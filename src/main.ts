@@ -5,7 +5,7 @@ import type { SeriesInfo, SliceData } from "./types";
 
 function byId<T extends HTMLElement>(id: string, ctor: new () => T): T {
   const el = document.getElementById(id);
-  if (!(el instanceof ctor)) throw new Error(`#${id} 요소를 찾을 수 없거나 타입이 다릅니다`);
+  if (!(el instanceof ctor)) throw new Error(`#${id} element not found or has wrong type`);
   return el;
 }
 
@@ -18,9 +18,9 @@ const presetSel = byId("preset", HTMLSelectElement);
 const openBtn = byId("open", HTMLButtonElement);
 const openFilesBtn = byId("open-files", HTMLButtonElement);
 const ctx = canvas.getContext("2d");
-if (!ctx) throw new Error("2D 컨텍스트를 만들 수 없습니다");
+if (!ctx) throw new Error("unable to get 2D context from canvas");
 
-// ---------- 상태 ----------
+// ---------- State ----------
 const state = { count: 0, index: 0, wl: 40, ww: 400, invert: false };
 const view = { zoom: 1, panX: 0, panY: 0 };
 let current: SliceData | null = null;
@@ -39,14 +39,14 @@ const PRESETS: { name: string; wl: number; ww: number }[] = [
 ];
 
 presetSel.replaceChildren(
-  new Option("WL/WW 프리셋", ""),
+  new Option("WL/WW Presets", ""),
   ...PRESETS.map((p, i) => new Option(p.name, String(i))),
 );
 
-// ---------- 표시 ----------
+// ---------- Display ----------
 function showError(err: unknown): void {
   const msg = err instanceof Error ? err.message : String(err);
-  overlayTL.textContent = `오류: ${msg}`;
+  overlayTL.textContent = `Error: ${msg}`;
   console.error(err);
 }
 
@@ -58,7 +58,7 @@ function updateOverlay(): void {
     s ? `${s.cols} × ${s.rows}` : "",
   ].filter(Boolean).join("\n");
   overlayBR.textContent =
-    `WL ${Math.round(state.wl)}  WW ${Math.round(state.ww)}${state.invert ? "  (반전)" : ""}\n` +
+    `WL ${Math.round(state.wl)}  WW ${Math.round(state.ww)}${state.invert ? "  (Invert)" : ""}\n` +
     `Zoom ${Math.round(view.zoom * 100)}%`;
 }
 
@@ -90,7 +90,7 @@ function zoomCenter(factor: number): void {
   zoomAt(factor, r.width / 2, r.height / 2);
 }
 
-// ---------- 렌더링 ----------
+// ---------- Rendering ----------
 let img: ImageData | null = null;
 let drawQueued = false;
 
@@ -162,7 +162,7 @@ function gotoSlice(next: number): void {
   void loadSlice();
 }
 
-// ---------- 시리즈 로딩 ----------
+// ---------- Series Loading ----------
 async function loadSeries(uid: string): Promise<void> {
   try {
     state.count = await selectSeries(uid);
@@ -182,14 +182,14 @@ async function showSeries(list: SeriesInfo[]): Promise<void> {
   );
   const first = list[0];
   if (first) await loadSeries(first.uid);
-  else overlayTL.textContent = "DICOM 파일을 찾지 못했습니다";
+  else overlayTL.textContent = "DICOM files not found";
 }
 
 openBtn.addEventListener("click", async () => {
   try {
     const dir = await open({ directory: true });
     if (typeof dir !== "string") return;
-    overlayTL.textContent = "불러오는 중...";
+    overlayTL.textContent = "Loading...";
     await showSeries(await openFolder(dir));
   } catch (err) {
     showError(err);
@@ -201,7 +201,7 @@ openFilesBtn.addEventListener("click", async () => {
     // DICOM은 확장자가 없는 경우가 많아 필터를 걸지 않았습니다
     const picked = await open({ multiple: true });
     if (!Array.isArray(picked) || picked.length === 0) return;
-    overlayTL.textContent = "불러오는 중...";
+    overlayTL.textContent = "Loading...";
     await showSeries(await openFiles(picked));
   } catch (err) {
     showError(err);
@@ -238,7 +238,7 @@ void getCurrentWebview().onDragDropEvent(async (event) => {
   }
 });
 
-// ---------- 마우스 ----------
+// ---------- Mouse ----------
 // 휠: 슬라이스 스크롤, 트랙패드 핀치(ctrl+휠): 확대/축소
 // 좌클릭 드래그: WL/WW, 우클릭 또는 Shift+드래그 또는 가운데 버튼: 이동
 let wheelAcc = 0;
