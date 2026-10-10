@@ -1,3 +1,23 @@
+html, body {
+  margin: 0; height: 100%; background: #000; color: #ddd;
+  font-family: -apple-system, sans-serif; overflow: hidden;
+}
+body { display: flex; flex-direction: column; }
+header { display: flex; gap: 12px; align-items: center; padding: 8px 12px; background: #111; }
+#viewport { position: relative; flex: 1; overflow: hidden; cursor: crosshair; }
+canvas {
+  position: absolute; left: 0; top: 0;
+  transform-origin: 0 0; image-rendering: pixelated;
+}
+.overlay {
+  position: absolute; padding: 8px 12px;
+  font: 12px/1.5 ui-monospace, Menlo, monospace;
+  color: #ffd54a; pointer-events: none; white-space: pre;
+  text-shadow: 0 0 3px #000;
+}
+#overlay-tl { top: 0; left: 0; }
+#overlay-br { bottom: 0; right: 0; text-align: right; }
+
 .logo.vite:hover {
   filter: drop-shadow(0 0 2em #747bff);
 }
