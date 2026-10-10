@@ -3,20 +3,52 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DICOM Viewer</title>
   <link rel="stylesheet" href="/src/styles.css" />
   <script type="module" src="/src/main.ts"></script>
 </head>
 <body>
-  <header>
-    <button id="open-files">Open Files</button>
-    <button id="open">Open Folder</button>
-    <select id="series"></select>
-    <select id="preset"></select>
+  <header id="toolbar">
+    <div class="group">
+      <button id="open-files">Open files</button>
+      <button id="open">Open folder</button>
+    </div>
+
+    <div class="group" id="tools" role="toolbar" aria-label="Mouse tools">
+      <button class="tool" data-tool="window" title="Window / Level (W)">W/L</button>
+      <button class="tool" data-tool="pan" title="Pan (P)">Pan</button>
+      <button class="tool" data-tool="zoom" title="Zoom (Z)">Zoom</button>
+      <button class="tool" data-tool="scroll" title="Scroll (S)">Scroll</button>
+    </div>
+
+    <div class="group">
+      <select id="preset" title="Window presets (1-6)"></select>
+      <button id="invert" title="Invert (I)">Invert</button>
+      <button id="fit" title="Fit to window (0)">Fit</button>
+      <button id="reset" title="Reset window (R)">Reset</button>
+    </div>
   </header>
-  <main id="viewport">
-    <canvas id="view"></canvas>
-    <div id="overlay-tl" class="overlay"></div>
-    <div id="overlay-br" class="overlay"></div>
-  </main>
+
+  <div id="body">
+    <aside id="sidebar">
+      <h2>Series</h2>
+      <ul id="series-list"></ul>
+    </aside>
+
+    <main id="stage">
+      <div id="viewport" class="empty" data-tool="window">
+        <canvas id="view"></canvas>
+        <div id="overlay-tl" class="overlay"></div>
+        <div id="overlay-br" class="overlay"></div>
+        <div id="empty">
+          <div id="empty-title">Drop DICOM files or a folder here</div>
+          <div id="empty-sub">or use Open folder / Open files above</div>
+        </div>
+      </div>
+      <div id="slider-bar">
+        <input type="range" id="slider" min="0" max="0" value="0" aria-label="Slice" />
+      </div>
+    </main>
+  </div>
 </body>
 </html>

@@ -134,3 +134,177 @@ button {
     background-color: #0f0f0f69;
   }
 }
+
+:root {
+  --bg: #0b0c0e;
+  --panel: #131519;
+  --panel-2: #1a1d22;
+  --border: #262a31;
+  --text: #d7dae0;
+  --muted: #8a919c;
+  --accent: #4da3ff;
+  --overlay: #ffd54a;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  overflow: hidden;
+  user-select: none;
+  -webkit-user-select: none;
+}
+body { display: flex; flex-direction: column; }
+
+/* ---------- Toolbar ---------- */
+#toolbar {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 8px 12px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+}
+.group { display: flex; align-items: center; gap: 6px; }
+
+button, select {
+  height: 28px;
+  padding: 0 10px;
+  color: var(--text);
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font: inherit;
+}
+button { cursor: pointer; }
+button:hover:not(:disabled), select:hover:not(:disabled) { border-color: #3a404a; }
+button:disabled, select:disabled { opacity: 0.4; cursor: default; }
+button.active {
+  color: #fff;
+  background: rgba(77, 163, 255, 0.22);
+  border-color: var(--accent);
+}
+button:focus-visible, select:focus-visible, input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* ---------- Layout ---------- */
+#body { flex: 1; display: flex; min-height: 0; }
+
+#sidebar {
+  width: 220px;
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+  border-right: 1px solid var(--border);
+}
+#sidebar h2 {
+  margin: 0;
+  padding: 10px 12px 6px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+#series-list {
+  flex: 1;
+  margin: 0;
+  padding: 0 6px 8px;
+  list-style: none;
+  overflow-y: auto;
+}
+.series-item {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  width: 100%;
+  height: auto;
+  margin-bottom: 4px;
+  padding: 8px 10px;
+  text-align: left;
+  background: transparent;
+  border-color: transparent;
+}
+.series-item:hover { background: var(--panel-2); }
+.series-item.active {
+  background: rgba(77, 163, 255, 0.16);
+  border-color: var(--accent);
+}
+.series-name {
+  width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.series-meta { font-size: 11px; color: var(--muted); }
+
+#stage { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+
+/* ---------- Viewport ---------- */
+#viewport {
+  position: relative;
+  flex: 1;
+  overflow: hidden;
+  background: #000;
+  outline: 2px dashed transparent;
+  outline-offset: -6px;
+}
+#viewport[data-tool="window"] { cursor: crosshair; }
+#viewport[data-tool="pan"] { cursor: grab; }
+#viewport[data-tool="zoom"] { cursor: zoom-in; }
+#viewport[data-tool="scroll"] { cursor: ns-resize; }
+body.dragging #viewport { outline-color: var(--accent); }
+
+canvas {
+  position: absolute;
+  left: 0;
+  top: 0;
+  transform-origin: 0 0;
+  image-rendering: pixelated;
+}
+#viewport.empty canvas { display: none; }
+
+.overlay {
+  position: absolute;
+  padding: 10px 14px;
+  font: 12px/1.5 ui-monospace, Menlo, monospace;
+  color: var(--overlay);
+  pointer-events: none;
+  white-space: pre;
+  text-shadow: 0 0 3px #000;
+}
+#overlay-tl { top: 0; left: 0; }
+#overlay-br { bottom: 0; right: 0; text-align: right; }
+
+#empty {
+  position: absolute;
+  inset: 0;
+  display: none;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  pointer-events: none;
+}
+#viewport.empty #empty { display: flex; }
+#empty-title { font-size: 16px; color: var(--text); }
+#empty-sub { color: var(--muted); }
+
+/* ---------- Slider ---------- */
+#slider-bar {
+  display: flex;
+  align-items: center;
+  height: 36px;
+  padding: 0 14px;
+  background: var(--panel);
+  border-top: 1px solid var(--border);
+}
+#slider { flex: 1; accent-color: var(--accent); }

@@ -7,7 +7,7 @@ export function openFolder(dir: string): Promise<SeriesInfo[]> {
   return invoke<SeriesInfo[]>("open_folder", { dir });
 }
 
-// 파일과 폴더가 섞여 있어도 됩니다 (드래그 앤 드롭에서 사용)
+// files and folders can be mixed (used in drag and drop)
 export function openFiles(files: string[]): Promise<SeriesInfo[]> {
   return invoke<SeriesInfo[]>("open_files", { files });
 }
@@ -26,7 +26,7 @@ export async function getSlice(index: number): Promise<SliceData> {
 // [slope f32][intercept f32][wc f32][ww f32][mono1 u32][pad u32]
 function parseSlice(buf: ArrayBuffer): SliceData {
   if (buf.byteLength < HEADER_BYTES) {
-    throw new Error(`슬라이스 응답이 너무 짧습니다 (${buf.byteLength} bytes)`);
+    throw new Error(`Slice response is too short (${buf.byteLength} bytes)`);
   }
   const dv = new DataView(buf);
   const rows = dv.getUint32(0, true);
@@ -40,13 +40,13 @@ function parseSlice(buf: ArrayBuffer): SliceData {
   const monochrome1 = dv.getUint32(32, true) === 1;
 
   if (bits !== 8 && bits !== 16) {
-    throw new Error(`지원하지 않는 BitsAllocated: ${bits}`);
+    throw new Error(`Unsupported BitsAllocated: ${bits}`);
   }
   const length = rows * cols;
   const expected = length * (bits / 8);
   const actual = buf.byteLength - HEADER_BYTES;
   if (actual < expected) {
-    throw new Error(`픽셀 데이터 길이 불일치: 기대 ${expected}, 실제 ${actual}`);
+    throw new Error(`Pixel data length mismatch: Expected ${expected}, Actual ${actual}`);
   }
 
   const pixels =
