@@ -1,6 +1,7 @@
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getSlice, openFiles, openFolder, selectSeries } from "./api";
+import { GLRenderer } from "./renderer";
 import type { SeriesInfo, SliceData } from "./types";
 
 function byId<T extends HTMLElement>(id: string, ctor: new () => T): T {
@@ -24,8 +25,6 @@ const fitBtn = byId("fit", HTMLButtonElement);
 const resetBtn = byId("reset", HTMLButtonElement);
 const slider = byId("slider", HTMLInputElement);
 const toolButtons = document.querySelectorAll<HTMLButtonElement>("#tools .tool");
-const ctx = canvas.getContext("2d");
-if (!ctx) throw new Error("Could not create a 2D context");
 
 // ---------- State ----------
 const state = { count: 0, index: 0, wl: 40, ww: 400, invert: false };
@@ -173,7 +172,6 @@ new ResizeObserver(() => {
 }).observe(viewport);
 
 // ---------- Rendering ----------
-let img: ImageData | null = null;
 let drawQueued = false;
 
 function requestDraw(): void {
@@ -185,28 +183,18 @@ function requestDraw(): void {
   });
 }
 
-function draw(): void {
-  const s = current;
-  if (!s) return;
-  const { rows, cols, pixels, slope, intercept } = s;
-  if (!img || img.width !== cols || img.height !== rows) {
-    img = ctx!.createImageData(cols, rows);
-  }
-  const out = new Uint32Array(img.data.buffer);
-  const lo = state.wl - state.ww / 2;
-  const scale = 255 / state.ww;
-  // MONOCHROME1 and the manual invert toggle cancel each other out
-  const flip = s.monochrome1 !== state.invert;
+let renderer: GLRenderer | null = null;
+try {
+  renderer = new GLRenderer(canvas, () => requestDraw());
+} catch (err) {
+  showError(err);
+}
 
-  for (let i = 0; i < rows * cols; i++) {
-    const hu = (pixels[i] as number) * slope + intercept;
-    let v = (hu - lo) * scale;
-    v = v < 0 ? 0 : v > 255 ? 255 : v;
-    if (flip) v = 255 - v;
-    const g = v | 0;
-    out[i] = 0xff000000 | (g << 16) | (g << 8) | g; // little-endian ABGR
-  }
-  ctx!.putImageData(img, 0, 0);
+// Window/level, inversion and rescaling all run in the fragment shader,
+// so a redraw only updates uniforms and never touches the pixel data.
+function draw(): void {
+  if (!current || !renderer) return;
+  renderer.draw({ wl: state.wl, ww: state.ww, invert: state.invert });
   updateOverlay();
 }
 
@@ -219,6 +207,7 @@ async function loadSlice(): Promise<void> {
 
     const dimsChanged = !current || current.rows !== slice.rows || current.cols !== slice.cols;
     current = slice;
+    renderer?.upload(slice);
 
     if (firstLoad) {
       if (slice.defaultWl !== null && slice.defaultWw !== null) {
@@ -228,6 +217,7 @@ async function loadSlice(): Promise<void> {
       firstLoad = false;
     }
     if (dimsChanged) {
+      // Resizing clears the drawing buffer, so draw right after
       canvas.width = slice.cols;
       canvas.height = slice.rows;
       if (autoFit) fitView();
