@@ -26,6 +26,31 @@ struct SeriesInfo {
     slice_count: usize,
 }
 
+// Display metadata for one slice. Missing attributes are empty strings or null.
+#[derive(Serialize)]
+struct SliceMeta {
+    patient_name: String,
+    patient_id: String,
+    patient_sex: String,
+    patient_age: String,
+    patient_birth_date: String,
+    institution: String,
+    study_description: String,
+    study_date: String,
+    study_time: String,
+    series_description: String,
+    series_number: String,
+    modality: String,
+    manufacturer_model: String,
+    slice_location: Option<f64>,
+    slice_thickness: Option<f64>,
+    kvp: Option<f64>,
+    tube_current: Option<f64>,
+    pixel_spacing: Option<[f64; 2]>, // [row spacing, column spacing] in mm, as in DICOM
+    frame: u32,
+    frame_count: u32,
+}
+
 #[derive(Default)]
 struct AppState {
     slices: Mutex<Vec<SliceInfo>>, // sorted frames of the selected series
@@ -88,33 +113,55 @@ fn read_header(path: PathBuf) -> Vec<(SliceInfo, String)> {
         .collect()
 }
 
+fn opt_f64(obj: &DefaultDicomObject, tag: Tag) -> Option<f64> {
+    obj.element(tag).ok().and_then(|e| e.to_float64().ok())
+}
+
 fn f64_of(obj: &DefaultDicomObject, tag: Tag, default: f64) -> f64 {
+    opt_f64(obj, tag).unwrap_or(default)
+}
+
+fn multi_f64(obj: &DefaultDicomObject, tag: Tag) -> Option<Vec<f64>> {
     obj.element(tag)
         .ok()
-        .and_then(|e| e.to_float64().ok())
-        .unwrap_or(default)
+        .and_then(|e| e.to_multi_float64().ok())
 }
 
 // WindowCenter/Width may be multi-valued; use the first value only
 fn first_f64(obj: &DefaultDicomObject, tag: Tag) -> Option<f64> {
+    multi_f64(obj, tag).and_then(|v| v.first().copied())
+}
+
+// Text value with DICOM padding (spaces, NUL) removed
+fn text_of(obj: &DefaultDicomObject, tag: Tag) -> String {
     obj.element(tag)
         .ok()
-        .and_then(|e| e.to_multi_float64().ok())
-        .and_then(|v| v.first().copied())
+        .and_then(|e| {
+            e.to_str()
+                .ok()
+                .map(|s| s.trim_matches(|c: char| c.is_whitespace() || c == '\0').to_string())
+        })
+        .unwrap_or_default()
 }
 
 fn open_cached(state: &AppState, path: &PathBuf) -> Result<Arc<DefaultDicomObject>, String> {
-    {
-        let cache = state.cache.lock().unwrap();
-        if let Some((p, obj)) = cache.as_ref() {
-            if p == path {
-                return Ok(Arc::clone(obj));
-            }
+    // The lock is held while loading so that concurrent commands for the same
+    // file (pixel data and metadata) trigger only one read.
+    let mut cache = state.cache.lock().unwrap();
+    if let Some((p, obj)) = cache.as_ref() {
+        if p == path {
+            return Ok(Arc::clone(obj));
         }
     }
     let obj = Arc::new(dicom::object::open_file(path).map_err(|e| e.to_string())?);
-    *state.cache.lock().unwrap() = Some((path.clone(), Arc::clone(&obj)));
+    *cache = Some((path.clone(), Arc::clone(&obj)));
     Ok(obj)
+}
+
+fn slice_ref(state: &AppState, index: usize) -> Result<(PathBuf, u32), String> {
+    let slices = state.slices.lock().unwrap();
+    let s = slices.get(index).ok_or("index out of range")?;
+    Ok((s.path.clone(), s.frame))
 }
 
 fn load_paths(paths: Vec<PathBuf>, state: &AppState) -> Vec<SeriesInfo> {
@@ -151,17 +198,19 @@ fn collect_paths(inputs: Vec<String>) -> Vec<PathBuf> {
         .collect()
 }
 
-#[tauri::command]
+// `async` makes Tauri run these on a worker thread instead of the main thread,
+// so decoding never blocks the window.
+#[tauri::command(async)]
 fn open_folder(dir: String, state: tauri::State<AppState>) -> Vec<SeriesInfo> {
     load_paths(collect_paths(vec![dir]), &state)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn open_files(files: Vec<String>, state: tauri::State<AppState>) -> Vec<SeriesInfo> {
     load_paths(collect_paths(files), &state)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn select_series(uid: String, state: tauri::State<AppState>) -> usize {
     let mut v: Vec<SliceInfo> = state
         .all
@@ -183,14 +232,9 @@ fn select_series(uid: String, state: tauri::State<AppState>) -> usize {
 // 40-byte header (little-endian):
 // [rows u32][cols u32][bits u32][signed u32]
 // [slope f32][intercept f32][wc f32][ww f32][mono1 u32][pad u32]
-#[tauri::command]
+#[tauri::command(async)]
 fn get_slice(index: usize, state: tauri::State<AppState>) -> Result<tauri::ipc::Response, String> {
-    let (path, frame) = {
-        let slices = state.slices.lock().unwrap();
-        let s = slices.get(index).ok_or("index out of range")?;
-        (s.path.clone(), s.frame)
-    };
-
+    let (path, frame) = slice_ref(&state, index)?;
     let obj = open_cached(&state, &path)?;
     let px = obj
         .decode_pixel_data_frame(frame)
@@ -228,6 +272,51 @@ fn get_slice(index: usize, state: tauri::State<AppState>) -> Result<tauri::ipc::
     Ok(tauri::ipc::Response::new(out))
 }
 
+#[tauri::command(async)]
+fn get_slice_meta(index: usize, state: tauri::State<AppState>) -> Result<SliceMeta, String> {
+    let (path, frame) = slice_ref(&state, index)?;
+    let obj = open_cached(&state, &path)?;
+
+    let spacing = multi_f64(&obj, tags::PIXEL_SPACING)
+        .or_else(|| multi_f64(&obj, tags::IMAGER_PIXEL_SPACING)) // projection radiography
+        .and_then(|v| if v.len() >= 2 { Some([v[0], v[1]]) } else { None });
+
+    // Fall back to the z component of ImagePositionPatient when SliceLocation is absent
+    let slice_location = opt_f64(&obj, tags::SLICE_LOCATION).or_else(|| {
+        multi_f64(&obj, tags::IMAGE_POSITION_PATIENT).and_then(|v| v.get(2).copied())
+    });
+
+    let frame_count = obj
+        .element(tags::NUMBER_OF_FRAMES)
+        .ok()
+        .and_then(|e| e.to_int::<u32>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(1);
+
+    Ok(SliceMeta {
+        patient_name: text_of(&obj, tags::PATIENT_NAME),
+        patient_id: text_of(&obj, tags::PATIENT_ID),
+        patient_sex: text_of(&obj, tags::PATIENT_SEX),
+        patient_age: text_of(&obj, tags::PATIENT_AGE),
+        patient_birth_date: text_of(&obj, tags::PATIENT_BIRTH_DATE),
+        institution: text_of(&obj, tags::INSTITUTION_NAME),
+        study_description: text_of(&obj, tags::STUDY_DESCRIPTION),
+        study_date: text_of(&obj, tags::STUDY_DATE),
+        study_time: text_of(&obj, tags::STUDY_TIME),
+        series_description: text_of(&obj, tags::SERIES_DESCRIPTION),
+        series_number: text_of(&obj, tags::SERIES_NUMBER),
+        modality: text_of(&obj, tags::MODALITY),
+        manufacturer_model: text_of(&obj, tags::MANUFACTURER_MODEL_NAME),
+        slice_location,
+        slice_thickness: opt_f64(&obj, tags::SLICE_THICKNESS),
+        kvp: opt_f64(&obj, tags::KVP),
+        tube_current: opt_f64(&obj, tags::X_RAY_TUBE_CURRENT),
+        pixel_spacing: spacing,
+        frame,
+        frame_count,
+    })
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -237,7 +326,8 @@ pub fn run() {
             open_folder,
             open_files,
             select_series,
-            get_slice
+            get_slice,
+            get_slice_meta
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -27,6 +27,11 @@
       <button id="fit" title="Fit to window (0)">Fit</button>
       <button id="reset" title="Reset window (R)">Reset</button>
     </div>
+
+    <div class="group">
+      <button id="info" title="Overlay detail: full / minimal / off (O)">Info: Full</button>
+      <button id="anonymize" title="Hide patient identifiers on screen (A)">Anonymize</button>
+    </div>
   </header>
 
   <div id="body">
@@ -39,7 +44,10 @@
       <div id="viewport" class="empty" data-tool="window">
         <canvas id="view"></canvas>
         <div id="overlay-tl" class="overlay"></div>
+        <div id="overlay-tr" class="overlay"></div>
+        <div id="overlay-bl" class="overlay"></div>
         <div id="overlay-br" class="overlay"></div>
+        <div id="status"></div>
         <div id="empty">
           <div id="empty-title">Drop DICOM files or a folder here</div>
           <div id="empty-sub">or use Open folder / Open files above</div>

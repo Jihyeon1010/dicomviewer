@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { SeriesInfo, SliceData } from "./types";
+import type { SeriesInfo, SliceData, SliceMeta } from "./types";
 
 const HEADER_BYTES = 40;
 
@@ -7,7 +7,7 @@ export function openFolder(dir: string): Promise<SeriesInfo[]> {
   return invoke<SeriesInfo[]>("open_folder", { dir });
 }
 
-// files and folders can be mixed (used in drag and drop)
+// Files and folders may be mixed (used by drag and drop)
 export function openFiles(files: string[]): Promise<SeriesInfo[]> {
   return invoke<SeriesInfo[]>("open_files", { files });
 }
@@ -16,17 +16,21 @@ export function selectSeries(uid: string): Promise<number> {
   return invoke<number>("select_series", { uid });
 }
 
+export function getSliceMeta(index: number): Promise<SliceMeta> {
+  return invoke<SliceMeta>("get_slice_meta", { index });
+}
+
 export async function getSlice(index: number): Promise<SliceData> {
   const buf = await invoke<ArrayBuffer>("get_slice", { index });
   return parseSlice(buf);
 }
 
-// 헤더 40바이트 (little-endian):
+// 40-byte header (little-endian):
 // [rows u32][cols u32][bits u32][signed u32]
 // [slope f32][intercept f32][wc f32][ww f32][mono1 u32][pad u32]
 function parseSlice(buf: ArrayBuffer): SliceData {
   if (buf.byteLength < HEADER_BYTES) {
-    throw new Error(`Slice response is too short (${buf.byteLength} bytes)`);
+    throw new Error(`Slice response too short (${buf.byteLength} bytes)`);
   }
   const dv = new DataView(buf);
   const rows = dv.getUint32(0, true);
@@ -46,7 +50,7 @@ function parseSlice(buf: ArrayBuffer): SliceData {
   const expected = length * (bits / 8);
   const actual = buf.byteLength - HEADER_BYTES;
   if (actual < expected) {
-    throw new Error(`Pixel data length mismatch: Expected ${expected}, Actual ${actual}`);
+    throw new Error(`Pixel data length mismatch: expected ${expected}, got ${actual}`);
   }
 
   const pixels =

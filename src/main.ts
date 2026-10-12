@@ -1,8 +1,8 @@
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { getSlice, openFiles, openFolder, selectSeries } from "./api";
+import { getSlice, getSliceMeta, openFiles, openFolder, selectSeries } from "./api";
 import { GLRenderer } from "./renderer";
-import type { SeriesInfo, SliceData } from "./types";
+import type { SeriesInfo, SliceData, SliceMeta } from "./types";
 
 function byId<T extends HTMLElement>(id: string, ctor: new () => T): T {
   const el = document.getElementById(id);
@@ -13,7 +13,10 @@ function byId<T extends HTMLElement>(id: string, ctor: new () => T): T {
 const viewport = byId("viewport", HTMLElement);
 const canvas = byId("view", HTMLCanvasElement);
 const overlayTL = byId("overlay-tl", HTMLDivElement);
+const overlayTR = byId("overlay-tr", HTMLDivElement);
+const overlayBL = byId("overlay-bl", HTMLDivElement);
 const overlayBR = byId("overlay-br", HTMLDivElement);
+const statusEl = byId("status", HTMLDivElement);
 const emptyTitle = byId("empty-title", HTMLDivElement);
 const emptySub = byId("empty-sub", HTMLDivElement);
 const seriesList = byId("series-list", HTMLUListElement);
@@ -23,19 +26,50 @@ const openFilesBtn = byId("open-files", HTMLButtonElement);
 const invertBtn = byId("invert", HTMLButtonElement);
 const fitBtn = byId("fit", HTMLButtonElement);
 const resetBtn = byId("reset", HTMLButtonElement);
+const infoBtn = byId("info", HTMLButtonElement);
+const anonBtn = byId("anonymize", HTMLButtonElement);
 const slider = byId("slider", HTMLInputElement);
 const toolButtons = document.querySelectorAll<HTMLButtonElement>("#tools .tool");
+
+// ---------- Persisted preferences ----------
+function loadPref(key: string): string | null {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null; // storage can be unavailable; fall back to defaults
+  }
+}
+
+function savePref(key: string, value: string): void {
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    // ignore: preferences are a convenience only
+  }
+}
 
 // ---------- State ----------
 const state = { count: 0, index: 0, wl: 40, ww: 400, invert: false };
 const view = { zoom: 1, panX: 0, panY: 0 };
 let current: SliceData | null = null;
+let meta: SliceMeta | null = null;
 let seriesData: SeriesInfo[] = [];
 let activeUid = "";
 let seriesName = "";
 let firstLoad = true; // apply the file's default WL/WW only once per series
 let autoFit = true;   // keep the image fitted until the user zooms or pans
 let fetchToken = 0;
+
+type OverlayMode = "full" | "minimal" | "off";
+const OVERLAY_MODES: OverlayMode[] = ["full", "minimal", "off"];
+const OVERLAY_LABEL: Record<OverlayMode, string> = {
+  full: "Full",
+  minimal: "Minimal",
+  off: "Off",
+};
+const savedMode = loadPref("overlay");
+let overlayMode: OverlayMode = OVERLAY_MODES.find((m) => m === savedMode) ?? "full";
+let anonymize = loadPref("anonymize") === "1";
 
 // Typical CT values; adjust per scanner and protocol.
 const PRESETS: { name: string; wl: number; ww: number }[] = [
@@ -71,13 +105,119 @@ for (const b of toolButtons) {
 }
 setTool("window");
 
-// ---------- UI sync ----------
+// ---------- Status line ----------
+function setStatus(text: string, isError = false): void {
+  statusEl.textContent = text;
+  statusEl.classList.toggle("error", isError);
+}
+
 function showError(err: unknown): void {
   const msg = err instanceof Error ? err.message : String(err);
-  overlayTL.textContent = `Error: ${msg}`;
+  setStatus(`Error: ${msg}`, true);
   console.error(err);
 }
 
+// ---------- Overlay formatting ----------
+type Maybe = string | false | null | undefined;
+
+function compact(items: Maybe[]): string[] {
+  return items.filter((x): x is string => typeof x === "string" && x !== "");
+}
+
+// DICOM person names use '^' as the component separator
+const cleanName = (s: string): string => s.replace(/\^+/g, " ").trim();
+
+function fmtDate(d: string): string {
+  return /^\d{8}$/.test(d) ? `${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6, 8)}` : d;
+}
+
+function fmtTime(t: string): string {
+  const m = /^(\d{2})(\d{2})(\d{2})/.exec(t);
+  return m ? `${m[1]}:${m[2]}:${m[3]}` : t;
+}
+
+// "034Y" -> "34Y"
+const fmtAge = (a: string): string => a.replace(/^0+(?=\d)/, "");
+
+// Rounds to `digits` decimals and drops trailing zeros
+const num = (v: number, digits = 2): string => String(+v.toFixed(digits));
+
+function patientLines(m: SliceMeta): string[] {
+  const demo = [m.patient_sex, fmtAge(m.patient_age)].filter(Boolean).join(" · ");
+  if (anonymize) return compact(["Anonymized", demo]);
+  return compact([
+    cleanName(m.patient_name),
+    m.patient_id && `ID ${m.patient_id}`,
+    m.patient_birth_date && `DOB ${fmtDate(m.patient_birth_date)}`,
+    demo,
+  ]);
+}
+
+function studyLines(m: SliceMeta | null): string[] {
+  const desc = m?.series_description || seriesName;
+  if (!m) return compact([desc]);
+  const seriesLine = m.series_number
+    ? `Se ${m.series_number}${desc ? `: ${desc}` : ""}`
+    : desc;
+  return compact([
+    !anonymize && m.institution,
+    m.study_description,
+    !anonymize && [fmtDate(m.study_date), fmtTime(m.study_time)].filter(Boolean).join(" "),
+    seriesLine,
+    [m.modality, m.manufacturer_model].filter(Boolean).join(" · "),
+  ]);
+}
+
+function imageLines(s: SliceData | null, m: SliceMeta | null): string[] {
+  const position = m
+    ? [
+        m.slice_location !== null && `Loc ${num(m.slice_location, 1)} mm`,
+        m.slice_thickness !== null && `Thk ${num(m.slice_thickness)} mm`,
+      ].filter(Boolean).join("  ")
+    : "";
+  const exposure = m
+    ? [
+        m.kvp !== null && `${num(m.kvp, 0)} kVp`,
+        m.tube_current !== null && `${num(m.tube_current, 0)} mA`,
+      ].filter(Boolean).join("  ")
+    : "";
+  // pixel_spacing is [row, column]; shown as horizontal x vertical, like the matrix size
+  const spacing = m?.pixel_spacing
+    ? `Px ${num(m.pixel_spacing[1], 3)} × ${num(m.pixel_spacing[0], 3)} mm`
+    : "";
+  return compact([
+    state.count ? `Im ${state.index + 1} / ${state.count}` : "",
+    s && `${s.cols} × ${s.rows}`,
+    position,
+    exposure,
+    spacing,
+  ]);
+}
+
+function updateOverlay(): void {
+  const s = current;
+  const m = meta;
+
+  if (overlayMode === "off") {
+    for (const el of [overlayTL, overlayTR, overlayBL, overlayBR]) el.textContent = "";
+    return;
+  }
+
+  const full = overlayMode === "full";
+  overlayTL.textContent = full && m ? patientLines(m).join("\n") : "";
+  overlayTR.textContent = full ? studyLines(m).join("\n") : "";
+  overlayBL.textContent = full
+    ? imageLines(s, m).join("\n")
+    : state.count
+      ? `Im ${state.index + 1} / ${state.count}`
+      : "";
+  overlayBR.textContent = s
+    ? `WL ${Math.round(state.wl)}  WW ${Math.round(state.ww)}${state.invert ? "  (inverted)" : ""}\n` +
+      `Zoom ${Math.round(view.zoom * 100)}%`
+    : "";
+}
+
+// ---------- UI sync ----------
 function setEmpty(on: boolean, title?: string, sub?: string): void {
   viewport.classList.toggle("empty", on);
   if (title !== undefined) emptyTitle.textContent = title;
@@ -92,19 +232,25 @@ function syncControls(): void {
   invertBtn.classList.toggle("active", state.invert);
   invertBtn.setAttribute("aria-pressed", String(state.invert));
   for (const el of [invertBtn, fitBtn, resetBtn, presetSel]) el.disabled = n === 0;
+
+  infoBtn.textContent = `Info: ${OVERLAY_LABEL[overlayMode]}`;
+  anonBtn.classList.toggle("active", anonymize);
+  anonBtn.setAttribute("aria-pressed", String(anonymize));
 }
 
-function updateOverlay(): void {
-  const s = current;
-  overlayTL.textContent = [
-    seriesName,
-    state.count ? `Im ${state.index + 1} / ${state.count}` : "",
-    s ? `${s.cols} × ${s.rows}` : "",
-  ].filter(Boolean).join("\n");
-  overlayBR.textContent = s
-    ? `WL ${Math.round(state.wl)}  WW ${Math.round(state.ww)}${state.invert ? "  (inverted)" : ""}\n` +
-      `Zoom ${Math.round(view.zoom * 100)}%`
-    : "";
+function cycleOverlay(): void {
+  const next = OVERLAY_MODES[(OVERLAY_MODES.indexOf(overlayMode) + 1) % OVERLAY_MODES.length];
+  overlayMode = next ?? "full";
+  savePref("overlay", overlayMode);
+  syncControls();
+  updateOverlay();
+}
+
+function toggleAnonymize(): void {
+  anonymize = !anonymize;
+  savePref("anonymize", anonymize ? "1" : "0");
+  syncControls();
+  updateOverlay();
 }
 
 function renderSeriesList(): void {
@@ -118,11 +264,11 @@ function renderSeriesList(): void {
       const name = document.createElement("span");
       name.className = "series-name";
       name.textContent = s.description || "(no description)";
-      const meta = document.createElement("span");
-      meta.className = "series-meta";
-      meta.textContent = `${s.slice_count} image${s.slice_count === 1 ? "" : "s"}`;
+      const info = document.createElement("span");
+      info.className = "series-meta";
+      info.textContent = `${s.slice_count} image${s.slice_count === 1 ? "" : "s"}`;
 
-      btn.append(name, meta);
+      btn.append(name, info);
       btn.addEventListener("click", () => void loadSeries(s.uid));
       li.append(btn);
       return li;
@@ -202,11 +348,16 @@ async function loadSlice(): Promise<void> {
   if (state.count === 0) return;
   const token = ++fetchToken;
   try {
-    const slice = await getSlice(state.index);
+    // Metadata is optional: a failure there must not block the image
+    const [slice, m] = await Promise.all([
+      getSlice(state.index),
+      getSliceMeta(state.index).catch(() => null),
+    ]);
     if (token !== fetchToken) return; // a newer request superseded this one
 
     const dimsChanged = !current || current.rows !== slice.rows || current.cols !== slice.cols;
     current = slice;
+    meta = m;
     renderer?.upload(slice);
 
     if (firstLoad) {
@@ -222,6 +373,7 @@ async function loadSlice(): Promise<void> {
       canvas.height = slice.rows;
       if (autoFit) fitView();
     }
+    setStatus("");
     draw();
   } catch (err) {
     showError(err);
@@ -270,6 +422,7 @@ async function loadSeries(uid: string): Promise<void> {
     firstLoad = true;
     autoFit = true;
     current = null;
+    meta = null;
     activeUid = uid;
     seriesName = seriesData.find((s) => s.uid === uid)?.description ?? "";
     renderSeriesList();
@@ -289,9 +442,11 @@ async function showSeries(list: SeriesInfo[]): Promise<void> {
   const first = list[0];
   if (!first) {
     current = null;
+    meta = null;
     state.count = 0;
     state.index = 0;
     seriesName = "";
+    setStatus("");
     setEmpty(true, "No DICOM files found", "Check that the selection contains DICOM data");
     syncControls();
     updateOverlay();
@@ -302,7 +457,7 @@ async function showSeries(list: SeriesInfo[]): Promise<void> {
 
 async function loadInputs(fetcher: () => Promise<SeriesInfo[]>): Promise<void> {
   try {
-    overlayTL.textContent = "Loading...";
+    setStatus("Loading...");
     await showSeries(await fetcher());
   } catch (err) {
     showError(err);
@@ -333,6 +488,8 @@ openFilesBtn.addEventListener("click", async () => {
 invertBtn.addEventListener("click", toggleInvert);
 fitBtn.addEventListener("click", () => { fitView(); updateOverlay(); });
 resetBtn.addEventListener("click", resetWindow);
+infoBtn.addEventListener("click", cycleOverlay);
+anonBtn.addEventListener("click", toggleAnonymize);
 
 presetSel.addEventListener("change", () => {
   if (presetSel.value !== "") applyPreset(Number(presetSel.value));
@@ -469,6 +626,8 @@ window.addEventListener("keydown", (e: KeyboardEvent) => {
     case "p": case "P": setTool("pan"); break;
     case "z": case "Z": setTool("zoom"); break;
     case "s": case "S": setTool("scroll"); break;
+    case "o": case "O": cycleOverlay(); break;
+    case "a": case "A": toggleAnonymize(); break;
     default:
       if (/^[1-6]$/.test(e.key)) applyPreset(Number(e.key) - 1);
       else return;
