@@ -44,3 +44,24 @@ export interface SliceMeta {
   frame: number;
   frame_count: number;
 }
+
+// Mirrors the VolumeInfo struct in lib.rs
+export interface VolumeInfo {
+  cols: number;
+  rows: number;
+  depth: number;
+  pixel_spacing: [number, number] | null; // [row, column] in mm
+  slice_spacing: number | null;           // mean distance between slices in mm
+  uniform: boolean;                       // false when the spacing varies by more than 1%
+  tilt_deg: number;                       // gantry tilt
+  value_min: number;
+  value_max: number;
+  megabytes: number;
+}
+
+// Mirrors the SeriesGeometry struct in lib.rs
+export interface SeriesGeometry {
+  frame_of_reference: string;
+  normal: [number, number, number] | null;
+  positions: number[] | null; // mm along the normal, one per image, ascending
+}

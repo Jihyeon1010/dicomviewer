@@ -45,6 +45,14 @@ export const ACTIONS: ActionDef[] = [
   { id: "ui.markers", label: "Toggle markers and scale bars", group: "Interface", defaults: ["KeyM"] },
   { id: "ui.anonymize", label: "Toggle anonymize", group: "Interface", defaults: ["KeyA"] },
   { id: "ui.settings", label: "Settings and shortcuts", group: "Interface", defaults: ["Comma", "Shift+Slash"] },
+  { id: "volume.build", label: "Build 3D volume", group: "Volume", defaults: ["KeyV"] },
+
+    { id: "layout.1x1", label: "Layout 1 × 1", group: "Layout", defaults: ["Alt+Digit1"] },
+  { id: "layout.2x1", label: "Layout 2 × 1 (side by side)", group: "Layout", defaults: ["Alt+Digit2"] },
+  { id: "layout.1x2", label: "Layout 1 × 2 (stacked)", group: "Layout", defaults: ["Alt+Digit3"] },
+  { id: "layout.2x2", label: "Layout 2 × 2", group: "Layout", defaults: ["Alt+Digit4"] },
+  { id: "sync.scroll", label: "Toggle scroll sync", group: "Layout", defaults: ["KeyL"] },
+  { id: "sync.window", label: "Toggle window sync", group: "Layout", defaults: ["Shift+KeyL"] },
 ];
 
 export const ACTION_BY_ID = new Map<string, ActionDef>(

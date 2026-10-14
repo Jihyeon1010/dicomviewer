@@ -144,6 +144,18 @@ export async function installMenu(deps: MenuDeps): Promise<AppMenu> {
       await key("Zoom In", "view.zoomIn"),
       await key("Zoom Out", "view.zoomOut"),
       await key("Fit to Window", "view.fit"),
+      await Submenu.new({
+        text: "Layout",
+        items: [
+          await key("1 × 1", "layout.1x1"),
+          await key("2 × 1 (Side by Side)", "layout.2x1"),
+          await key("1 × 2 (Stacked)", "layout.1x2"),
+          await key("2 × 2", "layout.2x2"),
+          await std("Separator"),
+          await key("Toggle Scroll Sync", "sync.scroll"),
+          await key("Toggle Window Sync", "sync.window"),
+        ],
+      }),
       await std("Separator"),
       await check("view.invert", "Invert", () => deps.run("view.invert")),
       await key("Reset Window", "view.resetWindow"),

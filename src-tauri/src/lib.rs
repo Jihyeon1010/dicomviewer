@@ -2,21 +2,36 @@ use dicom::core::Tag;
 use dicom::dictionary_std::tags;
 use dicom::object::{DefaultDicomObject, OpenFileOptions};
 use dicom::pixeldata::PixelDecoder;
-use rayon::{prelude::*, string};
+use rayon::prelude::*;
 use serde::Serialize;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
 };
 use walkdir::WalkDir;
+
+type Vec3 = [f64; 3];
+
+// Hard limit on the in-memory volume (f32 per voxel)
+const MAX_VOLUME_BYTES: usize = 4 * 1024 * 1024 * 1024;
+
+// Opened files kept in memory. Several viewports read different files at once,
+// and pixel data and metadata of one slice are requested separately.
+const FILE_CACHE_SIZE: usize = 6;
 
 #[derive(Clone, Serialize)]
 struct SliceInfo {
     path: PathBuf,
     series_uid: String,
     instance_number: i32,
-    frame: u32, // zero-based frame index inside the file
+    frame: u32,                // zero-based frame index inside the file
+    ipp: Option<[f64; 3]>,     // ImagePositionPatient
+    iop: Option<[f64; 6]>,     // ImageOrientationPatient
+    frame_of_reference: String,
 }
 
 #[derive(Serialize)]
@@ -24,6 +39,16 @@ struct SeriesInfo {
     uid: String,
     description: String,
     slice_count: usize,
+}
+
+// Where the images of a series sit in patient space; used to link viewports
+#[derive(Serialize)]
+struct SeriesGeometry {
+    frame_of_reference: String,
+    normal: Option<Vec3>,
+    // Millimetres along `normal`, one per image in display order (ascending).
+    // None when positions are missing or all images share one position.
+    positions: Option<Vec<f64>>,
 }
 
 // Display metadata for one slice. Missing attributes are empty strings or null.
@@ -47,20 +72,217 @@ struct SliceMeta {
     kvp: Option<f64>,
     tube_current: Option<f64>,
     pixel_spacing: Option<[f64; 2]>, // [row spacing, column spacing] in mm, as in DICOM
-    image_orientation: Option<[f64; 6]>,
-    patient_orientation: String, // row and column direction cosines, as in DICOM
+    image_orientation: Option<[f64; 6]>, // row cosines, then column cosines (patient LPS)
+    patient_orientation: String, // raw "row\column" codes, used by projection images
     frame: u32,
     frame_count: u32,
 }
 
+#[derive(Clone, Serialize)]
+struct VolumeInfo {
+    cols: u32,
+    rows: u32,
+    depth: u32,
+    pixel_spacing: Option<[f64; 2]>, // [row, column] in mm
+    slice_spacing: Option<f64>,      // mean distance between slices in mm
+    uniform: bool,                   // false when slice spacing varies by more than 1%
+    tilt_deg: f64,                   // angle between the stack axis and the slice normal
+    value_min: f64,
+    value_max: f64,
+    megabytes: f64,
+}
+
+struct Volume {
+    uid: String,
+    info: VolumeInfo,
+    // One buffer per slice in display order, each rows * cols rescaled values.
+    // Separate buffers let the parallel decode move results in without copying.
+    #[allow(dead_code)] // read by the MPR commands in a later step
+    slices: Vec<Vec<f32>>,
+}
+
 #[derive(Default)]
 struct AppState {
-    slices: Mutex<Vec<SliceInfo>>, // sorted frames of the selected series
     all: Mutex<Vec<SliceInfo>>,
-    // Last opened file. Scrolling through the frames of one multiframe file
-    // would otherwise re-read and re-parse the whole file for every frame.
-    cache: Mutex<Option<(PathBuf, Arc<DefaultDicomObject>)>>,
+    // Sorted images per series. Lock order when both are needed: `sorted`, then `all`.
+    sorted: Mutex<HashMap<String, Arc<Vec<SliceInfo>>>>,
+    // Recently opened files, most recently used first
+    files: Mutex<Vec<(PathBuf, Arc<DefaultDicomObject>)>>,
+    volume: Mutex<Option<Arc<Volume>>>,
+    // Bumped whenever a volume build starts or the loaded files change, so a
+    // build that finished too late can recognise that it is stale.
+    volume_gen: AtomicU64,
 }
+
+// ---------- Small DICOM helpers ----------
+
+fn opt_f64(obj: &DefaultDicomObject, tag: Tag) -> Option<f64> {
+    obj.element(tag).ok().and_then(|e| e.to_float64().ok())
+}
+
+fn f64_of(obj: &DefaultDicomObject, tag: Tag, default: f64) -> f64 {
+    opt_f64(obj, tag).unwrap_or(default)
+}
+
+fn multi_f64(obj: &DefaultDicomObject, tag: Tag) -> Option<Vec<f64>> {
+    obj.element(tag)
+        .ok()
+        .and_then(|e| e.to_multi_float64().ok())
+}
+
+// First N values of a multi-valued numeric attribute
+fn array_of<const N: usize>(obj: &DefaultDicomObject, tag: Tag) -> Option<[f64; N]> {
+    let v = multi_f64(obj, tag)?;
+    v.get(..N)?.try_into().ok()
+}
+
+// WindowCenter/Width may be multi-valued; use the first value only
+fn first_f64(obj: &DefaultDicomObject, tag: Tag) -> Option<f64> {
+    multi_f64(obj, tag).and_then(|v| v.first().copied())
+}
+
+// Text value with DICOM padding (spaces, NUL) removed
+fn text_of(obj: &DefaultDicomObject, tag: Tag) -> String {
+    obj.element(tag)
+        .ok()
+        .and_then(|e| {
+            e.to_str()
+                .ok()
+                .map(|s| s.trim_matches(|c: char| c.is_whitespace() || c == '\0').to_string())
+        })
+        .unwrap_or_default()
+}
+
+// Raw sample at index `i`. Decoded pixel data is little-endian and tightly packed;
+// the caller checks the buffer length first.
+fn sample_at(data: &[u8], bits: u32, signed: bool, i: usize) -> f64 {
+    match (bits, signed) {
+        (8, false) => data[i] as f64,
+        (8, true) => data[i] as i8 as f64,
+        (16, false) => u16::from_le_bytes([data[2 * i], data[2 * i + 1]]) as f64,
+        (16, true) => i16::from_le_bytes([data[2 * i], data[2 * i + 1]]) as f64,
+        _ => 0.0,
+    }
+}
+
+// ---------- Geometry and ordering ----------
+
+fn dot(a: Vec3, b: Vec3) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn cross(a: Vec3, b: Vec3) -> Vec3 {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+/// Unit slice normal, signed so that increasing position follows the usual
+/// scrolling convention: axial heads toward the feet (superior first), coronal
+/// toward the back (anterior first), sagittal toward the left (right first).
+/// Patient axes are LPS: +x = left, +y = posterior, +z = superior.
+fn scroll_normal(iop: &[f64; 6]) -> Option<Vec3> {
+    let n = cross([iop[0], iop[1], iop[2]], [iop[3], iop[4], iop[5]]);
+    let len = dot(n, n).sqrt();
+    if !len.is_finite() || len < 1e-6 {
+        return None;
+    }
+    let n = [n[0] / len, n[1] / len, n[2] / len];
+    let axis = (0..3).max_by(|&a, &b| n[a].abs().total_cmp(&n[b].abs()))?;
+    let want = if axis == 2 { -1.0 } else { 1.0 };
+    Some(if n[axis] * want < 0.0 {
+        [-n[0], -n[1], -n[2]]
+    } else {
+        n
+    })
+}
+
+/// Sorts by position along the slice normal when every slice has position and
+/// orientation, and by instance number otherwise.
+fn sort_slices(v: &mut [SliceInfo]) {
+    let normal = v.iter().find_map(|s| s.iop).and_then(|o| scroll_normal(&o));
+    let positioned = v.iter().all(|s| s.ipp.is_some());
+
+    match normal {
+        Some(n) if positioned => {
+            // Micrometre resolution: float noise must not reorder slices at the same position
+            let key = |s: &SliceInfo| s.ipp.map_or(0, |p| (dot(p, n) * 1000.0).round() as i64);
+            v.sort_by(|a, b| {
+                key(a)
+                    .cmp(&key(b))
+                    .then(a.instance_number.cmp(&b.instance_number))
+                    .then_with(|| a.path.cmp(&b.path))
+                    .then(a.frame.cmp(&b.frame))
+            });
+        }
+        _ => v.sort_by(|a, b| {
+            (a.instance_number, &a.path, a.frame).cmp(&(b.instance_number, &b.path, b.frame))
+        }),
+    }
+}
+
+// Frames of one series in display order, sorted once and shared by all viewports
+fn series_slices(state: &AppState, uid: &str) -> Arc<Vec<SliceInfo>> {
+    let mut sorted = state.sorted.lock().unwrap();
+    if let Some(v) = sorted.get(uid) {
+        return Arc::clone(v);
+    }
+    let mut v: Vec<SliceInfo> = state
+        .all
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|s| s.series_uid == uid)
+        .cloned()
+        .collect();
+    sort_slices(&mut v);
+    let v = Arc::new(v);
+    if !v.is_empty() {
+        sorted.insert(uid.to_string(), Arc::clone(&v));
+    }
+    v
+}
+
+/// (mean slice spacing in mm, spacing is regular, tilt in degrees) for sorted slices.
+/// The spacing is None when positions are missing or all identical.
+fn slice_geometry(v: &[SliceInfo]) -> (Option<f64>, bool, f64) {
+    let normal = v.iter().find_map(|s| s.iop).and_then(|o| scroll_normal(&o));
+    let pts: Vec<Vec3> = v.iter().filter_map(|s| s.ipp).collect();
+    let Some(n) = normal else {
+        return (None, true, 0.0);
+    };
+    if v.len() < 2 || pts.len() != v.len() {
+        return (None, true, 0.0);
+    }
+
+    let pos: Vec<f64> = pts.iter().map(|p| dot(*p, n)).collect();
+    let steps = pos.len() - 1;
+    let mean = (pos[steps] - pos[0]) / steps as f64;
+    if mean <= 0.0 {
+        return (None, true, 0.0);
+    }
+
+    let tol = (mean * 0.01).max(0.01);
+    let uniform = pos.windows(2).all(|w| ((w[1] - w[0]) - mean).abs() <= tol);
+
+    // A stack axis that is not parallel to the normal means gantry tilt
+    let d = [
+        pts[steps][0] - pts[0][0],
+        pts[steps][1] - pts[0][1],
+        pts[steps][2] - pts[0][2],
+    ];
+    let len = dot(d, d).sqrt();
+    let tilt = if len > 0.0 {
+        (dot(d, n).abs() / len).clamp(0.0, 1.0).acos().to_degrees()
+    } else {
+        0.0
+    };
+    (Some(mean), uniform, tilt)
+}
+
+// ---------- Loading ----------
 
 // Returns one entry per frame; an empty Vec means "not a displayable image".
 fn read_header(path: PathBuf) -> Vec<(SliceInfo, String)> {
@@ -99,6 +321,9 @@ fn read_header(path: PathBuf) -> Vec<(SliceInfo, String)> {
         .and_then(|e| e.to_int::<u32>().ok())
         .filter(|&n| n >= 1)
         .unwrap_or(1);
+    let ipp = array_of::<3>(&obj, tags::IMAGE_POSITION_PATIENT);
+    let iop = array_of::<6>(&obj, tags::IMAGE_ORIENTATION_PATIENT);
+    let frame_of_reference = text_of(&obj, tags::FRAME_OF_REFERENCE_UID);
 
     (0..frames)
         .map(|frame| {
@@ -108,6 +333,9 @@ fn read_header(path: PathBuf) -> Vec<(SliceInfo, String)> {
                     series_uid: uid.clone(),
                     instance_number: inst,
                     frame,
+                    ipp,
+                    iop,
+                    frame_of_reference: frame_of_reference.clone(),
                 },
                 desc.clone(),
             )
@@ -115,53 +343,24 @@ fn read_header(path: PathBuf) -> Vec<(SliceInfo, String)> {
         .collect()
 }
 
-fn opt_f64(obj: &DefaultDicomObject, tag: Tag) -> Option<f64> {
-    obj.element(tag).ok().and_then(|e| e.to_float64().ok())
-}
-
-fn f64_of(obj: &DefaultDicomObject, tag: Tag, default: f64) -> f64 {
-    opt_f64(obj, tag).unwrap_or(default)
-}
-
-fn multi_f64(obj: &DefaultDicomObject, tag: Tag) -> Option<Vec<f64>> {
-    obj.element(tag)
-        .ok()
-        .and_then(|e| e.to_multi_float64().ok())
-}
-
-// WindowCenter/Width may be multi-valued; use the first value only
-fn first_f64(obj: &DefaultDicomObject, tag: Tag) -> Option<f64> {
-    multi_f64(obj, tag).and_then(|v| v.first().copied())
-}
-
-// Text value with DICOM padding (spaces, NUL) removed
-fn text_of(obj: &DefaultDicomObject, tag: Tag) -> String {
-    obj.element(tag)
-        .ok()
-        .and_then(|e| {
-            e.to_str()
-                .ok()
-                .map(|s| s.trim_matches(|c: char| c.is_whitespace() || c == '\0').to_string())
-        })
-        .unwrap_or_default()
-}
-
 fn open_cached(state: &AppState, path: &PathBuf) -> Result<Arc<DefaultDicomObject>, String> {
     // The lock is held while loading so that concurrent commands for the same
     // file (pixel data and metadata) trigger only one read.
-    let mut cache = state.cache.lock().unwrap();
-    if let Some((p, obj)) = cache.as_ref() {
-        if p == path {
-            return Ok(Arc::clone(obj));
-        }
+    let mut files = state.files.lock().unwrap();
+    if let Some(pos) = files.iter().position(|(p, _)| p == path) {
+        let entry = files.remove(pos);
+        let obj = Arc::clone(&entry.1);
+        files.insert(0, entry);
+        return Ok(obj);
     }
     let obj = Arc::new(dicom::object::open_file(path).map_err(|e| e.to_string())?);
-    *cache = Some((path.clone(), Arc::clone(&obj)));
+    files.insert(0, (path.clone(), Arc::clone(&obj)));
+    files.truncate(FILE_CACHE_SIZE);
     Ok(obj)
 }
 
-fn slice_ref(state: &AppState, index: usize) -> Result<(PathBuf, u32), String> {
-    let slices = state.slices.lock().unwrap();
+fn slice_ref(state: &AppState, uid: &str, index: usize) -> Result<(PathBuf, u32), String> {
+    let slices = series_slices(state, uid);
     let s = slices.get(index).ok_or("index out of range")?;
     Ok((s.path.clone(), s.frame))
 }
@@ -177,8 +376,18 @@ fn load_paths(paths: Vec<PathBuf>, state: &AppState) -> Vec<SeriesInfo> {
             .or_insert((d.clone(), 0));
         e.1 += 1;
     }
-    *state.all.lock().unwrap() = parsed.into_iter().map(|(s, _)| s).collect();
-    *state.cache.lock().unwrap() = None;
+
+    {
+        // Same lock order as series_slices, so the two can never deadlock
+        let mut sorted = state.sorted.lock().unwrap();
+        let mut all = state.all.lock().unwrap();
+        *all = parsed.into_iter().map(|(s, _)| s).collect();
+        sorted.clear();
+    }
+    state.files.lock().unwrap().clear();
+    // The old volume belongs to files that are no longer loaded
+    *state.volume.lock().unwrap() = None;
+    state.volume_gen.fetch_add(1, Ordering::SeqCst);
 
     series
         .into_iter()
@@ -200,8 +409,10 @@ fn collect_paths(inputs: Vec<String>) -> Vec<PathBuf> {
         .collect()
 }
 
+// ---------- Commands ----------
 // `async` makes Tauri run these on a worker thread instead of the main thread,
 // so decoding never blocks the window.
+
 #[tauri::command(async)]
 fn open_folder(dir: String, state: tauri::State<AppState>) -> Vec<SeriesInfo> {
     load_paths(collect_paths(vec![dir]), &state)
@@ -213,37 +424,39 @@ fn open_files(files: Vec<String>, state: tauri::State<AppState>) -> Vec<SeriesIn
 }
 
 #[tauri::command(async)]
-// Frames of one series in display order: instance number first, then file,
-// then frame (keeps multiframe order stable).
-fn series_slices(state: &AppState, uid: &str) -> Vec<SliceInfo> {
-    let mut v: Vec<SliceInfo> = state
-        .all
-        .lock()
-        .unwrap()
-        .iter()
-        .filter(|s| s.series_uid == uid)
-        .cloned()
-        .collect();
-    v.sort_by(|a, b| {
-        (a.instance_number, &a.path, a.frame).cmp(&(b.instance_number, &b.path, b.frame))
-    });
-    v
-}
-
-#[tauri::command(async)]
-fn select_series(uid: String, state: tauri::State<AppState>) -> usize {
+fn get_series_geometry(uid: String, state: tauri::State<AppState>) -> SeriesGeometry {
     let v = series_slices(&state, &uid);
-    let n = v.len();
-    *state.slices.lock().unwrap() = v;
-    n
+    let frame_of_reference = v
+        .first()
+        .map(|s| s.frame_of_reference.clone())
+        .unwrap_or_default();
+    let normal = v.iter().find_map(|s| s.iop).and_then(|o| scroll_normal(&o));
+    let positions = normal.and_then(|n| {
+        let pos: Option<Vec<f64>> = v.iter().map(|s| s.ipp.map(|p| dot(p, n))).collect();
+        pos.filter(|p| {
+            let (lo, hi) = p
+                .iter()
+                .fold((f64::MAX, f64::MIN), |(lo, hi), &x| (lo.min(x), hi.max(x)));
+            hi - lo > 1e-3
+        })
+    });
+    SeriesGeometry {
+        frame_of_reference,
+        normal,
+        positions,
+    }
 }
 
 // 40-byte header (little-endian):
 // [rows u32][cols u32][bits u32][signed u32]
 // [slope f32][intercept f32][wc f32][ww f32][mono1 u32][pad u32]
 #[tauri::command(async)]
-fn get_slice(index: usize, state: tauri::State<AppState>) -> Result<tauri::ipc::Response, String> {
-    let (path, frame) = slice_ref(&state, index)?;
+fn get_slice(
+    uid: String,
+    index: usize,
+    state: tauri::State<AppState>,
+) -> Result<tauri::ipc::Response, String> {
+    let (path, frame) = slice_ref(&state, &uid, index)?;
     let obj = open_cached(&state, &path)?;
     let px = obj
         .decode_pixel_data_frame(frame)
@@ -282,8 +495,12 @@ fn get_slice(index: usize, state: tauri::State<AppState>) -> Result<tauri::ipc::
 }
 
 #[tauri::command(async)]
-fn get_slice_meta(index: usize, state: tauri::State<AppState>) -> Result<SliceMeta, String> {
-    let (path, frame) = slice_ref(&state, index)?;
+fn get_slice_meta(
+    uid: String,
+    index: usize,
+    state: tauri::State<AppState>,
+) -> Result<SliceMeta, String> {
+    let (path, frame) = slice_ref(&state, &uid, index)?;
     let obj = open_cached(&state, &path)?;
 
     let spacing = multi_f64(&obj, tags::PIXEL_SPACING)
@@ -336,18 +553,6 @@ fn get_slice_meta(index: usize, state: tauri::State<AppState>) -> Result<SliceMe
     })
 }
 
-// Raw sample at index `i`. Decoded pixel data is little-endian and tightly packed;
-// the caller checks the buffer length first.
-fn sample_at(data: &[u8], bits: u32, signed: bool, i: usize) -> f64 {
-    match (bits, signed) {
-        (8, false) => data[i] as f64,
-        (8, true) => data[i] as i8 as f64,
-        (16, false) => u16::from_le_bytes([data[2 * i], data[2 * i + 1]]) as f64,
-        (16, true) => i16::from_le_bytes([data[2 * i], data[2 * i + 1]]) as f64,
-        _ => 0.0,
-    }
-}
-
 // Response (little-endian): [width u32][height u32][width*height bytes, 8-bit gray].
 // Shows the middle image of the series, windowed with the file's own window when
 // present and with the 1st-99th percentile of the image otherwise.
@@ -362,7 +567,7 @@ fn get_thumbnail(
     let s = slices.get(slices.len() / 2).ok_or("Series not found")?;
 
     // Opened directly instead of through open_cached: the shared cache holds the
-    // file shown in the viewer and must not be evicted by background thumbnails.
+    // files shown in the viewports and must not be evicted by background thumbnails.
     let obj = dicom::object::open_file(&s.path).map_err(|e| e.to_string())?;
     let px = obj
         .decode_pixel_data_frame(s.frame)
@@ -458,6 +663,147 @@ fn get_thumbnail(
     Ok(tauri::ipc::Response::new(out))
 }
 
+// ---------- Volume ----------
+
+// Decodes every requested frame of one file; the file is opened once
+fn decode_group(
+    path: &PathBuf,
+    items: &[(usize, u32)],
+    rows: usize,
+    cols: usize,
+) -> Result<Vec<(usize, Vec<f32>)>, String> {
+    let obj = dicom::object::open_file(path).map_err(|e| e.to_string())?;
+    let mut slope = f64_of(&obj, tags::RESCALE_SLOPE, 1.0);
+    if slope == 0.0 {
+        slope = 1.0;
+    }
+    let intercept = f64_of(&obj, tags::RESCALE_INTERCEPT, 0.0);
+
+    let mut out = Vec::with_capacity(items.len());
+    for &(index, frame) in items {
+        let px = obj
+            .decode_pixel_data_frame(frame)
+            .map_err(|e| e.to_string())?;
+        if px.samples_per_pixel() != 1 {
+            return Err("Color images are not supported yet".into());
+        }
+        if px.rows() as usize != rows || px.columns() as usize != cols {
+            return Err("The series contains images of different sizes".into());
+        }
+        let bits = px.bits_allocated() as u32;
+        let signed = px.pixel_representation() as u32 == 1;
+        let data = px.data();
+        if (bits != 8 && bits != 16) || data.len() < rows * cols * (bits as usize / 8) {
+            return Err("Unsupported or truncated pixel data".into());
+        }
+
+        let mut buf = vec![0f32; rows * cols];
+        for (i, o) in buf.iter_mut().enumerate() {
+            *o = (sample_at(data, bits, signed, i) * slope + intercept) as f32;
+        }
+        out.push((index, buf));
+    }
+    Ok(out)
+}
+
+// Builds the in-memory volume of a series (images in display order).
+// The error text "superseded" means a newer build or file load replaced this one.
+#[tauri::command(async)]
+fn build_volume(uid: String, state: tauri::State<AppState>) -> Result<VolumeInfo, String> {
+    if let Some(v) = state.volume.lock().unwrap().as_ref() {
+        if v.uid == uid {
+            return Ok(v.info.clone());
+        }
+    }
+
+    let slices = series_slices(&state, &uid);
+    if slices.len() < 2 {
+        return Err("A volume needs at least 2 images".into());
+    }
+    let gen = state.volume_gen.fetch_add(1, Ordering::SeqCst) + 1;
+
+    // Image size and pixel spacing come from the first image's header
+    let head = OpenFileOptions::new()
+        .read_until(tags::PIXEL_DATA)
+        .open_file(&slices[0].path)
+        .map_err(|e| e.to_string())?;
+    let rows = head
+        .element(tags::ROWS)
+        .ok()
+        .and_then(|e| e.to_int::<u32>().ok())
+        .ok_or("Missing Rows")? as usize;
+    let cols = head
+        .element(tags::COLUMNS)
+        .ok()
+        .and_then(|e| e.to_int::<u32>().ok())
+        .ok_or("Missing Columns")? as usize;
+    let pixel_spacing = array_of::<2>(&head, tags::PIXEL_SPACING)
+        .or_else(|| array_of::<2>(&head, tags::IMAGER_PIXEL_SPACING));
+
+    let bytes = rows * cols * slices.len() * 4;
+    if bytes > MAX_VOLUME_BYTES {
+        return Err(format!(
+            "The volume would need {} MB, the limit is {} MB",
+            bytes >> 20,
+            MAX_VOLUME_BYTES >> 20
+        ));
+    }
+
+    // Group frames by file so each file is opened once
+    let mut by_file: BTreeMap<PathBuf, Vec<(usize, u32)>> = BTreeMap::new();
+    for (i, s) in slices.iter().enumerate() {
+        by_file.entry(s.path.clone()).or_default().push((i, s.frame));
+    }
+    let groups: Vec<(PathBuf, Vec<(usize, u32)>)> = by_file.into_iter().collect();
+
+    let decoded = groups
+        .par_iter()
+        .map(|(path, items)| decode_group(path, items, rows, cols))
+        .collect::<Result<Vec<Vec<(usize, Vec<f32>)>>, String>>()?;
+
+    let mut data: Vec<Vec<f32>> = vec![Vec::new(); slices.len()];
+    for group in decoded {
+        for (i, buf) in group {
+            data[i] = buf;
+        }
+    }
+
+    let (vmin, vmax) = data
+        .par_iter()
+        .map(|s| {
+            s.iter()
+                .fold((f32::MAX, f32::MIN), |(lo, hi), &x| (lo.min(x), hi.max(x)))
+        })
+        .reduce(
+            || (f32::MAX, f32::MIN),
+            |a, b| (a.0.min(b.0), a.1.max(b.1)),
+        );
+
+    let (slice_spacing, uniform, tilt_deg) = slice_geometry(&slices);
+    let info = VolumeInfo {
+        cols: cols as u32,
+        rows: rows as u32,
+        depth: slices.len() as u32,
+        pixel_spacing,
+        slice_spacing,
+        uniform,
+        tilt_deg,
+        value_min: vmin as f64,
+        value_max: vmax as f64,
+        megabytes: bytes as f64 / (1024.0 * 1024.0),
+    };
+
+    if state.volume_gen.load(Ordering::SeqCst) != gen {
+        return Err("Volume build superseded".into());
+    }
+    *state.volume.lock().unwrap() = Some(Arc::new(Volume {
+        uid,
+        info: info.clone(),
+        slices: data,
+    }));
+    Ok(info)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -466,10 +812,11 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             open_folder,
             open_files,
-            select_series,
+            get_series_geometry,
             get_slice,
             get_slice_meta,
-            get_thumbnail
+            get_thumbnail,
+            build_volume
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -98,6 +98,12 @@ button:focus-visible, select:focus-visible, input:focus-visible {
   background: transparent;
   border-color: transparent;
 }
+.series-item:hover { background: var(--panel-2); }
+.series-item.shown { border-color: rgba(77, 163, 255, 0.4); }
+.series-item.active {
+  background: rgba(77, 163, 255, 0.16);
+  border-color: var(--accent);
+}
 .series-thumb {
   flex: none;
   width: 56px;
@@ -114,11 +120,6 @@ button:focus-visible, select:focus-visible, input:focus-visible {
   gap: 2px;
   min-width: 0;
 }
-.series-item:hover { background: var(--panel-2); }
-.series-item.active {
-  background: rgba(77, 163, 255, 0.16);
-  border-color: var(--accent);
-}
 .series-name {
   width: 100%;
   overflow: hidden;
@@ -127,31 +128,65 @@ button:focus-visible, select:focus-visible, input:focus-visible {
 }
 .series-meta { font-size: 11px; color: var(--muted); }
 
-#stage { flex: 1; display: flex; flex-direction: column; min-width: 0; }
-
-/* ---------- Viewport ---------- */
-#viewport {
+#stage {
   position: relative;
   flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+/* ---------- Viewports ---------- */
+#viewports {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  gap: 2px;
+  background: var(--border);
+}
+/* Drop target highlight; a pseudo-element stays above the canvases */
+#viewports::after {
+  content: "";
+  position: absolute;
+  inset: 6px;
+  z-index: 5;
+  border: 2px dashed transparent;
+  pointer-events: none;
+}
+body.dragging #viewports::after { border-color: var(--accent); }
+
+.vp {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
   overflow: hidden;
   background: #000;
-  outline: 2px dashed transparent;
-  outline-offset: -6px;
 }
-#viewport[data-tool="window"] { cursor: crosshair; }
-#viewport[data-tool="pan"] { cursor: grab; }
-#viewport[data-tool="zoom"] { cursor: zoom-in; }
-#viewport[data-tool="scroll"] { cursor: ns-resize; }
-body.dragging #viewport { outline-color: var(--accent); }
+.vp[hidden] { display: none; }
+#viewports[data-tool="window"] .vp { cursor: crosshair; }
+#viewports[data-tool="pan"] .vp { cursor: grab; }
+#viewports[data-tool="zoom"] .vp { cursor: zoom-in; }
+#viewports[data-tool="scroll"] .vp { cursor: ns-resize; }
 
-#view {
+/* Active viewport border, drawn above the canvas */
+#viewports.multi .vp.active::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  border: 1px solid var(--accent);
+  pointer-events: none;
+}
+
+.vp-canvas {
   position: absolute;
   left: 0;
   top: 0;
   transform-origin: 0 0;
   image-rendering: pixelated;
 }
-#viewport.empty #view { display: none; }
+.vp.empty .vp-canvas { display: none; }
 
 /* ---------- Overlays ---------- */
 .overlay {
@@ -165,18 +200,63 @@ body.dragging #viewport { outline-color: var(--accent); }
   white-space: pre;
   text-shadow: 0 0 3px #000;
 }
-#overlay-tl { top: 0; left: 0; }
-#overlay-tr { top: 0; right: 0; text-align: right; }
-#overlay-bl { bottom: 0; left: 0; }
-#overlay-br { bottom: 0; right: 0; text-align: right; }
+.overlay.tl { top: 0; left: 0; }
+.overlay.tr { top: 0; right: 0; text-align: right; }
+.overlay.bl { bottom: 0; left: 0; }
+.overlay.br { bottom: 0; right: 0; text-align: right; }
+#viewports.multi .overlay { padding: 6px 8px; font-size: 11px; }
 
-#status {
+/* ---------- Orientation markers and scale bars ---------- */
+.marker {
   position: absolute;
-  top: 36px;
+  font: 600 14px ui-monospace, Menlo, monospace;
+  color: var(--overlay);
+  pointer-events: none;
+  text-shadow: 0 0 3px #000;
+}
+.marker.t { top: 6px; left: 50%; transform: translateX(-50%); }
+.marker.b { bottom: 6px; left: 50%; transform: translateX(-50%); }
+.marker.l { left: 8px; top: 50%; transform: translateY(-50%); }
+.marker.r { right: 8px; top: 50%; transform: translateY(-50%); }
+
+.scalebar {
+  position: absolute;
+  display: none;
+  align-items: center;
+  pointer-events: none;
+  font: 11px ui-monospace, Menlo, monospace;
+  color: var(--overlay);
+  text-shadow: 0 0 3px #000;
+}
+.scalebar.on { display: flex; }
+.scalebar.h {
+  bottom: 34px;
+  left: 50%;
+  transform: translateX(-50%);
+  flex-direction: column;
+  gap: 2px;
+}
+.scalebar.v {
+  left: 44px; /* clears the left orientation marker */
+  top: 50%;
+  transform: translateY(-50%);
+  gap: 6px;
+}
+.scalebar svg {
+  display: block;
+  overflow: visible;
+  filter: drop-shadow(0 0 2px #000);
+}
+.vp.empty .marker,
+.vp.empty .scalebar.on { display: none; }
+
+/* ---------- Status and empty state ---------- */
+.vp-status, #status {
+  position: absolute;
   left: 50%;
   transform: translateX(-50%);
   z-index: 2;
-  max-width: 70%;
+  max-width: 80%;
   padding: 4px 12px;
   color: var(--text);
   background: rgba(0, 0, 0, 0.7);
@@ -184,10 +264,12 @@ body.dragging #viewport { outline-color: var(--accent); }
   border-radius: 6px;
   pointer-events: none;
 }
-#status:empty { display: none; }
-#status.error { color: var(--danger); border-color: var(--danger); }
+.vp-status { top: 36px; }
+#status { top: 10px; z-index: 6; }
+.vp-status:empty, #status:empty { display: none; }
+.vp-status.error, #status.error { color: var(--danger); border-color: var(--danger); }
 
-#empty {
+.vp-empty {
   position: absolute;
   inset: 0;
   display: none;
@@ -195,11 +277,13 @@ body.dragging #viewport { outline-color: var(--accent); }
   align-items: center;
   justify-content: center;
   gap: 6px;
+  padding: 0 16px;
+  text-align: center;
   pointer-events: none;
 }
-#viewport.empty #empty { display: flex; }
-#empty-title { font-size: 16px; color: var(--text); }
-#empty-sub { color: var(--muted); }
+.vp.empty .vp-empty { display: flex; }
+.vp-empty-title { font-size: 16px; color: var(--text); }
+.vp-empty-sub { color: var(--muted); }
 
 /* ---------- Slider ---------- */
 #slider-bar {
@@ -211,59 +295,6 @@ body.dragging #viewport { outline-color: var(--accent); }
   border-top: 1px solid var(--border);
 }
 #slider { flex: 1; accent-color: var(--accent); }
-
-/* ---------- Orientation markers and scale bar ---------- */
-.marker {
-  position: absolute;
-  font: 600 14px ui-monospace, Menlo, monospace;
-  color: var(--overlay);
-  pointer-events: none;
-  text-shadow: 0 0 3px #000;
-}
-#marker-t { top: 6px; left: 50%; transform: translateX(-50%); }
-#marker-b { bottom: 6px; left: 50%; transform: translateX(-50%); }
-#marker-l { left: 8px; top: 50%; transform: translateY(-50%); }
-#marker-r { right: 8px; top: 50%; transform: translateY(-50%); }
-#viewport.empty .marker { display: none; }
-
-#scalebar {
-  position: absolute;
-  bottom: 34px;
-  left: 50%;
-  transform: translateX(-50%);
-  display: none;
-  flex-direction: column;
-  align-items: center;
-  gap: 2px;
-  pointer-events: none;
-  font: 11px ui-monospace, Menlo, monospace;
-  color: var(--overlay);
-  text-shadow: 0 0 3px #000;
-}
-#scalebar.on { display: flex; }
-#viewport.empty #scalebar { display: none; }
-#scalebar-svg,
-#scalebar-v-svg {
-  display: block;
-  overflow: visible;
-  filter: drop-shadow(0 0 2px #000);
-}
-
-#scalebar-v {
-  position: absolute;
-  left: 44px; /* clears the left orientation marker */
-  top: 50%;
-  transform: translateY(-50%);
-  display: none;
-  align-items: center;
-  gap: 6px;
-  pointer-events: none;
-  font: 11px ui-monospace, Menlo, monospace;
-  color: var(--overlay);
-  text-shadow: 0 0 3px #000;
-}
-#scalebar-v.on { display: flex; }
-#viewport.empty #scalebar-v { display: none; }
 
 /* ---------- Settings dialog ---------- */
 #settings-backdrop {

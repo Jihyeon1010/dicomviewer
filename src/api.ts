@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { SeriesInfo, SliceData, SliceMeta } from "./types";
+import type { SeriesGeometry, SeriesInfo, SliceData, SliceMeta, VolumeInfo } from "./types";
 
 const HEADER_BYTES = 40;
 
@@ -12,16 +12,16 @@ export function openFiles(files: string[]): Promise<SeriesInfo[]> {
   return invoke<SeriesInfo[]>("open_files", { files });
 }
 
-export function selectSeries(uid: string): Promise<number> {
-  return invoke<number>("select_series", { uid });
+export function getSeriesGeometry(uid: string): Promise<SeriesGeometry> {
+  return invoke<SeriesGeometry>("get_series_geometry", { uid });
 }
 
-export function getSliceMeta(index: number): Promise<SliceMeta> {
-  return invoke<SliceMeta>("get_slice_meta", { index });
+export function getSliceMeta(uid: string, index: number): Promise<SliceMeta> {
+  return invoke<SliceMeta>("get_slice_meta", { uid, index });
 }
 
-export async function getSlice(index: number): Promise<SliceData> {
-  const buf = await invoke<ArrayBuffer>("get_slice", { index });
+export async function getSlice(uid: string, index: number): Promise<SliceData> {
+  const buf = await invoke<ArrayBuffer>("get_slice", { uid, index });
   return parseSlice(buf);
 }
 
@@ -99,4 +99,9 @@ export async function getThumbnail(uid: string, maxPx: number): Promise<ImageDat
     rgba[o + 3] = 255;
   }
   return new ImageData(rgba, w, h);
+}
+
+// Builds the in-memory volume of a series. The Rust side keeps it for later use.
+export function buildVolume(uid: string): Promise<VolumeInfo> {
+  return invoke<VolumeInfo>("build_volume", { uid });
 }

@@ -1,25 +1,8 @@
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-
-import {
-  getSlice,
-  getSliceMeta,
-  getThumbnail,
-  openFiles,
-  openFolder,
-  selectSeries,
-} from "./api";
-
-import { byId, byIdSvg } from "./dom";
-
-import {
-  edgeLabels,
-  SCALE_BAR_HEIGHT,
-  scaleBar,
-  scaleBarPath,
-  scaleBarPathVertical,
-} from "./guides";
-
+import { buildVolume, getThumbnail, openFiles, openFolder } from "./api";
+import { byId } from "./dom";
+import { compact, num } from "./format";
 import {
   ACTION_BY_ID,
   ACTIONS,
@@ -30,35 +13,23 @@ import {
   resolveBindings,
   type Bindings,
 } from "./keymap";
-
 import { installMenu, type AppMenu } from "./menu";
-import { GLRenderer } from "./renderer";
 import { createSettingsDialog } from "./settings-dialog";
-import { loadSettings, OVERLAY_MODES, saveSettings, type OverlayMode, type Settings } from "./settings";
-import type { SeriesInfo, SliceData, SliceMeta } from "./types";
+import {
+  LAYOUT_IDS,
+  loadSettings,
+  OVERLAY_MODES,
+  saveSettings,
+  type LayoutId,
+  type OverlayMode,
+  type Settings,
+} from "./settings";
+import type { SeriesInfo, VolumeInfo } from "./types";
+import { syncedIndex, Viewport, type ToolId, type ViewportHost } from "./viewport";
 
 // ---------- Elements ----------
-const viewport = byId("viewport", HTMLElement);
-const canvas = byId("view", HTMLCanvasElement);
-const overlayTL = byId("overlay-tl", HTMLDivElement);
-const overlayTR = byId("overlay-tr", HTMLDivElement);
-const overlayBL = byId("overlay-bl", HTMLDivElement);
-const overlayBR = byId("overlay-br", HTMLDivElement);
-const markerT = byId("marker-t", HTMLDivElement);
-const markerB = byId("marker-b", HTMLDivElement);
-const markerL = byId("marker-l", HTMLDivElement);
-const markerR = byId("marker-r", HTMLDivElement);
-const scaleEl = byId("scalebar", HTMLDivElement);
-const scaleSvg = byIdSvg("scalebar-svg", SVGSVGElement);
-const scalePath = byIdSvg("scalebar-path", SVGPathElement);
-const scaleLabel = byId("scalebar-label", HTMLDivElement);
-const scaleVEl = byId("scalebar-v", HTMLDivElement);
-const scaleVSvg = byIdSvg("scalebar-v-svg", SVGSVGElement);
-const scaleVPath = byIdSvg("scalebar-v-path", SVGPathElement);
-const scaleVLabel = byId("scalebar-v-label", HTMLDivElement);
+const viewportsEl = byId("viewports", HTMLDivElement);
 const statusEl = byId("status", HTMLDivElement);
-const emptyTitle = byId("empty-title", HTMLDivElement);
-const emptySub = byId("empty-sub", HTMLDivElement);
 const seriesList = byId("series-list", HTMLUListElement);
 const presetSel = byId("preset", HTMLSelectElement);
 const openBtn = byId("open", HTMLButtonElement);
@@ -70,8 +41,11 @@ const infoBtn = byId("info", HTMLButtonElement);
 const markersBtn = byId("markers", HTMLButtonElement);
 const anonBtn = byId("anonymize", HTMLButtonElement);
 const settingsBtn = byId("settings-open", HTMLButtonElement);
+const syncScrollBtn = byId("sync-scroll", HTMLButtonElement);
+const syncWindowBtn = byId("sync-window", HTMLButtonElement);
 const slider = byId("slider", HTMLInputElement);
 const toolButtons = document.querySelectorAll<HTMLButtonElement>("#tools .tool");
+const layoutButtons = document.querySelectorAll<HTMLButtonElement>("#layouts .layout");
 
 // ---------- Settings ----------
 let settings: Settings = loadSettings();
@@ -82,50 +56,43 @@ function update(patch: Partial<Settings>): void {
 }
 
 // ---------- State ----------
-const state = { count: 0, index: 0, wl: 40, ww: 400, invert: false };
-const view = { zoom: 1, panX: 0, panY: 0 };
-let current: SliceData | null = null;
-let meta: SliceMeta | null = null;
-let seriesData: SeriesInfo[] = [];
-let activeUid = "";
-let seriesName = "";
-let firstLoad = true; // apply the file's default WL/WW only once per series
-let autoFit = true;   // keep the image fitted until the user zooms or pans
-let fetchToken = 0;
-
-const THUMB_PX = 112; // rendered at 2x the 56 px CSS size for high-DPI screens
-const thumbs = new Map<string, ImageData>();
-const thumbCanvases = new Map<string, HTMLCanvasElement>();
-let thumbRun = 0; // bumped to cancel thumbnail loading for a previous selection
-
 const OVERLAY_LABEL: Record<OverlayMode, string> = {
   full: "Full",
   minimal: "Minimal",
   off: "Off",
 };
+const LAYOUTS: Record<LayoutId, { cols: number; rows: number }> = {
+  "1x1": { cols: 1, rows: 1 },
+  "2x1": { cols: 2, rows: 1 },
+  "1x2": { cols: 1, rows: 2 },
+  "2x2": { cols: 2, rows: 2 },
+};
+const LAYOUT_TIPS: Record<LayoutId, string> = {
+  "1x1": "Single view",
+  "2x1": "Two views side by side",
+  "1x2": "Two views stacked",
+  "2x2": "Four views",
+};
+
+let layout: LayoutId = settings.layout;
 let overlayMode: OverlayMode = settings.overlay;
 let anonymize = settings.anonymize;
 let markersOn = settings.markers;
+let syncScroll = settings.syncScroll;
+let syncWindow = settings.syncWindow;
+let tool: ToolId = "window";
 
+let seriesData: SeriesInfo[] = [];
+let hasLoaded = false;
+let volume: { uid: string; info: VolumeInfo } | null = null;
+let volumeBusy: string | null = null; // uid of the series being built
 let appMenu: AppMenu | null = null;
 
-function syncMenu(): void {
-  appMenu?.sync({
-    tool,
-    invert: state.invert,
-    markers: markersOn,
-    anonymize,
-    overlay: overlayMode,
-  });
-}
-
-// Always re-syncs, so a click on the already checked item restores its check mark
-function setOverlay(mode: OverlayMode): void {
-  overlayMode = mode;
-  update({ overlay: mode });
-  syncControls();
-  updateOverlay();
-}
+const THUMB_PX = 112; // rendered at 2x the 56 px CSS size for high-DPI screens
+const thumbs = new Map<string, ImageData>();
+const thumbCanvases = new Map<string, HTMLCanvasElement>();
+const seriesButtons = new Map<string, HTMLButtonElement>();
+let thumbRun = 0; // bumped to cancel thumbnail loading for a previous selection
 
 // Typical CT values; adjust per scanner and protocol.
 // Must contain exactly PRESET_COUNT entries (one preset.N action each).
@@ -165,6 +132,12 @@ function refreshTooltips(): void {
     const t = b.dataset["tool"] ?? "";
     setTip(b, TOOL_TIPS[t] ?? t, `tool.${t}`);
   }
+  for (const b of layoutButtons) {
+    const id = LAYOUT_IDS.find((l) => l === b.dataset["layout"]);
+    if (id) setTip(b, LAYOUT_TIPS[id], `layout.${id}`);
+  }
+  setTip(syncScrollBtn, "Scroll linked views together", "sync.scroll");
+  setTip(syncWindowBtn, "Share window / level between views", "sync.window");
   setTip(invertBtn, "Invert", "view.invert");
   setTip(fitBtn, "Fit to window", "view.fit");
   setTip(resetBtn, "Reset window", "view.resetWindow");
@@ -184,25 +157,6 @@ function refreshPresetOptions(): void {
   );
 }
 
-// ---------- Tools ----------
-type ToolId = "window" | "pan" | "zoom" | "scroll";
-let tool: ToolId = "window";
-
-function setTool(next: ToolId): void {
-  tool = next;
-  viewport.dataset["tool"] = next;
-  for (const b of toolButtons) {
-    const on = b.dataset["tool"] === next;
-    b.classList.toggle("active", on);
-    b.setAttribute("aria-pressed", String(on));
-  } syncMenu();
-}
-
-for (const b of toolButtons) {
-  b.addEventListener("click", () => setTool(b.dataset["tool"] as ToolId));
-}
-setTool("window");
-
 // ---------- Status line ----------
 function setStatus(text: string, isError = false): void {
   statusEl.textContent = text;
@@ -210,203 +164,236 @@ function setStatus(text: string, isError = false): void {
 }
 
 function showError(err: unknown): void {
-  const msg = err instanceof Error ? err.message : String(err);
-  setStatus(`Error: ${msg}`, true);
+  setStatus(`Error: ${err instanceof Error ? err.message : String(err)}`, true);
   console.error(err);
 }
 
-// ---------- Overlay formatting ----------
-type Maybe = string | false | null | undefined;
-
-function compact(items: Maybe[]): string[] {
-  return items.filter((x): x is string => typeof x === "string" && x !== "");
+function flashStatus(text: string): void {
+  setStatus(text);
+  window.setTimeout(() => {
+    if (statusEl.textContent === text) setStatus("");
+  }, 3000);
 }
 
-// DICOM person names use '^' as the component separator
-const cleanName = (s: string): string => s.replace(/\^+/g, " ").trim();
+// ---------- Viewports ----------
+const host: ViewportHost = {
+  tool: () => tool,
+  overlay: () => ({ mode: overlayMode, anonymize, markers: markersOn }),
+  activate: (vp) => activate(vp),
+  sliceChanged: (vp) => syncSlices(vp),
+  windowChanged: (vp) => syncWindows(vp),
+  stateChanged: (vp) => {
+    if (vp === active) syncControls();
+  },
+};
 
-function fmtDate(d: string): string {
-  return /^\d{8}$/.test(d) ? `${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6, 8)}` : d;
+const first = new Viewport(host);
+const viewports: Viewport[] = [first, new Viewport(host), new Viewport(host), new Viewport(host)];
+let active: Viewport = first;
+viewportsEl.append(...viewports.map((v) => v.el));
+
+function cellCount(): number {
+  const l = LAYOUTS[layout];
+  return l.cols * l.rows;
 }
 
-function fmtTime(t: string): string {
-  const m = /^(\d{2})(\d{2})(\d{2})/.exec(t);
-  return m ? `${m[1]}:${m[2]}:${m[3]}` : t;
+function visible(): Viewport[] {
+  return viewports.slice(0, cellCount());
 }
 
-// "034Y" -> "34Y"
-const fmtAge = (a: string): string => a.replace(/^0+(?=\d)/, "");
-
-// Rounds to `digits` decimals and drops trailing zeros
-const num = (v: number, digits = 2): string => String(+v.toFixed(digits));
-
-function patientLines(m: SliceMeta): string[] {
-  const demo = [m.patient_sex, fmtAge(m.patient_age)].filter(Boolean).join(" · ");
-  if (anonymize) return compact(["Anonymized", demo]);
-  return compact([
-    cleanName(m.patient_name),
-    m.patient_id && `ID ${m.patient_id}`,
-    m.patient_birth_date && `DOB ${fmtDate(m.patient_birth_date)}`,
-    demo,
-  ]);
+function activate(vp: Viewport): void {
+  if (vp === active) return;
+  active.setActive(false);
+  active = vp;
+  vp.setActive(true);
+  updateHighlights();
+  syncControls();
 }
 
-function studyLines(m: SliceMeta | null): string[] {
-  const desc = m?.series_description || seriesName;
-  if (!m) return compact([desc]);
-  const seriesLine = m.series_number
-    ? `Se ${m.series_number}${desc ? `: ${desc}` : ""}`
-    : desc;
-  return compact([
-    !anonymize && m.institution,
-    m.study_description,
-    !anonymize && [fmtDate(m.study_date), fmtTime(m.study_time)].filter(Boolean).join(" "),
-    seriesLine,
-    [m.modality, m.manufacturer_model].filter(Boolean).join(" · "),
-  ]);
+function refreshAllOverlays(): void {
+  for (const vp of viewports) vp.refreshOverlay();
 }
 
-function imageLines(s: SliceData | null, m: SliceMeta | null): string[] {
-  const position = m
-    ? [
-        m.slice_location !== null && `Loc ${num(m.slice_location, 1)} mm`,
-        m.slice_thickness !== null && `Thk ${num(m.slice_thickness)} mm`,
-      ].filter(Boolean).join("  ")
-    : "";
-  const exposure = m
-    ? [
-        m.kvp !== null && `${num(m.kvp, 0)} kVp`,
-        m.tube_current !== null && `${num(m.tube_current, 0)} mA`,
-      ].filter(Boolean).join("  ")
-    : "";
-  // pixel_spacing is [row, column]; shown as horizontal x vertical, like the matrix size
-  const spacing = m?.pixel_spacing
-    ? `Px ${num(m.pixel_spacing[1], 3)} × ${num(m.pixel_spacing[0], 3)} mm`
-    : "";
-  return compact([
-    state.count ? `Im ${state.index + 1} / ${state.count}` : "",
-    s && `${s.cols} × ${s.rows}`,
-    position,
-    exposure,
-    spacing,
-  ]);
-}
-
-function updateTextOverlays(): void {
-  const s = current;
-  const m = meta;
-
-  if (overlayMode === "off") {
-    for (const el of [overlayTL, overlayTR, overlayBL, overlayBR]) el.textContent = "";
-    return;
-  }
-
-  const full = overlayMode === "full";
-  overlayTL.textContent = full && m ? patientLines(m).join("\n") : "";
-  overlayTR.textContent = full ? studyLines(m).join("\n") : "";
-  overlayBL.textContent = full
-    ? imageLines(s, m).join("\n")
-    : state.count
-      ? `Im ${state.index + 1} / ${state.count}`
-      : "";
-  overlayBR.textContent = s
-    ? `WL ${Math.round(state.wl)}  WW ${Math.round(state.ww)}${state.invert ? "  (inverted)" : ""}\n` +
-      `Zoom ${Math.round(view.zoom * 100)}%`
-    : "";
-}
-
-// Orientation markers and scale bars. Independent of the text overlay mode.
-function updateGuides(): void {
-  const show = markersOn && current !== null;
-
-  const labels = show ? edgeLabels(meta) : null;
-  markerT.textContent = labels?.top ?? "";
-  markerB.textContent = labels?.bottom ?? "";
-  markerL.textContent = labels?.left ?? "";
-  markerR.textContent = labels?.right ?? "";
-
-  // Horizontal ruler: the column spacing is the horizontal step in millimetres
-  const colSpacing = meta?.pixel_spacing?.[1] ?? 0;
-  const bar = show && colSpacing > 0 ? scaleBar(view.zoom / colSpacing) : null;
-  scaleEl.classList.toggle("on", bar !== null);
-  if (bar) {
-    scaleSvg.setAttribute("width", String(bar.px + 2));
-    scaleSvg.setAttribute("height", String(SCALE_BAR_HEIGHT));
-    scalePath.setAttribute("d", scaleBarPath(bar));
-    scaleLabel.textContent = bar.label;
-  }
-
-  // Vertical ruler: the row spacing is the vertical step in millimetres
-  const rowSpacing = meta?.pixel_spacing?.[0] ?? 0;
-  const barV = show && rowSpacing > 0 ? scaleBar(view.zoom / rowSpacing) : null;
-  scaleVEl.classList.toggle("on", barV !== null);
-  if (barV) {
-    scaleVSvg.setAttribute("width", String(SCALE_BAR_HEIGHT));
-    scaleVSvg.setAttribute("height", String(barV.px + 2));
-    scaleVPath.setAttribute("d", scaleBarPathVertical(barV));
-    scaleVLabel.textContent = barV.label;
+// ---------- Linking ----------
+function syncSlices(src: Viewport): void {
+  if (!syncScroll) return;
+  for (const vp of visible()) {
+    if (vp === src) continue;
+    const idx = syncedIndex(src, vp);
+    if (idx !== null) vp.goto(idx, false);
   }
 }
 
-function updateOverlay(): void {
-  updateTextOverlays();
-  updateGuides();
+function syncWindows(src: Viewport): void {
+  if (!syncWindow) return;
+  for (const vp of visible()) {
+    if (vp !== src && vp.series) vp.setWindow(src.wl, src.ww, false);
+  }
+}
+
+function toggleSyncScroll(): void {
+  syncScroll = !syncScroll;
+  update({ syncScroll });
+  if (syncScroll) syncSlices(active);
+  syncControls();
+}
+
+function toggleSyncWindow(): void {
+  syncWindow = !syncWindow;
+  update({ syncWindow });
+  if (syncWindow) syncWindows(active);
+  syncControls();
+}
+
+// ---------- Layout ----------
+function applyLayout(id: LayoutId, persist = true): void {
+  layout = id;
+  if (persist) update({ layout });
+
+  const { cols, rows } = LAYOUTS[id];
+  viewportsEl.style.gridTemplateColumns = `repeat(${cols}, minmax(0, 1fr))`;
+  viewportsEl.style.gridTemplateRows = `repeat(${rows}, minmax(0, 1fr))`;
+  viewportsEl.classList.toggle("multi", cols * rows > 1);
+  viewports.forEach((vp, i) => vp.setVisible(i < cols * rows));
+
+  const shown = visible();
+  if (!shown.includes(active)) activate(shown[0] ?? first);
+  void Promise.all(fillEmptyViewports());
+}
+
+// Gives each empty visible viewport a series that is not on screen yet
+function fillEmptyViewports(): Promise<void>[] {
+  const onScreen = new Set<string>();
+  for (const vp of visible()) if (vp.series) onScreen.add(vp.series.uid);
+  const queue = seriesData.filter((s) => !onScreen.has(s.uid));
+
+  const pending: Promise<void>[] = [];
+  for (const vp of visible()) {
+    if (vp.series) continue;
+    const next = queue.shift();
+    if (!next) break;
+    pending.push(vp.setSeries(next));
+  }
+  afterAssignment();
+  return pending;
+}
+
+function showInActive(s: SeriesInfo): void {
+  void active.setSeries(s);
+  afterAssignment();
+}
+
+function afterAssignment(): void {
+  applyVolumeLines();
+  updateHighlights();
+  refreshEmptyMessages();
+  syncControls();
+}
+
+function refreshEmptyMessages(): void {
+  for (const vp of viewports) {
+    if (!hasLoaded) {
+      vp.setEmptyMessage("Drop DICOM files or a folder here", "or use Open folder / Open files above");
+    } else if (seriesData.length === 0) {
+      vp.setEmptyMessage("No DICOM files found", "Check that the selection contains DICOM data");
+    } else {
+      vp.setEmptyMessage("No series shown", "Click a series in the sidebar to show it here");
+    }
+  }
+}
+
+// ---------- Tools ----------
+function setTool(next: ToolId): void {
+  tool = next;
+  viewportsEl.dataset["tool"] = next;
+  for (const b of toolButtons) {
+    const on = b.dataset["tool"] === next;
+    b.classList.toggle("active", on);
+    b.setAttribute("aria-pressed", String(on));
+  }
+  syncMenu();
+}
+
+for (const b of toolButtons) {
+  b.addEventListener("click", () => setTool(b.dataset["tool"] as ToolId));
+}
+
+function applyPreset(i: number): void {
+  const p = PRESETS[i];
+  if (p) active.setWindow(p.wl, p.ww, true);
 }
 
 // ---------- UI sync ----------
-function setEmpty(on: boolean, title?: string, sub?: string): void {
-  viewport.classList.toggle("empty", on);
-  if (title !== undefined) emptyTitle.textContent = title;
-  if (sub !== undefined) emptySub.textContent = sub;
+function syncMenu(): void {
+  appMenu?.sync({
+    tool,
+    invert: active.invert,
+    markers: markersOn,
+    anonymize,
+    overlay: overlayMode,
+  });
+}
+
+function setPressed(btn: HTMLButtonElement, on: boolean): void {
+  btn.classList.toggle("active", on);
+  btn.setAttribute("aria-pressed", String(on));
 }
 
 function syncControls(): void {
-  const n = state.count;
+  const vp = active;
+  const n = vp.count;
   slider.max = String(Math.max(0, n - 1));
-  slider.value = String(state.index);
+  slider.value = String(vp.index);
   slider.disabled = n <= 1;
-  invertBtn.classList.toggle("active", state.invert);
-  invertBtn.setAttribute("aria-pressed", String(state.invert));
   for (const el of [invertBtn, fitBtn, resetBtn, presetSel]) el.disabled = n === 0;
 
+  setPressed(invertBtn, vp.invert);
+  setPressed(markersBtn, markersOn);
+  setPressed(anonBtn, anonymize);
+  setPressed(syncScrollBtn, syncScroll);
+  setPressed(syncWindowBtn, syncWindow);
+  for (const b of layoutButtons) setPressed(b, b.dataset["layout"] === layout);
   infoBtn.textContent = `Info: ${OVERLAY_LABEL[overlayMode]}`;
-  markersBtn.classList.toggle("active", markersOn);
-  markersBtn.setAttribute("aria-pressed", String(markersOn));
-  anonBtn.classList.toggle("active", anonymize);
-  anonBtn.setAttribute("aria-pressed", String(anonymize));
+
   syncMenu();
+}
+
+function setOverlay(mode: OverlayMode): void {
+  overlayMode = mode;
+  update({ overlay: mode });
+  syncControls();
+  refreshAllOverlays();
 }
 
 function cycleOverlay(): void {
   const next = OVERLAY_MODES[(OVERLAY_MODES.indexOf(overlayMode) + 1) % OVERLAY_MODES.length];
-  overlayMode = next ?? "full";
-  update({ overlay: overlayMode });
-  syncControls();
-  updateOverlay();
+  setOverlay(next ?? "full");
 }
 
 function toggleMarkers(): void {
   markersOn = !markersOn;
   update({ markers: markersOn });
   syncControls();
-  updateOverlay();
+  refreshAllOverlays();
 }
 
 function toggleAnonymize(): void {
   anonymize = !anonymize;
   update({ anonymize });
   syncControls();
-  updateOverlay();
+  refreshAllOverlays();
 }
 
 // ---------- Series list and thumbnails ----------
 function renderSeriesList(): void {
   thumbCanvases.clear();
+  seriesButtons.clear();
   seriesList.replaceChildren(
     ...seriesData.map((s) => {
       const li = document.createElement("li");
       const btn = document.createElement("button");
-      btn.className = "series-item" + (s.uid === activeUid ? " active" : "");
+      btn.className = "series-item";
+      seriesButtons.set(s.uid, btn);
 
       const thumb = document.createElement("canvas");
       thumb.className = "series-thumb";
@@ -425,11 +412,23 @@ function renderSeriesList(): void {
       text.append(name, info);
 
       btn.append(thumb, text);
-      btn.addEventListener("click", () => void loadSeries(s.uid));
+      btn.addEventListener("click", () => showInActive(s));
       li.append(btn);
       return li;
     }),
   );
+  updateHighlights();
+}
+
+// Strong highlight: the active viewport's series. Light outline: series on other views.
+function updateHighlights(): void {
+  const onScreen = new Set<string>();
+  for (const vp of visible()) if (vp.series) onScreen.add(vp.series.uid);
+  const activeUid = active.series?.uid;
+  for (const [uid, btn] of seriesButtons) {
+    btn.classList.toggle("active", uid === activeUid);
+    btn.classList.toggle("shown", onScreen.has(uid) && uid !== activeUid);
+  }
 }
 
 function paintThumb(uid: string): void {
@@ -463,185 +462,71 @@ async function loadThumbnails(list: SeriesInfo[]): Promise<void> {
   await Promise.all([worker(), worker(), worker()]);
 }
 
-// ---------- View transform ----------
-const clampZoom = (z: number): number => Math.min(50, Math.max(0.05, z));
-
-function applyTransform(): void {
-  canvas.style.transform = `translate(${view.panX}px, ${view.panY}px) scale(${view.zoom})`;
+// ---------- Volume ----------
+function volumeLines(uid: string): string[] {
+  if (volumeBusy === uid) return ["Volume: building…"];
+  if (!volume || volume.uid !== uid) return [];
+  const v = volume.info;
+  const sp = v.pixel_spacing;
+  const voxel =
+    sp && v.slice_spacing !== null
+      ? `Voxel ${num(sp[1], 2)} × ${num(sp[0], 2)} × ${num(v.slice_spacing, 2)} mm`
+      : "";
+  const warn = [
+    v.slice_spacing === null && "spacing unknown",
+    !v.uniform && "uneven spacing",
+    v.tilt_deg > 1 && `tilt ${num(v.tilt_deg, 1)}°`,
+  ].filter(Boolean).join(", ");
+  return compact([
+    `Volume ${v.cols} × ${v.rows} × ${v.depth}`,
+    voxel,
+    warn && `(${warn})`,
+  ]);
 }
 
-function fitView(): void {
-  if (!current) return;
-  const r = viewport.getBoundingClientRect();
-  if (r.width === 0 || r.height === 0) return;
-  view.zoom = Math.min(r.width / current.cols, r.height / current.rows);
-  view.panX = (r.width - current.cols * view.zoom) / 2;
-  view.panY = (r.height - current.rows * view.zoom) / 2;
-  autoFit = true;
-  applyTransform();
-}
-
-function zoomAt(factor: number, cx: number, cy: number): void {
-  const z2 = clampZoom(view.zoom * factor);
-  const k = z2 / view.zoom;
-  view.panX = cx - (cx - view.panX) * k;
-  view.panY = cy - (cy - view.panY) * k;
-  view.zoom = z2;
-  autoFit = false;
-  applyTransform();
-  updateOverlay();
-}
-
-function zoomCenter(factor: number): void {
-  const r = viewport.getBoundingClientRect();
-  zoomAt(factor, r.width / 2, r.height / 2);
-}
-
-new ResizeObserver(() => {
-  if (autoFit && current) {
-    fitView();
-    updateOverlay();
+function applyVolumeLines(): void {
+  for (const vp of viewports) {
+    vp.extraLines = vp.series ? volumeLines(vp.series.uid) : [];
+    vp.refreshOverlay();
   }
-}).observe(viewport);
-
-// ---------- Rendering ----------
-let drawQueued = false;
-
-function requestDraw(): void {
-  if (drawQueued) return;
-  drawQueued = true;
-  requestAnimationFrame(() => {
-    drawQueued = false;
-    draw();
-  });
 }
 
-let renderer: GLRenderer | null = null;
-try {
-  renderer = new GLRenderer(canvas, () => requestDraw());
-} catch (err) {
-  showError(err);
-}
-
-// Window/level, inversion and rescaling all run in the fragment shader,
-// so a redraw only updates uniforms and never touches the pixel data.
-function draw(): void {
-  if (!current || !renderer) return;
-  renderer.draw({ wl: state.wl, ww: state.ww, invert: state.invert });
-  updateOverlay();
-}
-
-async function loadSlice(): Promise<void> {
-  if (state.count === 0) return;
-  const token = ++fetchToken;
+async function runBuildVolume(): Promise<void> {
+  if (volumeBusy) return;
+  const s = active.series;
+  if (!s || s.slice_count < 2) {
+    flashStatus("A volume needs a series with at least 2 images");
+    return;
+  }
+  volumeBusy = s.uid;
+  applyVolumeLines();
   try {
-    // Metadata is optional: a failure there must not block the image
-    const [slice, m] = await Promise.all([
-      getSlice(state.index),
-      getSliceMeta(state.index).catch(() => null),
-    ]);
-    if (token !== fetchToken) return; // a newer request superseded this one
-
-    const dimsChanged = !current || current.rows !== slice.rows || current.cols !== slice.cols;
-    current = slice;
-    meta = m;
-    renderer?.upload(slice);
-
-    if (firstLoad) {
-      if (slice.defaultWl !== null && slice.defaultWw !== null) {
-        state.wl = slice.defaultWl;
-        state.ww = slice.defaultWw;
-      }
-      firstLoad = false;
-    }
-    if (dimsChanged) {
-      // Resizing clears the drawing buffer, so draw right after
-      canvas.width = slice.cols;
-      canvas.height = slice.rows;
-      if (autoFit) fitView();
-    }
-    setStatus("");
-    draw();
+    const info = await buildVolume(s.uid);
+    // Ignore the result when other files have been opened in the meantime
+    if (seriesData.some((x) => x.uid === s.uid)) volume = { uid: s.uid, info };
   } catch (err) {
-    showError(err);
+    const msg = err instanceof Error ? err.message : String(err);
+    if (!msg.includes("superseded")) showError(err);
+  } finally {
+    volumeBusy = null;
+    applyVolumeLines();
   }
-}
-
-function gotoSlice(next: number): void {
-  const clamped = Math.max(0, Math.min(state.count - 1, next));
-  if (clamped === state.index) return;
-  state.index = clamped;
-  syncControls();
-  updateOverlay();
-  void loadSlice();
-}
-
-function resetWindow(): void {
-  if (current?.defaultWl != null && current.defaultWw != null) {
-    state.wl = current.defaultWl;
-    state.ww = current.defaultWw;
-  } else {
-    state.wl = 40;
-    state.ww = 400;
-  }
-  requestDraw();
-}
-
-function toggleInvert(): void {
-  state.invert = !state.invert;
-  syncControls();
-  requestDraw();
-}
-
-function applyPreset(i: number): void {
-  const p = PRESETS[i];
-  if (!p) return;
-  state.wl = p.wl;
-  state.ww = p.ww;
-  requestDraw();
 }
 
 // ---------- Loading ----------
-async function loadSeries(uid: string): Promise<void> {
-  try {
-    state.count = await selectSeries(uid);
-    state.index = 0;
-    firstLoad = true;
-    autoFit = true;
-    current = null;
-    meta = null;
-    activeUid = uid;
-    seriesName = seriesData.find((s) => s.uid === uid)?.description ?? "";
-    renderSeriesList();
-    setEmpty(false);
-    syncControls();
-    await loadSlice();
-  } catch (err) {
-    showError(err);
-  }
-}
-
 async function showSeries(list: SeriesInfo[]): Promise<void> {
   thumbRun++; // cancels thumbnail loading for the previous selection
   thumbs.clear();
   seriesData = list;
-  activeUid = "";
+  hasLoaded = true;
+  volume = null;
+  for (const vp of viewports) void vp.setSeries(null);
   renderSeriesList();
 
-  const first = list[0];
-  if (!first) {
-    current = null;
-    meta = null;
-    state.count = 0;
-    state.index = 0;
-    seriesName = "";
-    setStatus("");
-    setEmpty(true, "No DICOM files found", "Check that the selection contains DICOM data");
-    syncControls();
-    updateOverlay();
-    return;
-  }
-  await loadSeries(first.uid);
+  activate(visible()[0] ?? first);
+  // Thumbnails wait until the first images are on screen
+  await Promise.all(fillEmptyViewports());
+  setStatus("");
   void loadThumbnails(list);
 }
 
@@ -675,12 +560,22 @@ openFilesBtn.addEventListener("click", async () => {
   }
 });
 
-invertBtn.addEventListener("click", toggleInvert);
-fitBtn.addEventListener("click", () => { fitView(); updateOverlay(); });
-resetBtn.addEventListener("click", resetWindow);
+// ---------- Toolbar ----------
+invertBtn.addEventListener("click", () => active.toggleInvert());
+fitBtn.addEventListener("click", () => active.fit());
+resetBtn.addEventListener("click", () => active.resetWindow());
 infoBtn.addEventListener("click", cycleOverlay);
 markersBtn.addEventListener("click", toggleMarkers);
 anonBtn.addEventListener("click", toggleAnonymize);
+syncScrollBtn.addEventListener("click", toggleSyncScroll);
+syncWindowBtn.addEventListener("click", toggleSyncWindow);
+
+for (const b of layoutButtons) {
+  b.addEventListener("click", () => {
+    const id = LAYOUT_IDS.find((l) => l === b.dataset["layout"]);
+    if (id) applyLayout(id);
+  });
+}
 
 presetSel.addEventListener("change", () => {
   if (presetSel.value !== "") applyPreset(Number(presetSel.value));
@@ -688,7 +583,7 @@ presetSel.addEventListener("change", () => {
   presetSel.blur();
 });
 
-slider.addEventListener("input", () => gotoSlice(Number(slider.value)));
+slider.addEventListener("input", () => active.goto(Number(slider.value)));
 slider.addEventListener("change", () => slider.blur());
 
 // ---------- Drag and drop (files and folders) ----------
@@ -701,99 +596,6 @@ void getCurrentWebview().onDragDropEvent(async (event) => {
   document.body.classList.remove("dragging");
   if (p.type !== "drop" || p.paths.length === 0) return;
   await loadInputs(() => openFiles(p.paths));
-});
-
-// ---------- Mouse ----------
-// Wheel: scroll slices. Pinch (ctrl+wheel): zoom at the cursor.
-// Left drag: active tool. Right / middle / Shift+left drag: pan.
-let wheelAcc = 0;
-viewport.addEventListener(
-  "wheel",
-  (e: WheelEvent) => {
-    e.preventDefault();
-    if (!current) return;
-    if (e.ctrlKey) {
-      const r = viewport.getBoundingClientRect();
-      zoomAt(Math.exp(-e.deltaY * 0.01), e.clientX - r.left, e.clientY - r.top);
-      return;
-    }
-    wheelAcc += e.deltaY;
-    const steps = Math.trunc(wheelAcc / 40);
-    if (steps !== 0) {
-      wheelAcc -= steps * 40;
-      gotoSlice(state.index + steps);
-    }
-  },
-  { passive: false },
-);
-
-interface Drag {
-  mode: ToolId;
-  x: number; y: number;   // pointer start (client coordinates)
-  ax: number; ay: number; // anchor point in viewport coordinates
-  wl: number; ww: number;
-  panX: number; panY: number; zoom: number;
-  index: number;
-}
-let drag: Drag | null = null;
-
-viewport.addEventListener("contextmenu", (e) => e.preventDefault());
-
-viewport.addEventListener("mousedown", (e: MouseEvent) => {
-  if (!current) return;
-  const panOverride = e.button === 1 || e.button === 2 || (e.button === 0 && e.shiftKey);
-  const r = viewport.getBoundingClientRect();
-  drag = {
-    mode: panOverride ? "pan" : tool,
-    x: e.clientX, y: e.clientY,
-    ax: e.clientX - r.left, ay: e.clientY - r.top,
-    wl: state.wl, ww: state.ww,
-    panX: view.panX, panY: view.panY, zoom: view.zoom,
-    index: state.index,
-  };
-  e.preventDefault();
-});
-
-window.addEventListener("mouseup", () => { drag = null; });
-
-window.addEventListener("mousemove", (e: MouseEvent) => {
-  if (!drag) return;
-  const dx = e.clientX - drag.x;
-  const dy = e.clientY - drag.y;
-
-  switch (drag.mode) {
-    case "window":
-      state.ww = Math.max(1, drag.ww + dx * 2);
-      state.wl = drag.wl + dy * 2;
-      requestDraw();
-      break;
-    case "pan":
-      view.panX = drag.panX + dx;
-      view.panY = drag.panY + dy;
-      autoFit = false;
-      applyTransform();
-      break;
-    case "zoom": {
-      // Drag up to zoom in, anchored at the point where the drag started
-      const z2 = clampZoom(drag.zoom * Math.exp(-dy * 0.01));
-      const k = z2 / drag.zoom;
-      view.panX = drag.ax - (drag.ax - drag.panX) * k;
-      view.panY = drag.ay - (drag.ay - drag.panY) * k;
-      view.zoom = z2;
-      autoFit = false;
-      applyTransform();
-      updateOverlay();
-      break;
-    }
-    case "scroll":
-      gotoSlice(drag.index + Math.trunc(dy / 8)); // 8 px per slice
-      break;
-  }
-});
-
-viewport.addEventListener("dblclick", () => {
-  fitView();
-  updateOverlay();
 });
 
 // ---------- Settings dialog and keyboard ----------
@@ -809,19 +611,20 @@ const dialog = createSettingsDialog({
 
 settingsBtn.addEventListener("click", () => dialog.open());
 
-// One handler per action id; the keys that trigger them live in keymap.ts and the settings
+// One handler per action id; the keys that trigger them live in keymap.ts and the settings.
+// Image, view and window actions apply to the active viewport.
 const handlers: Record<string, () => void> = {
-  "slice.prev": () => gotoSlice(state.index - 1),
-  "slice.next": () => gotoSlice(state.index + 1),
-  "slice.back10": () => gotoSlice(state.index - 10),
-  "slice.fwd10": () => gotoSlice(state.index + 10),
-  "slice.first": () => gotoSlice(0),
-  "slice.last": () => gotoSlice(state.count - 1),
-  "view.zoomIn": () => zoomCenter(1.25),
-  "view.zoomOut": () => zoomCenter(0.8),
-  "view.fit": () => { fitView(); updateOverlay(); },
-  "view.invert": toggleInvert,
-  "view.resetWindow": resetWindow,
+  "slice.prev": () => active.goto(active.index - 1),
+  "slice.next": () => active.goto(active.index + 1),
+  "slice.back10": () => active.goto(active.index - 10),
+  "slice.fwd10": () => active.goto(active.index + 10),
+  "slice.first": () => active.goto(0),
+  "slice.last": () => active.goto(active.count - 1),
+  "view.zoomIn": () => active.zoomBy(1.25),
+  "view.zoomOut": () => active.zoomBy(0.8),
+  "view.fit": () => active.fit(),
+  "view.invert": () => active.toggleInvert(),
+  "view.resetWindow": () => active.resetWindow(),
   "tool.window": () => setTool("window"),
   "tool.pan": () => setTool("pan"),
   "tool.zoom": () => setTool("zoom"),
@@ -830,9 +633,15 @@ const handlers: Record<string, () => void> = {
   "ui.markers": toggleMarkers,
   "ui.anonymize": toggleAnonymize,
   "ui.settings": () => dialog.open(),
+  "volume.build": () => void runBuildVolume(),
+  "sync.scroll": toggleSyncScroll,
+  "sync.window": toggleSyncWindow,
 };
 for (let i = 1; i <= PRESET_COUNT; i++) {
   handlers[`preset.${i}`] = () => applyPreset(i - 1);
+}
+for (const id of LAYOUT_IDS) {
+  handlers[`layout.${id}`] = () => applyLayout(id);
 }
 for (const a of ACTIONS) {
   if (!handlers[a.id]) console.warn(`No handler for action ${a.id}`);
@@ -864,7 +673,7 @@ installMenu({
   appName: "DICOM Viewer",
   presetNames: PRESETS.map((p) => p.name),
   run: (id) => {
-    if (dialog.isOpen()) {
+    if (dialog.isOpen() && id !== "ui.settings") {
       syncMenu(); // undo the native check toggle; the action itself is ignored
       return;
     }
@@ -889,7 +698,12 @@ installMenu({
     syncMenu();
   });
 
+// ---------- Init ----------
+first.setActive(true);
+setTool("window");
+applyLayout(layout, false);
+refreshEmptyMessages();
 refreshPresetOptions();
 refreshTooltips();
 syncControls();
-updateOverlay();
+refreshAllOverlays();

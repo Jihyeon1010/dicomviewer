@@ -3,18 +3,34 @@ import { ACTIONS, type Bindings } from "./keymap";
 export type OverlayMode = "full" | "minimal" | "off";
 export const OVERLAY_MODES: OverlayMode[] = ["full", "minimal", "off"];
 
+// Columns x rows: "2x1" is two views side by side, "1x2" is two stacked
+export type LayoutId = "1x1" | "2x1" | "1x2" | "2x2";
+export const LAYOUT_IDS: LayoutId[] = ["1x1", "2x1", "1x2", "2x2"];
+
 export interface Settings {
   version: 1;
   overlay: OverlayMode;
   anonymize: boolean;
   markers: boolean;
+  layout: LayoutId;
+  syncScroll: boolean;
+  syncWindow: boolean;
   keymap: Bindings; // overrides only: actions whose keys differ from the defaults
 }
 
 const STORAGE_KEY = "settings";
 
 function defaults(): Settings {
-  return { version: 1, overlay: "full", anonymize: false, markers: true, keymap: {} };
+  return {
+    version: 1,
+    overlay: "full",
+    anonymize: false,
+    markers: true,
+    layout: "1x1",
+    syncScroll: true,
+    syncWindow: false,
+    keymap: {},
+  };
 }
 
 function readItem(key: string): string | null {
@@ -34,11 +50,14 @@ function sanitize(p: unknown, base: Settings): Settings {
   if (!isRecord(p)) return base;
   const out: Settings = { ...base };
 
-  const overlay = p["overlay"];
-  const mode = OVERLAY_MODES.find((m) => m === overlay);
+  const mode = OVERLAY_MODES.find((m) => m === p["overlay"]);
   if (mode) out.overlay = mode;
+  const layout = LAYOUT_IDS.find((l) => l === p["layout"]);
+  if (layout) out.layout = layout;
   if (typeof p["anonymize"] === "boolean") out.anonymize = p["anonymize"];
   if (typeof p["markers"] === "boolean") out.markers = p["markers"];
+  if (typeof p["syncScroll"] === "boolean") out.syncScroll = p["syncScroll"];
+  if (typeof p["syncWindow"] === "boolean") out.syncWindow = p["syncWindow"];
 
   const km = p["keymap"];
   if (isRecord(km)) {
