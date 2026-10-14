@@ -1,7 +1,7 @@
 use dicom::core::Tag;
 use dicom::dictionary_std::tags;
 use dicom::object::{DefaultDicomObject, OpenFileOptions};
-use dicom::pixeldata::PixelDecoder;
+use dicom::pixeldata::{DecodedPixelData, PixelDecoder};
 use rayon::prelude::*;
 use serde::Serialize;
 use std::{
@@ -163,6 +163,173 @@ fn sample_at(data: &[u8], bits: u32, signed: bool, i: usize) -> f64 {
         (16, true) => i16::from_le_bytes([data[2 * i], data[2 * i + 1]]) as f64,
         _ => 0.0,
     }
+}
+
+// ---------- Color images ----------
+
+// Colour images (RGB, YBR) have three samples per pixel. PALETTE COLOR has one sample
+// per pixel that indexes a colour table. Both are shown through the RGB path.
+fn is_color(obj: &DefaultDicomObject, px: &DecodedPixelData<'_>) -> bool {
+    px.samples_per_pixel() == 3
+        || text_of(obj, tags::PHOTOMETRIC_INTERPRETATION) == "PALETTE COLOR"
+}
+
+// Raw bytes of an element (palette tables are stored as 16-bit little-endian words)
+fn bytes_of(obj: &DefaultDicomObject, tag: Tag) -> Option<Vec<u8>> {
+    obj.element(tag)
+        .ok()
+        .and_then(|e| e.to_bytes().ok().map(|b| b.into_owned()))
+}
+
+// PALETTE COLOR: the decoded samples are indices into three lookup tables.
+// Returns interleaved 8-bit RGB.
+fn palette_to_rgb(
+    obj: &DefaultDicomObject,
+    px: &DecodedPixelData<'_>,
+) -> Result<(usize, usize, Vec<u8>), String> {
+    let rows = px.rows() as usize;
+    let cols = px.columns() as usize;
+    let bits = px.bits_allocated() as u32;
+    let signed = px.pixel_representation() as u32 == 1;
+    let data = px.data();
+    if (bits != 8 && bits != 16) || data.len() < rows * cols * (bits as usize / 8) {
+        return Err("Unsupported or truncated palette image".into());
+    }
+
+    // Descriptor: [number of entries (0 means 65536), first mapped value, bits per entry]
+    let descriptor = multi_f64(obj, tags::RED_PALETTE_COLOR_LOOKUP_TABLE_DESCRIPTOR)
+        .filter(|d| d.len() >= 3)
+        .ok_or("Missing palette descriptor")?;
+    let entries = if descriptor[0] as usize == 0 { 65536 } else { descriptor[0] as usize };
+    let first = descriptor[1] as i64;
+    let entry_bits = descriptor[2] as u32;
+
+    let table = |tag: Tag| -> Result<Vec<u8>, String> {
+        let raw = bytes_of(obj, tag).ok_or("Missing palette lookup table data")?;
+        // 16-bit entries: keep the high byte. 8-bit entries are stored one per word
+        // in some files (values 0-255 in the low byte); keep the low byte then.
+        let out: Vec<u8> = raw
+            .chunks_exact(2)
+            .take(entries)
+            .map(|w| {
+                let v = u16::from_le_bytes([w[0], w[1]]);
+                if entry_bits <= 8 { v as u8 } else { (v >> 8) as u8 }
+            })
+            .collect();
+        if out.is_empty() {
+            return Err("Empty palette lookup table".into());
+        }
+        Ok(out)
+    };
+    let red = table(tags::RED_PALETTE_COLOR_LOOKUP_TABLE_DATA)?;
+    let green = table(tags::GREEN_PALETTE_COLOR_LOOKUP_TABLE_DATA)?;
+    let blue = table(tags::BLUE_PALETTE_COLOR_LOOKUP_TABLE_DATA)?;
+
+    let mut out = Vec::with_capacity(rows * cols * 3);
+
+    for i in 0..rows * cols {
+        let v = sample_at(data, bits, signed, i) as i64;
+        // Values below the first mapped one use the first entry, values above the last use the last
+        let idx = (v - first).clamp(0, red.len() as i64 - 1) as usize;
+        out.push(red[idx]);
+        out.push(green.get(idx).copied().unwrap_or(0));
+        out.push(blue.get(idx).copied().unwrap_or(0));
+    }
+    Ok((cols, rows, out))
+}
+
+// 8-bit interleaved RGB of a decoded colour image: (width, height, bytes).
+// Palette images go through their lookup tables. For true colour the pixeldata
+// crate handles planar layouts, YBR conversion and 16-bit samples.
+fn rgb8_of(
+    obj: &DefaultDicomObject,
+    px: &DecodedPixelData<'_>,
+) -> Result<(usize, usize, Vec<u8>), String> {
+    if text_of(obj, tags::PHOTOMETRIC_INTERPRETATION) == "PALETTE COLOR" {
+        return palette_to_rgb(obj, px);
+    }
+    let img = px.to_dynamic_image(0).map_err(|e| e.to_string())?.to_rgb8();
+    let (w, h) = (img.width() as usize, img.height() as usize);
+    Ok((w, h, img.into_raw()))
+}
+
+// 40-byte header of a slice response (little-endian):
+// [rows u32][cols u32][bits u32][signed u32]
+// [slope f32][intercept f32][wc f32][ww f32][mono1 u32][samples u32]
+struct SliceHeader {
+    rows: u32,
+    cols: u32,
+    bits: u32,
+    signed: bool,
+    slope: f32,
+    intercept: f32,
+    wc: f32,
+    ww: f32,
+    mono1: bool,
+    samples: u32, // 1 = grayscale, 3 = RGB
+}
+
+impl SliceHeader {
+    fn write(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.rows.to_le_bytes());
+        out.extend_from_slice(&self.cols.to_le_bytes());
+        out.extend_from_slice(&self.bits.to_le_bytes());
+        out.extend_from_slice(&(self.signed as u32).to_le_bytes());
+        out.extend_from_slice(&self.slope.to_le_bytes());
+        out.extend_from_slice(&self.intercept.to_le_bytes());
+        out.extend_from_slice(&self.wc.to_le_bytes());
+        out.extend_from_slice(&self.ww.to_le_bytes());
+        out.extend_from_slice(&(self.mono1 as u32).to_le_bytes());
+        out.extend_from_slice(&self.samples.to_le_bytes());
+    }
+}
+
+// Output size that keeps the aspect ratio and never upscales
+fn fit_size(cols: usize, rows: usize, max_px: usize) -> (usize, usize) {
+    let longest = rows.max(cols);
+    if longest <= max_px {
+        (cols, rows)
+    } else {
+        (
+            (cols * max_px / longest).max(1),
+            (rows * max_px / longest).max(1),
+        )
+    }
+}
+
+// Box-average downscale of interleaved RGB
+fn downscale_rgb(src: &[u8], cols: usize, rows: usize, ow: usize, oh: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(ow * oh * 3);
+    for oy in 0..oh {
+        let y0 = oy * rows / oh;
+        let y1 = ((oy + 1) * rows / oh).max(y0 + 1).min(rows);
+        for ox in 0..ow {
+            let x0 = ox * cols / ow;
+            let x1 = ((ox + 1) * cols / ow).max(x0 + 1).min(cols);
+            let mut sum = [0u32; 3];
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let i = (y * cols + x) * 3;
+                    sum[0] += src[i] as u32;
+                    sum[1] += src[i + 1] as u32;
+                    sum[2] += src[i + 2] as u32;
+                }
+            }
+            let n = ((y1 - y0) * (x1 - x0)) as u32;
+            out.extend(sum.iter().map(|&s| (s / n) as u8));
+        }
+    }
+    out
+}
+
+// Response (little-endian): [width u32][height u32][channels u32][width*height*channels bytes]
+fn thumb_response(w: usize, h: usize, channels: u32, bytes: Vec<u8>) -> tauri::ipc::Response {
+    let mut out = Vec::with_capacity(12 + bytes.len());
+    out.extend_from_slice(&(w as u32).to_le_bytes());
+    out.extend_from_slice(&(h as u32).to_le_bytes());
+    out.extend_from_slice(&channels.to_le_bytes());
+    out.extend_from_slice(&bytes);
+    tauri::ipc::Response::new(out)
 }
 
 // ---------- Geometry and ordering ----------
@@ -447,9 +614,8 @@ fn get_series_geometry(uid: String, state: tauri::State<AppState>) -> SeriesGeom
     }
 }
 
-// 40-byte header (little-endian):
-// [rows u32][cols u32][bits u32][signed u32]
-// [slope f32][intercept f32][wc f32][ww f32][mono1 u32][pad u32]
+// Response: a 40-byte SliceHeader followed by the pixel bytes
+// (16- or 8-bit samples for grayscale, 8-bit interleaved RGB for colour).
 #[tauri::command(async)]
 fn get_slice(
     uid: String,
@@ -462,34 +628,53 @@ fn get_slice(
         .decode_pixel_data_frame(frame)
         .map_err(|e| e.to_string())?;
 
+    if is_color(&obj, &px) {
+
+        // Rescale and windowing do not apply to colour images, so those fields stay neutral
+        let (w, h, rgb) = rgb8_of(&obj, &px)?;
+        let header = SliceHeader {
+            rows: h as u32,
+            cols: w as u32,
+            bits: 8,
+            signed: false,
+            slope: 1.0,
+            intercept: 0.0,
+            wc: f32::NAN,
+            ww: f32::NAN,
+            mono1: false,
+            samples: 3,
+        };
+        let mut out = Vec::with_capacity(40 + rgb.len());
+        header.write(&mut out);
+        out.extend_from_slice(&rgb);
+        return Ok(tauri::ipc::Response::new(out));
+    }
+
     if px.samples_per_pixel() != 1 {
-        return Err("Color (multi-sample) images are not supported yet".into());
+        return Err(format!(
+            "Unsupported number of samples per pixel: {}",
+            px.samples_per_pixel()
+        ));
     }
 
     // Note: only top-level rescale and window attributes are read. Enhanced
     // multiframe objects keep them in functional group sequences instead.
-    let slope = f64_of(&obj, tags::RESCALE_SLOPE, 1.0) as f32;
-    let intercept = f64_of(&obj, tags::RESCALE_INTERCEPT, 0.0) as f32;
-    let wc = first_f64(&obj, tags::WINDOW_CENTER).unwrap_or(f64::NAN) as f32;
-    let ww = first_f64(&obj, tags::WINDOW_WIDTH).unwrap_or(f64::NAN) as f32;
-    let mono1 = obj
-        .element(tags::PHOTOMETRIC_INTERPRETATION)
-        .ok()
-        .and_then(|e| e.to_str().ok().map(|s| s.trim() == "MONOCHROME1"))
-        .unwrap_or(false);
+    let header = SliceHeader {
+        rows: px.rows(),
+        cols: px.columns(),
+        bits: px.bits_allocated() as u32,
+        signed: px.pixel_representation() as u32 == 1,
+        slope: f64_of(&obj, tags::RESCALE_SLOPE, 1.0) as f32,
+        intercept: f64_of(&obj, tags::RESCALE_INTERCEPT, 0.0) as f32,
+        wc: first_f64(&obj, tags::WINDOW_CENTER).unwrap_or(f64::NAN) as f32,
+        ww: first_f64(&obj, tags::WINDOW_WIDTH).unwrap_or(f64::NAN) as f32,
+        mono1: text_of(&obj, tags::PHOTOMETRIC_INTERPRETATION) == "MONOCHROME1",
+        samples: 1,
+    };
 
     let data = px.data();
     let mut out = Vec::with_capacity(40 + data.len());
-    out.extend_from_slice(&px.rows().to_le_bytes());
-    out.extend_from_slice(&px.columns().to_le_bytes());
-    out.extend_from_slice(&(px.bits_allocated() as u32).to_le_bytes());
-    out.extend_from_slice(&(px.pixel_representation() as u32).to_le_bytes());
-    out.extend_from_slice(&slope.to_le_bytes());
-    out.extend_from_slice(&intercept.to_le_bytes());
-    out.extend_from_slice(&wc.to_le_bytes());
-    out.extend_from_slice(&ww.to_le_bytes());
-    out.extend_from_slice(&(mono1 as u32).to_le_bytes());
-    out.extend_from_slice(&0u32.to_le_bytes());
+    header.write(&mut out);
     out.extend_from_slice(data);
     Ok(tauri::ipc::Response::new(out))
 }
@@ -553,9 +738,9 @@ fn get_slice_meta(
     })
 }
 
-// Response (little-endian): [width u32][height u32][width*height bytes, 8-bit gray].
-// Shows the middle image of the series, windowed with the file's own window when
-// present and with the 1st-99th percentile of the image otherwise.
+// Shows the middle image of the series. Grayscale is windowed with the file's own
+// window when present and with the 1st-99th percentile of the image otherwise;
+// colour images are only scaled down. See thumb_response for the format.
 #[tauri::command(async)]
 fn get_thumbnail(
     uid: String,
@@ -572,8 +757,17 @@ fn get_thumbnail(
     let px = obj
         .decode_pixel_data_frame(s.frame)
         .map_err(|e| e.to_string())?;
+
+    if is_color(&obj, &px) {
+        let (w, h, rgb) = rgb8_of(&obj, &px)?;
+        let (ow, oh) = fit_size(w, h, max_px);
+        return Ok(thumb_response(ow, oh, 3, downscale_rgb(&rgb, w, h, ow, oh)));
+    }
     if px.samples_per_pixel() != 1 {
-        return Err("Color images are not supported yet".into());
+        return Err(format!(
+            "Unsupported number of samples per pixel: {}",
+            px.samples_per_pixel()
+        ));
     }
 
     let rows = px.rows() as usize;
@@ -589,16 +783,7 @@ fn get_thumbnail(
         return Err("Unsupported or truncated pixel data".into());
     }
 
-    // Output size keeps the aspect ratio and never upscales
-    let longest = rows.max(cols);
-    let (ow, oh) = if longest <= max_px {
-        (cols, rows)
-    } else {
-        (
-            (cols * max_px / longest).max(1),
-            (rows * max_px / longest).max(1),
-        )
-    };
+    let (ow, oh) = fit_size(cols, rows, max_px);
 
     // Box-average each output pixel over its block of source pixels
     let mut values: Vec<f32> = Vec::with_capacity(ow * oh);
@@ -643,24 +828,19 @@ fn get_thumbnail(
     });
     let width = (hi - lo).max(1e-6);
 
-    let mono1 = obj
-        .element(tags::PHOTOMETRIC_INTERPRETATION)
-        .ok()
-        .and_then(|e| e.to_str().ok().map(|s| s.trim() == "MONOCHROME1"))
-        .unwrap_or(false);
-
-    let mut out = Vec::with_capacity(8 + ow * oh);
-    out.extend_from_slice(&(ow as u32).to_le_bytes());
-    out.extend_from_slice(&(oh as u32).to_le_bytes());
-    out.extend(values.iter().map(|&v| {
-        let g = (((v as f64 - lo) / width) * 255.0).clamp(0.0, 255.0) as u8;
-        if mono1 {
-            255 - g
-        } else {
-            g
-        }
-    }));
-    Ok(tauri::ipc::Response::new(out))
+    let mono1 = text_of(&obj, tags::PHOTOMETRIC_INTERPRETATION) == "MONOCHROME1";
+    let bytes: Vec<u8> = values
+        .iter()
+        .map(|&v| {
+            let g = (((v as f64 - lo) / width) * 255.0).clamp(0.0, 255.0) as u8;
+            if mono1 {
+                255 - g
+            } else {
+                g
+            }
+        })
+        .collect();
+    Ok(thumb_response(ow, oh, 1, bytes))
 }
 
 // ---------- Volume ----------

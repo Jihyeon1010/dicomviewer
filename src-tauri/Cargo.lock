@@ -1078,6 +1078,7 @@ name = "dicomviewer"
 version = "0.1.0"
 dependencies = [
  "dicom",
+ "dicom-pixeldata",
  "rayon",
  "serde",
  "serde_json",

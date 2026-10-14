@@ -16,6 +16,7 @@ export interface SliceData {
   defaultWl: number | null; // null when the file has no window attributes
   defaultWw: number | null;
   monochrome1: boolean;
+  samples: 1 | 3; // 1 = grayscale, 3 = RGB (8-bit, interleaved)
   pixels: PixelArray;
 }
 

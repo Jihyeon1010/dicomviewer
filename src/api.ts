@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type { SeriesGeometry, SeriesInfo, SliceData, SliceMeta, VolumeInfo } from "./types";
 
 const HEADER_BYTES = 40;
+const THUMB_HEADER_BYTES = 12;
 
 export function openFolder(dir: string): Promise<SeriesInfo[]> {
   return invoke<SeriesInfo[]>("open_folder", { dir });
@@ -27,7 +28,8 @@ export async function getSlice(uid: string, index: number): Promise<SliceData> {
 
 // 40-byte header (little-endian):
 // [rows u32][cols u32][bits u32][signed u32]
-// [slope f32][intercept f32][wc f32][ww f32][mono1 u32][pad u32]
+// [slope f32][intercept f32][wc f32][ww f32][mono1 u32][samples u32]
+// followed by the pixels: 8/16-bit grayscale, or 8-bit interleaved RGB when samples is 3
 function parseSlice(buf: ArrayBuffer): SliceData {
   if (buf.byteLength < HEADER_BYTES) {
     throw new Error(`Slice response too short (${buf.byteLength} bytes)`);
@@ -42,11 +44,20 @@ function parseSlice(buf: ArrayBuffer): SliceData {
   const wc = dv.getFloat32(24, true);
   const ww = dv.getFloat32(28, true);
   const monochrome1 = dv.getUint32(32, true) === 1;
+  const samplesRaw = dv.getUint32(36, true);
 
   if (bits !== 8 && bits !== 16) {
     throw new Error(`Unsupported BitsAllocated: ${bits}`);
   }
-  const length = rows * cols;
+  if (samplesRaw !== 1 && samplesRaw !== 3) {
+    throw new Error(`Unsupported samples per pixel: ${samplesRaw}`);
+  }
+  if (samplesRaw === 3 && bits !== 8) {
+    throw new Error("Colour images must be 8-bit");
+  }
+  const samples: 1 | 3 = samplesRaw === 3 ? 3 : 1;
+
+  const length = rows * cols * samples;
   const expected = length * (bits / 8);
   const actual = buf.byteLength - HEADER_BYTES;
   if (actual < expected) {
@@ -70,32 +81,45 @@ function parseSlice(buf: ArrayBuffer): SliceData {
     defaultWl: Number.isFinite(wc) ? wc : null,
     defaultWw: Number.isFinite(ww) && ww > 0 ? ww : null,
     monochrome1,
+    samples,
     pixels,
   };
 }
 
-// Response (little-endian): [width u32][height u32][width*height bytes, 8-bit gray]
+// Response (little-endian): [width u32][height u32][channels u32][width*height*channels bytes]
+// channels is 1 (8-bit gray) or 3 (8-bit RGB)
 export async function getThumbnail(uid: string, maxPx: number): Promise<ImageData> {
   const buf = await invoke<ArrayBuffer>("get_thumbnail", { uid, maxPx });
-  if (buf.byteLength < 8) {
+  if (buf.byteLength < THUMB_HEADER_BYTES) {
     throw new Error(`Thumbnail response too short (${buf.byteLength} bytes)`);
   }
   const dv = new DataView(buf);
   const w = dv.getUint32(0, true);
   const h = dv.getUint32(4, true);
-  if (w === 0 || h === 0 || buf.byteLength - 8 < w * h) {
-    throw new Error(`Thumbnail size mismatch: ${w}x${h}, ${buf.byteLength - 8} bytes`);
+  const channels = dv.getUint32(8, true);
+  if (channels !== 1 && channels !== 3) {
+    throw new Error(`Unsupported thumbnail channel count: ${channels}`);
+  }
+  if (w === 0 || h === 0 || buf.byteLength - THUMB_HEADER_BYTES < w * h * channels) {
+    throw new Error(`Thumbnail size mismatch: ${w}x${h}x${channels}, ${buf.byteLength} bytes`);
   }
 
-  // Expand gray to RGBA for ImageData
-  const gray = new Uint8Array(buf, 8, w * h);
+  // Expand to RGBA for ImageData
+  const src = new Uint8Array(buf, THUMB_HEADER_BYTES, w * h * channels);
   const rgba = new Uint8ClampedArray(w * h * 4);
-  for (let i = 0; i < gray.length; i++) {
-    const g = gray[i] as number;
+  for (let i = 0; i < w * h; i++) {
     const o = i * 4;
-    rgba[o] = g;
-    rgba[o + 1] = g;
-    rgba[o + 2] = g;
+    if (channels === 1) {
+      const g = src[i] as number;
+      rgba[o] = g;
+      rgba[o + 1] = g;
+      rgba[o + 2] = g;
+    } else {
+      const j = i * 3;
+      rgba[o] = src[j] as number;
+      rgba[o + 1] = src[j + 1] as number;
+      rgba[o + 2] = src[j + 2] as number;
+    }
     rgba[o + 3] = 255;
   }
   return new ImageData(rgba, w, h);

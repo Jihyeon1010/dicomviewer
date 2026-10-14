@@ -187,6 +187,7 @@ body.dragging #viewports::after { border-color: var(--accent); }
   image-rendering: pixelated;
 }
 .vp.empty .vp-canvas { display: none; }
+.vp-canvas[hidden] { display: none; }
 
 /* ---------- Overlays ---------- */
 .overlay {

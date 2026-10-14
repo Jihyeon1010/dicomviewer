@@ -345,7 +345,9 @@ function syncControls(): void {
   slider.max = String(Math.max(0, n - 1));
   slider.value = String(vp.index);
   slider.disabled = n <= 1;
-  for (const el of [invertBtn, fitBtn, resetBtn, presetSel]) el.disabled = n === 0;
+  for (const el of [invertBtn, fitBtn]) el.disabled = n === 0;
+  // Windowing does not apply to colour images
+  for (const el of [resetBtn, presetSel]) el.disabled = n === 0 || vp.color;
 
   setPressed(invertBtn, vp.invert);
   setPressed(markersBtn, markersOn);

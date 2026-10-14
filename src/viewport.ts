@@ -60,6 +60,10 @@ function svgWithPath(): { svg: SVGSVGElement; path: SVGPathElement } {
 function buildUi(root: HTMLElement) {
   const canvas = document.createElement("canvas");
   canvas.className = "vp-canvas";
+  // Colour images are drawn with a plain 2D canvas: no windowing is needed for them
+  const colorCanvas = document.createElement("canvas");
+  colorCanvas.className = "vp-canvas color";
+  colorCanvas.hidden = true;
 
   const tl = div("overlay tl");
   const tr = div("overlay tr");
@@ -86,9 +90,9 @@ function buildUi(root: HTMLElement) {
   const empty = div("vp-empty");
   empty.append(emptyTitle, emptySub);
 
-  root.append(canvas, tl, tr, bl, br, markerT, markerB, markerL, markerR, hBar, vBar, status, empty);
+  root.append(canvas, colorCanvas, tl, tr, bl, br, markerT, markerB, markerL, markerR, hBar, vBar, status, empty);
   return {
-    canvas, tl, tr, bl, br,
+    canvas, colorCanvas, tl, tr, bl, br,
     markerT, markerB, markerL, markerR,
     hBar, hSvg: h.svg, hPath: h.path, hLabel,
     vBar, vSvg: v.svg, vPath: v.path, vLabel,
@@ -215,6 +219,12 @@ export class Viewport {
   private drawQueued = false;
   private drag: Drag | null = null;
   private wheelAcc = 0;
+  private colorImage: ImageData | null = null;
+
+    /** True when the shown image is in colour; windowing does not apply to those. */
+  get color(): boolean {
+    return this.current?.samples === 3;
+  }
 
   constructor(host: ViewportHost) {
     this.host = host;
@@ -302,7 +312,7 @@ export class Viewport {
         !this.current || this.current.rows !== slice.rows || this.current.cols !== slice.cols;
       this.current = slice;
       this.meta = m;
-      this.renderer?.upload(slice);
+      this.showSlice(slice);
 
       if (this.firstLoad) {
         if (slice.defaultWl !== null && slice.defaultWw !== null) {
@@ -315,13 +325,49 @@ export class Viewport {
         // Resizing clears the drawing buffer, so draw right after
         this.ui.canvas.width = slice.cols;
         this.ui.canvas.height = slice.rows;
+        this.ui.colorCanvas.width = slice.cols;
+        this.ui.colorCanvas.height = slice.rows;
         if (this.autoFit) this.fitView();
       }
       this.setStatus("");
       this.draw();
+      this.host.stateChanged(this); // grayscale or colour decides which controls apply
     } catch (err) {
       if (token === this.fetchToken) this.showError(err);
     }
+  }
+
+  // Colour goes to the 2D canvas, grayscale to the WebGL canvas
+  private showSlice(s: SliceData): void {
+    const color = s.samples === 3;
+    this.ui.canvas.hidden = color;
+    this.ui.colorCanvas.hidden = !color;
+    if (!color) {
+      this.renderer?.upload(s);
+      return;
+    }
+    const img = new ImageData(s.cols, s.rows);
+    const src = s.pixels;
+    for (let i = 0; i < s.cols * s.rows; i++) {
+      img.data[i * 4] = src[i * 3] as number;
+      img.data[i * 4 + 1] = src[i * 3 + 1] as number;
+      img.data[i * 4 + 2] = src[i * 3 + 2] as number;
+      img.data[i * 4 + 3] = 255;
+    }
+    this.colorImage = img;
+  }
+
+  private drawColor(): void {
+    const img = this.colorImage;
+    if (!img) return;
+    const c = this.ui.colorCanvas;
+    if (c.width !== img.width || c.height !== img.height) {
+      c.width = img.width;
+      c.height = img.height;
+    }
+    c.getContext("2d")?.putImageData(img, 0, 0);
+    // The invert toggle is a CSS filter, so it needs no pixel work
+    c.style.filter = this.invert ? "invert(1)" : "";
   }
 
   // ---------- Navigation and window ----------
@@ -338,6 +384,7 @@ export class Viewport {
   }
 
   setWindow(wl: number, ww: number, notify: boolean): void {
+    if (this.color) return; // windowing does not apply to colour images
     this.wl = wl;
     this.ww = Math.max(1, ww);
     this.requestDraw();
@@ -345,6 +392,7 @@ export class Viewport {
   }
 
   resetWindow(): void {
+    if (this.color) return;
     const s = this.current;
     if (s && s.defaultWl !== null && s.defaultWw !== null) {
       this.setWindow(s.defaultWl, s.defaultWw, true);
@@ -362,8 +410,9 @@ export class Viewport {
   // ---------- View transform ----------
 
   private applyTransform(): void {
-    this.ui.canvas.style.transform =
-      `translate(${this.panX}px, ${this.panY}px) scale(${this.zoom})`;
+    const t = `translate(${this.panX}px, ${this.panY}px) scale(${this.zoom})`;
+    this.ui.canvas.style.transform = t;
+    this.ui.colorCanvas.style.transform = t;
   }
 
   private fitView(): void {
@@ -413,8 +462,12 @@ export class Viewport {
   // Window/level, inversion and rescaling all run in the fragment shader,
   // so a redraw only updates uniforms and never touches the pixel data.
   private draw(): void {
-    if (!this.current || !this.renderer || this.el.hidden) return;
-    this.renderer.draw({ wl: this.wl, ww: this.ww, invert: this.invert });
+    if (!this.current || this.el.hidden) return;
+    if (this.current.samples === 3) {
+      this.drawColor();
+    } else if (this.renderer) {
+      this.renderer.draw({ wl: this.wl, ww: this.ww, invert: this.invert });
+    }
     this.refreshOverlay();
   }
 
@@ -444,10 +497,17 @@ export class Viewport {
       : this.count
         ? `Im ${this.index + 1} / ${this.count}`
         : "";
-    br.textContent = s
-      ? `WL ${Math.round(this.wl)}  WW ${Math.round(this.ww)}${this.invert ? "  (inverted)" : ""}\n` +
-        `Zoom ${Math.round(this.zoom * 100)}%`
-      : "";
+    const zoomText = `Zoom ${Math.round(this.zoom * 100)}%`;
+    
+    if (!s) {
+      br.textContent = "";
+    } else if (s.samples === 3) {
+      br.textContent = `${this.invert ? "(inverted)\n" : ""}${zoomText}`;
+    } else {
+      br.textContent =
+        `WL ${Math.round(this.wl)}  WW ${Math.round(this.ww)}${this.invert ? "  (inverted)" : ""}\n` +
+        zoomText;
+    }
   }
 
   // Orientation markers and scale bars. Independent of the text overlay mode.
