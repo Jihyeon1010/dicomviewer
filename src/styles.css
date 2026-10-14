@@ -156,7 +156,7 @@ canvas {
 
 #status {
   position: absolute;
-  top: 10px;
+  top: 36px;
   left: 50%;
   transform: translateX(-50%);
   z-index: 2;
@@ -195,3 +195,56 @@ canvas {
   border-top: 1px solid var(--border);
 }
 #slider { flex: 1; accent-color: var(--accent); }
+
+/* ---------- Orientation markers and scale bar ---------- */
+.marker {
+  position: absolute;
+  font: 600 14px ui-monospace, Menlo, monospace;
+  color: var(--overlay);
+  pointer-events: none;
+  text-shadow: 0 0 3px #000;
+}
+#marker-t { top: 6px; left: 50%; transform: translateX(-50%); }
+#marker-b { bottom: 6px; left: 50%; transform: translateX(-50%); }
+#marker-l { left: 8px; top: 50%; transform: translateY(-50%); }
+#marker-r { right: 8px; top: 50%; transform: translateY(-50%); }
+#viewport.empty .marker { display: none; }
+
+#scalebar {
+  position: absolute;
+  bottom: 34px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: none;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  pointer-events: none;
+  font: 11px ui-monospace, Menlo, monospace;
+  color: var(--overlay);
+  text-shadow: 0 0 3px #000;
+}
+#scalebar.on { display: flex; }
+#viewport.empty #scalebar { display: none; }
+#scalebar-svg,
+#scalebar-v-svg {
+  display: block;
+  overflow: visible;
+  filter: drop-shadow(0 0 2px #000);
+}
+
+#scalebar-v {
+  position: absolute;
+  left: 44px; /* clears the left orientation marker */
+  top: 50%;
+  transform: translateY(-50%);
+  display: none;
+  align-items: center;
+  gap: 6px;
+  pointer-events: none;
+  font: 11px ui-monospace, Menlo, monospace;
+  color: var(--overlay);
+  text-shadow: 0 0 3px #000;
+}
+#scalebar-v.on { display: flex; }
+#viewport.empty #scalebar-v { display: none; }

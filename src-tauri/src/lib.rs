@@ -2,7 +2,7 @@ use dicom::core::Tag;
 use dicom::dictionary_std::tags;
 use dicom::object::{DefaultDicomObject, OpenFileOptions};
 use dicom::pixeldata::PixelDecoder;
-use rayon::prelude::*;
+use rayon::{prelude::*, string};
 use serde::Serialize;
 use std::{
     collections::BTreeMap,
@@ -47,6 +47,8 @@ struct SliceMeta {
     kvp: Option<f64>,
     tube_current: Option<f64>,
     pixel_spacing: Option<[f64; 2]>, // [row spacing, column spacing] in mm, as in DICOM
+    image_orientation: Option<[f64; 6]>,
+    patient_orientation: String, // row and column direction cosines, as in DICOM
     frame: u32,
     frame_count: u32,
 }
@@ -286,6 +288,14 @@ fn get_slice_meta(index: usize, state: tauri::State<AppState>) -> Result<SliceMe
         multi_f64(&obj, tags::IMAGE_POSITION_PATIENT).and_then(|v| v.get(2).copied())
     });
 
+    let orientation = multi_f64(&obj, tags::IMAGE_ORIENTATION_PATIENT).and_then(|v| {
+        if v.len() >= 6 {
+            Some([v[0], v[1], v[2], v[3], v[4], v[5]])
+        } else {
+            None
+        }
+    });
+
     let frame_count = obj
         .element(tags::NUMBER_OF_FRAMES)
         .ok()
@@ -312,6 +322,8 @@ fn get_slice_meta(index: usize, state: tauri::State<AppState>) -> Result<SliceMe
         kvp: opt_f64(&obj, tags::KVP),
         tube_current: opt_f64(&obj, tags::X_RAY_TUBE_CURRENT),
         pixel_spacing: spacing,
+        image_orientation: orientation,
+        patient_orientation: text_of(&obj, tags::PATIENT_ORIENTATION),
         frame,
         frame_count,
     })

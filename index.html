@@ -30,6 +30,7 @@
 
     <div class="group">
       <button id="info" title="Overlay detail: full / minimal / off (O)">Info: Full</button>
+      <button id="markers" title="Orientation markers and scale bar (M)">Markers</button>
       <button id="anonymize" title="Hide patient identifiers on screen (A)">Anonymize</button>
     </div>
   </header>
@@ -47,6 +48,22 @@
         <div id="overlay-tr" class="overlay"></div>
         <div id="overlay-bl" class="overlay"></div>
         <div id="overlay-br" class="overlay"></div>
+        <div id="marker-t" class="marker"></div>
+        <div id="marker-b" class="marker"></div>
+        <div id="marker-l" class="marker"></div>
+        <div id="marker-r" class="marker"></div>
+        <div id="scalebar">
+          <div id="scalebar-label"></div>
+          <svg id="scalebar-svg" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+            <path id="scalebar-path" fill="none" stroke="currentColor" stroke-width="2" />
+          </svg>
+        </div>
+        <div id="scalebar-v">
+          <svg id="scalebar-v-svg" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+            <path id="scalebar-v-path" fill="none" stroke="currentColor" stroke-width="2" />
+          </svg>
+          <div id="scalebar-v-label"></div>
+        </div>
         <div id="status"></div>
         <div id="empty">
           <div id="empty-title">Drop DICOM files or a folder here</div>

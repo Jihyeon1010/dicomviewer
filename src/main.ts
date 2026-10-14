@@ -1,6 +1,13 @@
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getSlice, getSliceMeta, openFiles, openFolder, selectSeries } from "./api";
+import {
+  edgeLabels,
+  SCALE_BAR_HEIGHT,
+  scaleBar,
+  scaleBarPath,
+  scaleBarPathVertical,
+} from "./guides";
 import { GLRenderer } from "./renderer";
 import type { SeriesInfo, SliceData, SliceMeta } from "./types";
 
@@ -10,12 +17,30 @@ function byId<T extends HTMLElement>(id: string, ctor: new () => T): T {
   return el;
 }
 
+function byIdSvg<T extends SVGElement>(id: string, ctor: new () => T): T {
+  const el = document.getElementById(id);
+  if (!(el instanceof ctor)) throw new Error(`SVG element #${id} not found or has the wrong type`);
+  return el;
+}
+
 const viewport = byId("viewport", HTMLElement);
 const canvas = byId("view", HTMLCanvasElement);
 const overlayTL = byId("overlay-tl", HTMLDivElement);
 const overlayTR = byId("overlay-tr", HTMLDivElement);
 const overlayBL = byId("overlay-bl", HTMLDivElement);
 const overlayBR = byId("overlay-br", HTMLDivElement);
+const markerT = byId("marker-t", HTMLDivElement);
+const markerB = byId("marker-b", HTMLDivElement);
+const markerL = byId("marker-l", HTMLDivElement);
+const markerR = byId("marker-r", HTMLDivElement);
+const scaleEl = byId("scalebar", HTMLDivElement);
+const scaleSvg = byIdSvg("scalebar-svg", SVGSVGElement);
+const scalePath = byIdSvg("scalebar-path", SVGPathElement);
+const scaleLabel = byId("scalebar-label", HTMLDivElement);
+const scaleVEl = byId("scalebar-v", HTMLDivElement);
+const scaleVSvg = byIdSvg("scalebar-v-svg", SVGSVGElement);
+const scaleVPath = byIdSvg("scalebar-v-path", SVGPathElement);
+const scaleVLabel = byId("scalebar-v-label", HTMLDivElement);
 const statusEl = byId("status", HTMLDivElement);
 const emptyTitle = byId("empty-title", HTMLDivElement);
 const emptySub = byId("empty-sub", HTMLDivElement);
@@ -27,6 +52,7 @@ const invertBtn = byId("invert", HTMLButtonElement);
 const fitBtn = byId("fit", HTMLButtonElement);
 const resetBtn = byId("reset", HTMLButtonElement);
 const infoBtn = byId("info", HTMLButtonElement);
+const markersBtn = byId("markers", HTMLButtonElement);
 const anonBtn = byId("anonymize", HTMLButtonElement);
 const slider = byId("slider", HTMLInputElement);
 const toolButtons = document.querySelectorAll<HTMLButtonElement>("#tools .tool");
@@ -70,6 +96,7 @@ const OVERLAY_LABEL: Record<OverlayMode, string> = {
 const savedMode = loadPref("overlay");
 let overlayMode: OverlayMode = OVERLAY_MODES.find((m) => m === savedMode) ?? "full";
 let anonymize = loadPref("anonymize") === "1";
+let markersOn = loadPref("markers") !== "0"; // on by default
 
 // Typical CT values; adjust per scanner and protocol.
 const PRESETS: { name: string; wl: number; ww: number }[] = [
@@ -194,7 +221,7 @@ function imageLines(s: SliceData | null, m: SliceMeta | null): string[] {
   ]);
 }
 
-function updateOverlay(): void {
+function updateTextOverlays(): void {
   const s = current;
   const m = meta;
 
@@ -217,6 +244,45 @@ function updateOverlay(): void {
     : "";
 }
 
+// Orientation markers and scale bar. Independent of the text overlay mode.
+function updateGuides(): void {
+  const show = markersOn && current !== null;
+
+  const labels = show ? edgeLabels(meta) : null;
+  markerT.textContent = labels?.top ?? "";
+  markerB.textContent = labels?.bottom ?? "";
+  markerL.textContent = labels?.left ?? "";
+  markerR.textContent = labels?.right ?? "";
+
+  // Screen pixels per millimetre along the horizontal image axis.
+  // pixel_spacing is [row, column]; the column spacing is the horizontal step.
+  const colSpacing = meta?.pixel_spacing?.[1] ?? 0;
+  const bar = show && colSpacing > 0 ? scaleBar(view.zoom / colSpacing) : null;
+  scaleEl.classList.toggle("on", bar !== null);
+  if (bar) {
+    scaleSvg.setAttribute("width", String(bar.px + 2));
+    scaleSvg.setAttribute("height", String(SCALE_BAR_HEIGHT));
+    scalePath.setAttribute("d", scaleBarPath(bar));
+    scaleLabel.textContent = bar.label;
+  }
+
+    // Vertical ruler: the row spacing is the vertical step in millimetres
+  const rowSpacing = meta?.pixel_spacing?.[0] ?? 0;
+  const barV = show && rowSpacing > 0 ? scaleBar(view.zoom / rowSpacing) : null;
+  scaleVEl.classList.toggle("on", barV !== null);
+  if (barV) {
+    scaleVSvg.setAttribute("width", String(SCALE_BAR_HEIGHT));
+    scaleVSvg.setAttribute("height", String(barV.px + 2));
+    scaleVPath.setAttribute("d", scaleBarPathVertical(barV));
+    scaleVLabel.textContent = barV.label;
+  }
+}
+
+function updateOverlay(): void {
+  updateTextOverlays();
+  updateGuides();
+}
+
 // ---------- UI sync ----------
 function setEmpty(on: boolean, title?: string, sub?: string): void {
   viewport.classList.toggle("empty", on);
@@ -234,6 +300,8 @@ function syncControls(): void {
   for (const el of [invertBtn, fitBtn, resetBtn, presetSel]) el.disabled = n === 0;
 
   infoBtn.textContent = `Info: ${OVERLAY_LABEL[overlayMode]}`;
+  markersBtn.classList.toggle("active", markersOn);
+  markersBtn.setAttribute("aria-pressed", String(markersOn));
   anonBtn.classList.toggle("active", anonymize);
   anonBtn.setAttribute("aria-pressed", String(anonymize));
 }
@@ -242,6 +310,13 @@ function cycleOverlay(): void {
   const next = OVERLAY_MODES[(OVERLAY_MODES.indexOf(overlayMode) + 1) % OVERLAY_MODES.length];
   overlayMode = next ?? "full";
   savePref("overlay", overlayMode);
+  syncControls();
+  updateOverlay();
+}
+
+function toggleMarkers(): void {
+  markersOn = !markersOn;
+  savePref("markers", markersOn ? "1" : "0");
   syncControls();
   updateOverlay();
 }
@@ -489,6 +564,7 @@ invertBtn.addEventListener("click", toggleInvert);
 fitBtn.addEventListener("click", () => { fitView(); updateOverlay(); });
 resetBtn.addEventListener("click", resetWindow);
 infoBtn.addEventListener("click", cycleOverlay);
+markersBtn.addEventListener("click", toggleMarkers);
 anonBtn.addEventListener("click", toggleAnonymize);
 
 presetSel.addEventListener("change", () => {
@@ -627,6 +703,7 @@ window.addEventListener("keydown", (e: KeyboardEvent) => {
     case "z": case "Z": setTool("zoom"); break;
     case "s": case "S": setTool("scroll"); break;
     case "o": case "O": cycleOverlay(); break;
+    case "m": case "M": toggleMarkers(); break;
     case "a": case "A": toggleAnonymize(); break;
     default:
       if (/^[1-6]$/.test(e.key)) applyPreset(Number(e.key) - 1);

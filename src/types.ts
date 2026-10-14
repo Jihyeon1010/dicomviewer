@@ -39,6 +39,8 @@ export interface SliceMeta {
   kvp: number | null;
   tube_current: number | null;
   pixel_spacing: [number, number] | null; // [row, column] in mm
+  image_orientation: [number, number, number, number, number, number] | null;
+  patient_orientation: string; // raw "row\column" codes, e.g. "L\F"
   frame: number;
   frame_count: number;
 }
