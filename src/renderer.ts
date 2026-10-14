@@ -6,16 +6,21 @@ export interface DrawParams {
   invert: boolean;
 }
 
-type Kind = "int" | "uint";
+// "int" and "uint" are windowed grayscale (signed / unsigned samples); "rgb" is colour
+type Kind = "int" | "uint" | "rgb";
 
-interface ProgramInfo {
-  prog: WebGLProgram;
-  uTex: WebGLUniformLocation;
+interface GrayUniforms {
   uSlope: WebGLUniformLocation;
   uIntercept: WebGLUniformLocation;
   uLo: WebGLUniformLocation;
   uInvWidth: WebGLUniformLocation;
+}
+
+interface ProgramInfo {
+  prog: WebGLProgram;
+  uTex: WebGLUniformLocation;
   uFlip: WebGLUniformLocation;
+  gray: GrayUniforms | null; // null for the colour program, which has no windowing
 }
 
 const VERT = `#version 300 es
@@ -51,6 +56,21 @@ void main() {
   outColor = vec4(v, v, v, 1.0);
 }`;
 }
+
+// Colour images are shown as they are: no rescale and no windowing
+const RGB_FRAG = `#version 300 es
+precision highp float;
+uniform sampler2D uTex;
+uniform bool uFlip;
+in vec2 vUv;
+out vec4 outColor;
+void main() {
+  ivec2 size = textureSize(uTex, 0);
+  ivec2 c = min(ivec2(vUv * vec2(size)), size - ivec2(1));
+  vec3 rgb = texelFetch(uTex, c, 0).rgb;
+  if (uFlip) rgb = vec3(1.0) - rgb;
+  outColor = vec4(rgb, 1.0);
+}`;
 
 export class GLRenderer {
   private canvas: HTMLCanvasElement;
@@ -95,8 +115,9 @@ export class GLRenderer {
     this.gl = gl;
     this.maxSize = gl.getParameter(gl.MAX_TEXTURE_SIZE) as number;
     this.programs = {
-      int: this.link(fragSource("isampler2D")),
-      uint: this.link(fragSource("usampler2D")),
+      int: this.link(fragSource("isampler2D"), true),
+      uint: this.link(fragSource("usampler2D"), true),
+      rgb: this.link(RGB_FRAG, false),
     };
     this.tex = null;
     this.texW = 0;
@@ -120,7 +141,7 @@ export class GLRenderer {
     return sh;
   }
 
-  private link(fragSrc: string): ProgramInfo {
+  private link(fragSrc: string, windowed: boolean): ProgramInfo {
     const gl = this.gl;
     const vs = this.compile(gl.VERTEX_SHADER, VERT);
     const fs = this.compile(gl.FRAGMENT_SHADER, fragSrc);
@@ -140,15 +161,15 @@ export class GLRenderer {
       if (!l) throw new Error(`Missing shader uniform: ${name}`);
       return l;
     };
-    return {
-      prog,
-      uTex: loc("uTex"),
-      uSlope: loc("uSlope"),
-      uIntercept: loc("uIntercept"),
-      uLo: loc("uLo"),
-      uInvWidth: loc("uInvWidth"),
-      uFlip: loc("uFlip"),
-    };
+    const gray: GrayUniforms | null = windowed
+      ? {
+          uSlope: loc("uSlope"),
+          uIntercept: loc("uIntercept"),
+          uLo: loc("uLo"),
+          uInvWidth: loc("uInvWidth"),
+        }
+      : null;
+    return { prog, uTex: loc("uTex"), uFlip: loc("uFlip"), gray };
   }
 
   /** Uploads a slice to the GPU. Call once per slice, not per redraw. */
@@ -167,17 +188,26 @@ export class GLRenderer {
     }
 
     let internal: number;
+    let format: number;
     let type: number;
-    if (s.bitsAllocated === 8) {
+    if (s.samples === 3) {
+      internal = gl.RGB8;
+      format = gl.RGB;
+      type = gl.UNSIGNED_BYTE;
+      this.kind = "rgb";
+    } else if (s.bitsAllocated === 8) {
       internal = gl.R8UI;
+      format = gl.RED_INTEGER;
       type = gl.UNSIGNED_BYTE;
       this.kind = "uint";
     } else if (s.signed) {
       internal = gl.R16I;
+      format = gl.RED_INTEGER;
       type = gl.SHORT;
       this.kind = "int";
     } else {
       internal = gl.R16UI;
+      format = gl.RED_INTEGER;
       type = gl.UNSIGNED_SHORT;
       this.kind = "uint";
     }
@@ -196,9 +226,9 @@ export class GLRenderer {
 
     if (this.texFormat === internal && this.texW === s.cols && this.texH === s.rows) {
       // Same layout as the previous slice: overwrite in place, no reallocation
-      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, s.cols, s.rows, gl.RED_INTEGER, type, s.pixels);
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, s.cols, s.rows, format, type, s.pixels);
     } else {
-      gl.texImage2D(gl.TEXTURE_2D, 0, internal, s.cols, s.rows, 0, gl.RED_INTEGER, type, s.pixels);
+      gl.texImage2D(gl.TEXTURE_2D, 0, internal, s.cols, s.rows, 0, format, type, s.pixels);
       this.texFormat = internal;
       this.texW = s.cols;
       this.texH = s.rows;
@@ -217,11 +247,16 @@ export class GLRenderer {
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, this.tex);
     gl.uniform1i(info.uTex, 0);
-    gl.uniform1f(info.uSlope, s.slope);
-    gl.uniform1f(info.uIntercept, s.intercept);
-    gl.uniform1f(info.uLo, p.wl - p.ww / 2);
-    gl.uniform1f(info.uInvWidth, 1 / Math.max(1, p.ww));
+
+    const g = info.gray;
+    if (g) {
+      gl.uniform1f(g.uSlope, s.slope);
+      gl.uniform1f(g.uIntercept, s.intercept);
+      gl.uniform1f(g.uLo, p.wl - p.ww / 2);
+      gl.uniform1f(g.uInvWidth, 1 / Math.max(1, p.ww));
+    }
     // MONOCHROME1 and the manual invert toggle cancel each other out
+    // (monochrome1 is always false for colour images)
     gl.uniform1i(info.uFlip, s.monochrome1 !== p.invert ? 1 : 0);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
   }
