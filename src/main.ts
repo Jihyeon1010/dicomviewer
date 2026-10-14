@@ -13,14 +13,13 @@ import {
   resolveBindings,
   type Bindings,
 } from "./keymap";
+import { LAYOUT_PRESETS, MAX_COLS, MAX_ROWS, type Layout } from "./layout";
 import { installMenu, type AppMenu } from "./menu";
 import { createSettingsDialog } from "./settings-dialog";
 import {
-  LAYOUT_IDS,
   loadSettings,
   OVERLAY_MODES,
   saveSettings,
-  type LayoutId,
   type OverlayMode,
   type Settings,
 } from "./settings";
@@ -44,8 +43,12 @@ const settingsBtn = byId("settings-open", HTMLButtonElement);
 const syncScrollBtn = byId("sync-scroll", HTMLButtonElement);
 const syncWindowBtn = byId("sync-window", HTMLButtonElement);
 const slider = byId("slider", HTMLInputElement);
+const layoutWrap = byId("layout-wrap", HTMLDivElement);
+const layoutBtn = byId("layout-btn", HTMLButtonElement);
+const layoutPop = byId("layout-pop", HTMLDivElement);
+const layoutGrid = byId("layout-grid", HTMLDivElement);
+const layoutLabel = byId("layout-label", HTMLDivElement);
 const toolButtons = document.querySelectorAll<HTMLButtonElement>("#tools .tool");
-const layoutButtons = document.querySelectorAll<HTMLButtonElement>("#layouts .layout");
 
 // ---------- Settings ----------
 let settings: Settings = loadSettings();
@@ -61,20 +64,8 @@ const OVERLAY_LABEL: Record<OverlayMode, string> = {
   minimal: "Minimal",
   off: "Off",
 };
-const LAYOUTS: Record<LayoutId, { cols: number; rows: number }> = {
-  "1x1": { cols: 1, rows: 1 },
-  "2x1": { cols: 2, rows: 1 },
-  "1x2": { cols: 1, rows: 2 },
-  "2x2": { cols: 2, rows: 2 },
-};
-const LAYOUT_TIPS: Record<LayoutId, string> = {
-  "1x1": "Single view",
-  "2x1": "Two views side by side",
-  "1x2": "Two views stacked",
-  "2x2": "Four views",
-};
 
-let layout: LayoutId = settings.layout;
+let layout: Layout = settings.layout;
 let overlayMode: OverlayMode = settings.overlay;
 let anonymize = settings.anonymize;
 let markersOn = settings.markers;
@@ -132,10 +123,7 @@ function refreshTooltips(): void {
     const t = b.dataset["tool"] ?? "";
     setTip(b, TOOL_TIPS[t] ?? t, `tool.${t}`);
   }
-  for (const b of layoutButtons) {
-    const id = LAYOUT_IDS.find((l) => l === b.dataset["layout"]);
-    if (id) setTip(b, LAYOUT_TIPS[id], `layout.${id}`);
-  }
+  layoutBtn.title = `Choose how many views to show (up to ${MAX_COLS} × ${MAX_ROWS})`;
   setTip(syncScrollBtn, "Scroll linked views together", "sync.scroll");
   setTip(syncWindowBtn, "Share window / level between views", "sync.window");
   setTip(invertBtn, "Invert", "view.invert");
@@ -187,14 +175,23 @@ const host: ViewportHost = {
   },
 };
 
+// Viewports are created on demand when the layout grows and are then kept,
+// so going back to a larger layout restores what each view was showing.
 const first = new Viewport(host);
-const viewports: Viewport[] = [first, new Viewport(host), new Viewport(host), new Viewport(host)];
+const viewports: Viewport[] = [first];
+viewportsEl.append(first.el);
 let active: Viewport = first;
-viewportsEl.append(...viewports.map((v) => v.el));
+
+function ensureViewports(n: number): void {
+  while (viewports.length < n) {
+    const vp = new Viewport(host);
+    viewports.push(vp);
+    viewportsEl.append(vp.el);
+  }
+}
 
 function cellCount(): number {
-  const l = LAYOUTS[layout];
-  return l.cols * l.rows;
+  return layout.cols * layout.rows;
 }
 
 function visible(): Viewport[] {
@@ -246,19 +243,21 @@ function toggleSyncWindow(): void {
 }
 
 // ---------- Layout ----------
-function applyLayout(id: LayoutId, persist = true): void {
-  layout = id;
+function applyLayout(next: Layout, persist = true): void {
+  layout = { cols: next.cols, rows: next.rows };
   if (persist) update({ layout });
 
-  const { cols, rows } = LAYOUTS[id];
-  viewportsEl.style.gridTemplateColumns = `repeat(${cols}, minmax(0, 1fr))`;
-  viewportsEl.style.gridTemplateRows = `repeat(${rows}, minmax(0, 1fr))`;
-  viewportsEl.classList.toggle("multi", cols * rows > 1);
-  viewports.forEach((vp, i) => vp.setVisible(i < cols * rows));
+  const n = cellCount();
+  ensureViewports(n);
+  viewportsEl.style.gridTemplateColumns = `repeat(${layout.cols}, minmax(0, 1fr))`;
+  viewportsEl.style.gridTemplateRows = `repeat(${layout.rows}, minmax(0, 1fr))`;
+  viewportsEl.classList.toggle("multi", n > 1);
+  viewports.forEach((vp, i) => vp.setVisible(i < n));
 
   const shown = visible();
   if (!shown.includes(active)) activate(shown[0] ?? first);
   void Promise.all(fillEmptyViewports());
+  syncControls();
 }
 
 // Gives each empty visible viewport a series that is not on screen yet
@@ -301,6 +300,61 @@ function refreshEmptyMessages(): void {
     }
   }
 }
+
+// ---------- Layout picker ----------
+// A MAX_COLS x MAX_ROWS grid; hovering a cell previews the layout up to that cell
+const layoutCells: HTMLButtonElement[] = [];
+for (let r = 1; r <= MAX_ROWS; r++) {
+  for (let c = 1; c <= MAX_COLS; c++) {
+    const cell = document.createElement("button");
+    cell.type = "button";
+    cell.className = "layout-cell";
+    cell.dataset["cols"] = String(c);
+    cell.dataset["rows"] = String(r);
+    cell.setAttribute("aria-label", `${c} columns by ${r} rows`);
+    cell.addEventListener("mouseenter", () => previewLayout(c, r));
+    cell.addEventListener("focus", () => previewLayout(c, r));
+    cell.addEventListener("click", () => {
+      applyLayout({ cols: c, rows: r });
+      closeLayoutPicker();
+    });
+    layoutCells.push(cell);
+  }
+}
+layoutGrid.style.gridTemplateColumns = `repeat(${MAX_COLS}, 22px)`;
+layoutGrid.replaceChildren(...layoutCells);
+
+function previewLayout(cols: number, rows: number): void {
+  for (const cell of layoutCells) {
+    const c = Number(cell.dataset["cols"]);
+    const r = Number(cell.dataset["rows"]);
+    cell.classList.toggle("on", c <= cols && r <= rows);
+  }
+  layoutLabel.textContent = `${cols} × ${rows}`;
+}
+
+function openLayoutPicker(): void {
+  layoutPop.hidden = false;
+  layoutBtn.setAttribute("aria-expanded", "true");
+  previewLayout(layout.cols, layout.rows);
+}
+
+function closeLayoutPicker(): void {
+  layoutPop.hidden = true;
+  layoutBtn.setAttribute("aria-expanded", "false");
+}
+
+layoutBtn.addEventListener("click", () => {
+  if (layoutPop.hidden) openLayoutPicker();
+  else closeLayoutPicker();
+});
+
+// A click anywhere outside the picker closes it
+document.addEventListener("mousedown", (e: MouseEvent) => {
+  if (layoutPop.hidden) return;
+  if (e.target instanceof Node && layoutWrap.contains(e.target)) return;
+  closeLayoutPicker();
+});
 
 // ---------- Tools ----------
 function setTool(next: ToolId): void {
@@ -354,7 +408,7 @@ function syncControls(): void {
   setPressed(anonBtn, anonymize);
   setPressed(syncScrollBtn, syncScroll);
   setPressed(syncWindowBtn, syncWindow);
-  for (const b of layoutButtons) setPressed(b, b.dataset["layout"] === layout);
+  layoutBtn.textContent = `Layout: ${layout.cols} × ${layout.rows}`;
   infoBtn.textContent = `Info: ${OVERLAY_LABEL[overlayMode]}`;
 
   syncMenu();
@@ -572,13 +626,6 @@ anonBtn.addEventListener("click", toggleAnonymize);
 syncScrollBtn.addEventListener("click", toggleSyncScroll);
 syncWindowBtn.addEventListener("click", toggleSyncWindow);
 
-for (const b of layoutButtons) {
-  b.addEventListener("click", () => {
-    const id = LAYOUT_IDS.find((l) => l === b.dataset["layout"]);
-    if (id) applyLayout(id);
-  });
-}
-
 presetSel.addEventListener("change", () => {
   if (presetSel.value !== "") applyPreset(Number(presetSel.value));
   presetSel.value = "";
@@ -642,8 +689,8 @@ const handlers: Record<string, () => void> = {
 for (let i = 1; i <= PRESET_COUNT; i++) {
   handlers[`preset.${i}`] = () => applyPreset(i - 1);
 }
-for (const id of LAYOUT_IDS) {
-  handlers[`layout.${id}`] = () => applyLayout(id);
+for (const l of LAYOUT_PRESETS) {
+  handlers[`layout.${l.cols}x${l.rows}`] = () => applyLayout(l);
 }
 for (const a of ACTIONS) {
   if (!handlers[a.id]) console.warn(`No handler for action ${a.id}`);
@@ -652,6 +699,11 @@ for (const a of ACTIONS) {
 window.addEventListener("keydown", (e: KeyboardEvent) => {
   // While the dialog is open it owns the keyboard (including key capture)
   if (dialog.handleKey(e)) return;
+  if (e.key === "Escape" && !layoutPop.hidden) {
+    e.preventDefault();
+    closeLayoutPicker();
+    return;
+  }
   if (e.target instanceof HTMLSelectElement || e.target instanceof HTMLInputElement) return;
 
   const combo = comboFromEvent(e);

@@ -21,11 +21,12 @@
       <button class="tool" data-tool="scroll">Scroll</button>
     </div>
 
-    <div class="group" id="layouts" role="toolbar" aria-label="Layout">
-      <button class="layout" data-layout="1x1">1×1</button>
-      <button class="layout" data-layout="2x1">2×1</button>
-      <button class="layout" data-layout="1x2">1×2</button>
-      <button class="layout" data-layout="2x2">2×2</button>
+    <div class="group" id="layout-wrap">
+      <button id="layout-btn" aria-haspopup="true" aria-expanded="false">Layout: 1 × 1</button>
+      <div id="layout-pop" hidden>
+        <div id="layout-grid"></div>
+        <div id="layout-label"></div>
+      </div>
     </div>
 
     <div class="group">

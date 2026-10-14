@@ -46,6 +46,10 @@ function div(className: string): HTMLDivElement {
   return d;
 }
 
+// Views smaller than this cannot hold the full overlay
+const SMALL_W = 360;
+const SMALL_H = 260;
+
 function svgWithPath(): { svg: SVGSVGElement; path: SVGPathElement } {
   const svg = document.createElementNS(SVG_NS, "svg");
   svg.setAttribute("aria-hidden", "true");
@@ -234,10 +238,8 @@ export class Viewport {
     }
 
     new ResizeObserver(() => {
-      if (this.autoFit && this.current) {
-        this.fitView();
-        this.refreshOverlay();
-      }
+      if (this.autoFit && this.current) this.fitView();
+      this.refreshOverlay();
     }).observe(this.el);
 
     this.bindMouse();
@@ -429,8 +431,13 @@ export class Viewport {
   // ---------- Overlay ----------
 
   refreshOverlay(): void {
+    this.el.classList.toggle("small", this.isSmall());
     this.updateText();
     this.updateGuides();
+  }
+
+  private isSmall(): boolean {
+    return this.el.clientWidth < SMALL_W || this.el.clientHeight < SMALL_H;
   }
 
   private updateText(): void {
@@ -444,7 +451,8 @@ export class Viewport {
 
     const s = this.current;
     const m = this.meta;
-    const full = o.mode === "full";
+    // Small views fall back to the minimal overlay
+    const full = o.mode === "full" && !this.isSmall();
     tl.textContent = full && m ? patientLines(m, o.anonymize).join("\n") : "";
     tr.textContent = full ? studyLines(m, series.description, o.anonymize).join("\n") : "";
     bl.textContent = full

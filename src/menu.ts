@@ -1,3 +1,5 @@
+import { LAYOUT_PRESETS } from "./layout";
+
 import {
   CheckMenuItem,
   Menu,
@@ -138,6 +140,11 @@ export async function installMenu(deps: MenuDeps): Promise<AppMenu> {
     ],
   });
 
+  const layoutItems: MenuItem[] = [];
+  for (const l of LAYOUT_PRESETS) {
+    layoutItems.push(await key(`${l.cols} × ${l.rows}`, `layout.${l.cols}x${l.rows}`));
+  }
+
   const viewMenu = await Submenu.new({
     text: "View",
     items: [
@@ -147,10 +154,7 @@ export async function installMenu(deps: MenuDeps): Promise<AppMenu> {
       await Submenu.new({
         text: "Layout",
         items: [
-          await key("1 × 1", "layout.1x1"),
-          await key("2 × 1 (Side by Side)", "layout.2x1"),
-          await key("1 × 2 (Stacked)", "layout.1x2"),
-          await key("2 × 2", "layout.2x2"),
+          ...layoutItems,
           await std("Separator"),
           await key("Toggle Scroll Sync", "sync.scroll"),
           await key("Toggle Window Sync", "sync.window"),

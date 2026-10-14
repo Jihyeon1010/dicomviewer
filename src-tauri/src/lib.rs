@@ -21,7 +21,11 @@ const MAX_VOLUME_BYTES: usize = 4 * 1024 * 1024 * 1024;
 
 // Opened files kept in memory. Several viewports read different files at once,
 // and pixel data and metadata of one slice are requested separately.
-const FILE_CACHE_SIZE: usize = 6;
+// Opened files kept in memory. Several viewports read different files at once,
+// and pixel data and metadata of one slice are requested separately.
+// Bounded by count and by total file size on disk (multiframe files can be huge).
+const FILE_CACHE_MAX_FILES: usize = 16;
+const FILE_CACHE_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 #[derive(Clone, Serialize)]
 struct SliceInfo {
@@ -106,8 +110,8 @@ struct AppState {
     all: Mutex<Vec<SliceInfo>>,
     // Sorted images per series. Lock order when both are needed: `sorted`, then `all`.
     sorted: Mutex<HashMap<String, Arc<Vec<SliceInfo>>>>,
-    // Recently opened files, most recently used first
-    files: Mutex<Vec<(PathBuf, Arc<DefaultDicomObject>)>>,
+    // Recently opened files with their size on disk, most recently used first
+    files: Mutex<Vec<(PathBuf, Arc<DefaultDicomObject>, u64)>>,
     volume: Mutex<Option<Arc<Volume>>>,
     // Bumped whenever a volume build starts or the loaded files change, so a
     // build that finished too late can recognise that it is stale.
@@ -514,15 +518,24 @@ fn open_cached(state: &AppState, path: &PathBuf) -> Result<Arc<DefaultDicomObjec
     // The lock is held while loading so that concurrent commands for the same
     // file (pixel data and metadata) trigger only one read.
     let mut files = state.files.lock().unwrap();
-    if let Some(pos) = files.iter().position(|(p, _)| p == path) {
+    if let Some(pos) = files.iter().position(|(p, _, _)| p == path) {
         let entry = files.remove(pos);
         let obj = Arc::clone(&entry.1);
         files.insert(0, entry);
         return Ok(obj);
     }
+
     let obj = Arc::new(dicom::object::open_file(path).map_err(|e| e.to_string())?);
-    files.insert(0, (path.clone(), Arc::clone(&obj)));
-    files.truncate(FILE_CACHE_SIZE);
+    let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    files.insert(0, (path.clone(), Arc::clone(&obj), size));
+
+    // Evict the least recently used files, but always keep the one just opened
+    let mut total: u64 = files.iter().map(|f| f.2).sum();
+    while files.len() > 1 && (files.len() > FILE_CACHE_MAX_FILES || total > FILE_CACHE_MAX_BYTES) {
+        if let Some(last) = files.pop() {
+            total -= last.2;
+        }
+    }
     Ok(obj)
 }
 

@@ -1,18 +1,15 @@
 import { ACTIONS, type Bindings } from "./keymap";
+import { DEFAULT_LAYOUT, parseLayout, type Layout } from "./layout";
 
 export type OverlayMode = "full" | "minimal" | "off";
 export const OVERLAY_MODES: OverlayMode[] = ["full", "minimal", "off"];
-
-// Columns x rows: "2x1" is two views side by side, "1x2" is two stacked
-export type LayoutId = "1x1" | "2x1" | "1x2" | "2x2";
-export const LAYOUT_IDS: LayoutId[] = ["1x1", "2x1", "1x2", "2x2"];
 
 export interface Settings {
   version: 1;
   overlay: OverlayMode;
   anonymize: boolean;
   markers: boolean;
-  layout: LayoutId;
+  layout: Layout;
   syncScroll: boolean;
   syncWindow: boolean;
   keymap: Bindings; // overrides only: actions whose keys differ from the defaults
@@ -26,7 +23,7 @@ function defaults(): Settings {
     overlay: "full",
     anonymize: false,
     markers: true,
-    layout: "1x1",
+    layout: { ...DEFAULT_LAYOUT },
     syncScroll: true,
     syncWindow: false,
     keymap: {},
@@ -52,7 +49,7 @@ function sanitize(p: unknown, base: Settings): Settings {
 
   const mode = OVERLAY_MODES.find((m) => m === p["overlay"]);
   if (mode) out.overlay = mode;
-  const layout = LAYOUT_IDS.find((l) => l === p["layout"]);
+  const layout = parseLayout(p["layout"]);
   if (layout) out.layout = layout;
   if (typeof p["anonymize"] === "boolean") out.anonymize = p["anonymize"];
   if (typeof p["markers"] === "boolean") out.markers = p["markers"];
