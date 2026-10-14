@@ -1,6 +1,17 @@
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { getSlice, getSliceMeta, getThumbnail, openFiles, openFolder, selectSeries } from "./api";
+
+import {
+  getSlice,
+  getSliceMeta,
+  getThumbnail,
+  openFiles,
+  openFolder,
+  selectSeries,
+} from "./api";
+
+import { byId, byIdSvg } from "./dom";
+
 import {
   edgeLabels,
   SCALE_BAR_HEIGHT,
@@ -8,21 +19,25 @@ import {
   scaleBarPath,
   scaleBarPathVertical,
 } from "./guides";
+
+import {
+  ACTION_BY_ID,
+  ACTIONS,
+  buildLookup,
+  comboFromEvent,
+  formatCombo,
+  PRESET_COUNT,
+  resolveBindings,
+  type Bindings,
+} from "./keymap";
+
+import { installMenu, type AppMenu } from "./menu";
 import { GLRenderer } from "./renderer";
+import { createSettingsDialog } from "./settings-dialog";
+import { loadSettings, OVERLAY_MODES, saveSettings, type OverlayMode, type Settings } from "./settings";
 import type { SeriesInfo, SliceData, SliceMeta } from "./types";
 
-function byId<T extends HTMLElement>(id: string, ctor: new () => T): T {
-  const el = document.getElementById(id);
-  if (!(el instanceof ctor)) throw new Error(`Element #${id} not found or has the wrong type`);
-  return el;
-}
-
-function byIdSvg<T extends SVGElement>(id: string, ctor: new () => T): T {
-  const el = document.getElementById(id);
-  if (!(el instanceof ctor)) throw new Error(`SVG element #${id} not found or has the wrong type`);
-  return el;
-}
-
+// ---------- Elements ----------
 const viewport = byId("viewport", HTMLElement);
 const canvas = byId("view", HTMLCanvasElement);
 const overlayTL = byId("overlay-tl", HTMLDivElement);
@@ -54,24 +69,16 @@ const resetBtn = byId("reset", HTMLButtonElement);
 const infoBtn = byId("info", HTMLButtonElement);
 const markersBtn = byId("markers", HTMLButtonElement);
 const anonBtn = byId("anonymize", HTMLButtonElement);
+const settingsBtn = byId("settings-open", HTMLButtonElement);
 const slider = byId("slider", HTMLInputElement);
 const toolButtons = document.querySelectorAll<HTMLButtonElement>("#tools .tool");
 
-// ---------- Persisted preferences ----------
-function loadPref(key: string): string | null {
-  try {
-    return localStorage.getItem(key);
-  } catch {
-    return null; // storage can be unavailable; fall back to defaults
-  }
-}
+// ---------- Settings ----------
+let settings: Settings = loadSettings();
 
-function savePref(key: string, value: string): void {
-  try {
-    localStorage.setItem(key, value);
-  } catch {
-    // ignore: preferences are a convenience only
-  }
+function update(patch: Partial<Settings>): void {
+  settings = { ...settings, ...patch };
+  saveSettings(settings);
 }
 
 // ---------- State ----------
@@ -80,44 +87,102 @@ const view = { zoom: 1, panX: 0, panY: 0 };
 let current: SliceData | null = null;
 let meta: SliceMeta | null = null;
 let seriesData: SeriesInfo[] = [];
-
-const THUMB_PX = 112; // rendered at 2x the 56 px CSS size for high-DPI screens
-const thumbs = new Map<string, ImageData>();
-const thumbCanvases = new Map<string, HTMLCanvasElement>();
-let thumbRun = 0; // bumped to cancel thumbnail loading for a previous selection
-
 let activeUid = "";
 let seriesName = "";
 let firstLoad = true; // apply the file's default WL/WW only once per series
 let autoFit = true;   // keep the image fitted until the user zooms or pans
 let fetchToken = 0;
 
-type OverlayMode = "full" | "minimal" | "off";
-const OVERLAY_MODES: OverlayMode[] = ["full", "minimal", "off"];
+const THUMB_PX = 112; // rendered at 2x the 56 px CSS size for high-DPI screens
+const thumbs = new Map<string, ImageData>();
+const thumbCanvases = new Map<string, HTMLCanvasElement>();
+let thumbRun = 0; // bumped to cancel thumbnail loading for a previous selection
+
 const OVERLAY_LABEL: Record<OverlayMode, string> = {
   full: "Full",
   minimal: "Minimal",
   off: "Off",
 };
-const savedMode = loadPref("overlay");
-let overlayMode: OverlayMode = OVERLAY_MODES.find((m) => m === savedMode) ?? "full";
-let anonymize = loadPref("anonymize") === "1";
-let markersOn = loadPref("markers") !== "0"; // on by default
+let overlayMode: OverlayMode = settings.overlay;
+let anonymize = settings.anonymize;
+let markersOn = settings.markers;
+
+let appMenu: AppMenu | null = null;
+
+function syncMenu(): void {
+  appMenu?.sync({
+    tool,
+    invert: state.invert,
+    markers: markersOn,
+    anonymize,
+    overlay: overlayMode,
+  });
+}
+
+// Always re-syncs, so a click on the already checked item restores its check mark
+function setOverlay(mode: OverlayMode): void {
+  overlayMode = mode;
+  update({ overlay: mode });
+  syncControls();
+  updateOverlay();
+}
 
 // Typical CT values; adjust per scanner and protocol.
+// Must contain exactly PRESET_COUNT entries (one preset.N action each).
 const PRESETS: { name: string; wl: number; ww: number }[] = [
-  { name: "Brain (1)", wl: 40, ww: 80 },
-  { name: "Subdural (2)", wl: 75, ww: 215 },
-  { name: "Soft tissue (3)", wl: 40, ww: 400 },
-  { name: "CTA (4)", wl: 150, ww: 600 },
-  { name: "Bone (5)", wl: 500, ww: 2000 },
-  { name: "Lung (6)", wl: -600, ww: 1500 },
+  { name: "Brain", wl: 40, ww: 80 },
+  { name: "Subdural", wl: 75, ww: 215 },
+  { name: "Soft tissue", wl: 40, ww: 400 },
+  { name: "CTA", wl: 150, ww: 600 },
+  { name: "Bone", wl: 500, ww: 2000 },
+  { name: "Lung", wl: -600, ww: 1500 },
 ];
 
-presetSel.replaceChildren(
-  new Option("WL/WW presets", ""),
-  ...PRESETS.map((p, i) => new Option(p.name, String(i))),
-);
+// ---------- Keymap ----------
+let bindings: Bindings = resolveBindings(settings.keymap);
+let lookup = buildLookup(bindings);
+
+function rebuildKeymap(): void {
+  bindings = resolveBindings(settings.keymap);
+  lookup = buildLookup(bindings);
+}
+
+function setTip(el: HTMLElement, text: string, actionId: string): void {
+  const keys = (bindings[actionId] ?? []).map(formatCombo);
+  el.title = keys.length ? `${text} (${keys.join(", ")})` : text;
+}
+
+const TOOL_TIPS: Record<string, string> = {
+  window: "Window / Level",
+  pan: "Pan",
+  zoom: "Zoom",
+  scroll: "Scroll",
+};
+
+// Tooltips and preset labels are generated from the keymap, so they never go stale
+function refreshTooltips(): void {
+  for (const b of toolButtons) {
+    const t = b.dataset["tool"] ?? "";
+    setTip(b, TOOL_TIPS[t] ?? t, `tool.${t}`);
+  }
+  setTip(invertBtn, "Invert", "view.invert");
+  setTip(fitBtn, "Fit to window", "view.fit");
+  setTip(resetBtn, "Reset window", "view.resetWindow");
+  setTip(infoBtn, "Overlay detail: full / minimal / off", "ui.overlay");
+  setTip(markersBtn, "Orientation markers and scale bars", "ui.markers");
+  setTip(anonBtn, "Hide patient identifiers on screen", "ui.anonymize");
+  setTip(settingsBtn, "Settings and keyboard shortcuts", "ui.settings");
+}
+
+function refreshPresetOptions(): void {
+  presetSel.replaceChildren(
+    new Option("WL/WW presets", ""),
+    ...PRESETS.map((p, i) => {
+      const first = (bindings[`preset.${i + 1}`] ?? [])[0];
+      return new Option(first ? `${p.name} (${formatCombo(first)})` : p.name, String(i));
+    }),
+  );
+}
 
 // ---------- Tools ----------
 type ToolId = "window" | "pan" | "zoom" | "scroll";
@@ -125,16 +190,16 @@ let tool: ToolId = "window";
 
 function setTool(next: ToolId): void {
   tool = next;
-  viewport.dataset.tool = next;
+  viewport.dataset["tool"] = next;
   for (const b of toolButtons) {
-    const on = b.dataset.tool === next;
+    const on = b.dataset["tool"] === next;
     b.classList.toggle("active", on);
     b.setAttribute("aria-pressed", String(on));
-  }
+  } syncMenu();
 }
 
 for (const b of toolButtons) {
-  b.addEventListener("click", () => setTool(b.dataset.tool as ToolId));
+  b.addEventListener("click", () => setTool(b.dataset["tool"] as ToolId));
 }
 setTool("window");
 
@@ -250,7 +315,7 @@ function updateTextOverlays(): void {
     : "";
 }
 
-// Orientation markers and scale bar. Independent of the text overlay mode.
+// Orientation markers and scale bars. Independent of the text overlay mode.
 function updateGuides(): void {
   const show = markersOn && current !== null;
 
@@ -260,8 +325,7 @@ function updateGuides(): void {
   markerL.textContent = labels?.left ?? "";
   markerR.textContent = labels?.right ?? "";
 
-  // Screen pixels per millimetre along the horizontal image axis.
-  // pixel_spacing is [row, column]; the column spacing is the horizontal step.
+  // Horizontal ruler: the column spacing is the horizontal step in millimetres
   const colSpacing = meta?.pixel_spacing?.[1] ?? 0;
   const bar = show && colSpacing > 0 ? scaleBar(view.zoom / colSpacing) : null;
   scaleEl.classList.toggle("on", bar !== null);
@@ -272,7 +336,7 @@ function updateGuides(): void {
     scaleLabel.textContent = bar.label;
   }
 
-    // Vertical ruler: the row spacing is the vertical step in millimetres
+  // Vertical ruler: the row spacing is the vertical step in millimetres
   const rowSpacing = meta?.pixel_spacing?.[0] ?? 0;
   const barV = show && rowSpacing > 0 ? scaleBar(view.zoom / rowSpacing) : null;
   scaleVEl.classList.toggle("on", barV !== null);
@@ -310,30 +374,32 @@ function syncControls(): void {
   markersBtn.setAttribute("aria-pressed", String(markersOn));
   anonBtn.classList.toggle("active", anonymize);
   anonBtn.setAttribute("aria-pressed", String(anonymize));
+  syncMenu();
 }
 
 function cycleOverlay(): void {
   const next = OVERLAY_MODES[(OVERLAY_MODES.indexOf(overlayMode) + 1) % OVERLAY_MODES.length];
   overlayMode = next ?? "full";
-  savePref("overlay", overlayMode);
+  update({ overlay: overlayMode });
   syncControls();
   updateOverlay();
 }
 
 function toggleMarkers(): void {
   markersOn = !markersOn;
-  savePref("markers", markersOn ? "1" : "0");
+  update({ markers: markersOn });
   syncControls();
   updateOverlay();
 }
 
 function toggleAnonymize(): void {
   anonymize = !anonymize;
-  savePref("anonymize", anonymize ? "1" : "0");
+  update({ anonymize });
   syncControls();
   updateOverlay();
 }
 
+// ---------- Series list and thumbnails ----------
 function renderSeriesList(): void {
   thumbCanvases.clear();
   seriesList.replaceChildren(
@@ -730,36 +796,100 @@ viewport.addEventListener("dblclick", () => {
   updateOverlay();
 });
 
-// ---------- Keyboard ----------
-window.addEventListener("keydown", (e: KeyboardEvent) => {
-  if (e.target instanceof HTMLSelectElement || e.target instanceof HTMLInputElement) return;
-  if (e.metaKey || e.ctrlKey || e.altKey) return;
-
-  switch (e.key) {
-    case "ArrowUp": case "ArrowLeft": gotoSlice(state.index - 1); break;
-    case "ArrowDown": case "ArrowRight": gotoSlice(state.index + 1); break;
-    case "PageUp": gotoSlice(state.index - 10); break;
-    case "PageDown": gotoSlice(state.index + 10); break;
-    case "Home": gotoSlice(0); break;
-    case "End": gotoSlice(state.count - 1); break;
-    case "+": case "=": zoomCenter(1.25); break;
-    case "-": zoomCenter(0.8); break;
-    case "0": fitView(); updateOverlay(); break;
-    case "i": case "I": toggleInvert(); break;
-    case "r": case "R": resetWindow(); break;
-    case "w": case "W": setTool("window"); break;
-    case "p": case "P": setTool("pan"); break;
-    case "z": case "Z": setTool("zoom"); break;
-    case "s": case "S": setTool("scroll"); break;
-    case "o": case "O": cycleOverlay(); break;
-    case "m": case "M": toggleMarkers(); break;
-    case "a": case "A": toggleAnonymize(); break;
-    default:
-      if (/^[1-6]$/.test(e.key)) applyPreset(Number(e.key) - 1);
-      else return;
-  }
-  e.preventDefault();
+// ---------- Settings dialog and keyboard ----------
+const dialog = createSettingsDialog({
+  getBindings: () => bindings,
+  onChange: (overrides) => {
+    update({ keymap: overrides });
+    rebuildKeymap();
+    refreshPresetOptions();
+    refreshTooltips();
+  },
 });
 
+settingsBtn.addEventListener("click", () => dialog.open());
+
+// One handler per action id; the keys that trigger them live in keymap.ts and the settings
+const handlers: Record<string, () => void> = {
+  "slice.prev": () => gotoSlice(state.index - 1),
+  "slice.next": () => gotoSlice(state.index + 1),
+  "slice.back10": () => gotoSlice(state.index - 10),
+  "slice.fwd10": () => gotoSlice(state.index + 10),
+  "slice.first": () => gotoSlice(0),
+  "slice.last": () => gotoSlice(state.count - 1),
+  "view.zoomIn": () => zoomCenter(1.25),
+  "view.zoomOut": () => zoomCenter(0.8),
+  "view.fit": () => { fitView(); updateOverlay(); },
+  "view.invert": toggleInvert,
+  "view.resetWindow": resetWindow,
+  "tool.window": () => setTool("window"),
+  "tool.pan": () => setTool("pan"),
+  "tool.zoom": () => setTool("zoom"),
+  "tool.scroll": () => setTool("scroll"),
+  "ui.overlay": cycleOverlay,
+  "ui.markers": toggleMarkers,
+  "ui.anonymize": toggleAnonymize,
+  "ui.settings": () => dialog.open(),
+};
+for (let i = 1; i <= PRESET_COUNT; i++) {
+  handlers[`preset.${i}`] = () => applyPreset(i - 1);
+}
+for (const a of ACTIONS) {
+  if (!handlers[a.id]) console.warn(`No handler for action ${a.id}`);
+}
+
+window.addEventListener("keydown", (e: KeyboardEvent) => {
+  // While the dialog is open it owns the keyboard (including key capture)
+  if (dialog.handleKey(e)) return;
+  if (e.target instanceof HTMLSelectElement || e.target instanceof HTMLInputElement) return;
+
+  const combo = comboFromEvent(e);
+  if (!combo) return;
+  const id = lookup.get(combo);
+  if (!id) return;
+
+  e.preventDefault();
+  // Toggles must not flip repeatedly while a key is held
+  if (e.repeat && !ACTION_BY_ID.get(id)?.repeat) return;
+  handlers[id]?.();
+});
+
+// ---------- Native menu ----------
+// Menu actions are ignored while the settings dialog is open (it owns the keyboard)
+const whenIdle = (fn: () => void) => (): void => {
+  if (!dialog.isOpen()) fn();
+};
+
+installMenu({
+  appName: "DICOM Viewer",
+  presetNames: PRESETS.map((p) => p.name),
+  run: (id) => {
+    if (dialog.isOpen()) {
+      syncMenu(); // undo the native check toggle; the action itself is ignored
+      return;
+    }
+    handlers[id]?.();
+  },
+  openFiles: whenIdle(() => openFilesBtn.click()),
+  openFolder: whenIdle(() => openBtn.click()),
+  setOverlay: (mode) => {
+    if (dialog.isOpen()) {
+      syncMenu();
+      return;
+    }
+    setOverlay(mode);
+  },
+})
+  .catch((err: unknown) => {
+    console.warn("Menu setup failed", err);
+    return null;
+  })
+  .then((m) => {
+    appMenu = m;
+    syncMenu();
+  });
+
+refreshPresetOptions();
+refreshTooltips();
 syncControls();
 updateOverlay();

@@ -1,3 +1,3 @@
 # Dicom Viewer
 
-A Rust + Typescript with CSS HTML based medical image viewer such as DICOM file(.dcm)
+A Rust backend + Typescript with CSS and HTML frontend based medical image viewer such as DICOM file(.dcm)

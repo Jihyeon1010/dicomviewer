@@ -15,23 +15,24 @@
     </div>
 
     <div class="group" id="tools" role="toolbar" aria-label="Mouse tools">
-      <button class="tool" data-tool="window" title="Window / Level (W)">W/L</button>
-      <button class="tool" data-tool="pan" title="Pan (P)">Pan</button>
-      <button class="tool" data-tool="zoom" title="Zoom (Z)">Zoom</button>
-      <button class="tool" data-tool="scroll" title="Scroll (S)">Scroll</button>
+      <button class="tool" data-tool="window">W/L</button>
+      <button class="tool" data-tool="pan">Pan</button>
+      <button class="tool" data-tool="zoom">Zoom</button>
+      <button class="tool" data-tool="scroll">Scroll</button>
     </div>
 
     <div class="group">
-      <select id="preset" title="Window presets (1-6)"></select>
-      <button id="invert" title="Invert (I)">Invert</button>
-      <button id="fit" title="Fit to window (0)">Fit</button>
-      <button id="reset" title="Reset window (R)">Reset</button>
+      <select id="preset"></select>
+      <button id="invert">Invert</button>
+      <button id="fit">Fit</button>
+      <button id="reset">Reset</button>
     </div>
 
     <div class="group">
-      <button id="info" title="Overlay detail: full / minimal / off (O)">Info: Full</button>
-      <button id="markers" title="Orientation markers and scale bar (M)">Markers</button>
-      <button id="anonymize" title="Hide patient identifiers on screen (A)">Anonymize</button>
+      <button id="info">Info: Full</button>
+      <button id="markers">Markers</button>
+      <button id="anonymize">Anonymize</button>
+      <button id="settings-open">Settings</button>
     </div>
   </header>
 
@@ -74,6 +75,23 @@
         <input type="range" id="slider" min="0" max="0" value="0" aria-label="Slice" />
       </div>
     </main>
+  </div>
+
+  <div id="settings-backdrop" hidden>
+    <div id="settings" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+      <div class="dialog-head">
+        <h2 id="settings-title">Settings</h2>
+        <button id="settings-close" type="button">Close</button>
+      </div>
+      <div id="settings-body">
+        <div class="section-head">
+          <h3>Keyboard shortcuts</h3>
+          <button id="keys-reset-all" type="button">Reset all</button>
+        </div>
+        <div id="keys-notice" role="status"></div>
+        <div id="keys-list"></div>
+      </div>
+    </div>
   </div>
 </body>
 </html>
