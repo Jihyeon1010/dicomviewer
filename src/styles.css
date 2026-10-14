@@ -62,7 +62,7 @@ button:focus-visible, select:focus-visible, input:focus-visible {
 #body { flex: 1; display: flex; min-height: 0; }
 
 #sidebar {
-  width: 220px;
+  width: 250px;
   flex: none;
   display: flex;
   flex-direction: column;
@@ -87,16 +87,32 @@ button:focus-visible, select:focus-visible, input:focus-visible {
 }
 .series-item {
   display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 2px;
+  flex-direction: row;
+  align-items: center;
+  gap: 10px;
   width: 100%;
   height: auto;
   margin-bottom: 4px;
-  padding: 8px 10px;
+  padding: 6px 8px;
   text-align: left;
   background: transparent;
   border-color: transparent;
+}
+.series-thumb {
+  flex: none;
+  width: 56px;
+  height: 56px;
+  object-fit: contain;
+  background: #000;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+.series-text {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  gap: 2px;
+  min-width: 0;
 }
 .series-item:hover { background: var(--panel-2); }
 .series-item.active {
@@ -128,14 +144,14 @@ button:focus-visible, select:focus-visible, input:focus-visible {
 #viewport[data-tool="scroll"] { cursor: ns-resize; }
 body.dragging #viewport { outline-color: var(--accent); }
 
-canvas {
+#view {
   position: absolute;
   left: 0;
   top: 0;
   transform-origin: 0 0;
   image-rendering: pixelated;
 }
-#viewport.empty canvas { display: none; }
+#viewport.empty #view { display: none; }
 
 /* ---------- Overlays ---------- */
 .overlay {

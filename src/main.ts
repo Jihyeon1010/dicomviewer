@@ -1,6 +1,6 @@
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { getSlice, getSliceMeta, openFiles, openFolder, selectSeries } from "./api";
+import { getSlice, getSliceMeta, getThumbnail, openFiles, openFolder, selectSeries } from "./api";
 import {
   edgeLabels,
   SCALE_BAR_HEIGHT,
@@ -80,6 +80,12 @@ const view = { zoom: 1, panX: 0, panY: 0 };
 let current: SliceData | null = null;
 let meta: SliceMeta | null = null;
 let seriesData: SeriesInfo[] = [];
+
+const THUMB_PX = 112; // rendered at 2x the 56 px CSS size for high-DPI screens
+const thumbs = new Map<string, ImageData>();
+const thumbCanvases = new Map<string, HTMLCanvasElement>();
+let thumbRun = 0; // bumped to cancel thumbnail loading for a previous selection
+
 let activeUid = "";
 let seriesName = "";
 let firstLoad = true; // apply the file's default WL/WW only once per series
@@ -329,11 +335,17 @@ function toggleAnonymize(): void {
 }
 
 function renderSeriesList(): void {
+  thumbCanvases.clear();
   seriesList.replaceChildren(
     ...seriesData.map((s) => {
       const li = document.createElement("li");
       const btn = document.createElement("button");
       btn.className = "series-item" + (s.uid === activeUid ? " active" : "");
+
+      const thumb = document.createElement("canvas");
+      thumb.className = "series-thumb";
+      thumbCanvases.set(s.uid, thumb);
+      paintThumb(s.uid); // already-loaded thumbnails survive list re-renders
 
       // textContent only: descriptions come from DICOM headers (untrusted input)
       const name = document.createElement("span");
@@ -342,13 +354,47 @@ function renderSeriesList(): void {
       const info = document.createElement("span");
       info.className = "series-meta";
       info.textContent = `${s.slice_count} image${s.slice_count === 1 ? "" : "s"}`;
+      const text = document.createElement("span");
+      text.className = "series-text";
+      text.append(name, info);
 
-      btn.append(name, info);
+      btn.append(thumb, text);
       btn.addEventListener("click", () => void loadSeries(s.uid));
       li.append(btn);
       return li;
     }),
   );
+}
+
+function paintThumb(uid: string): void {
+  const img = thumbs.get(uid);
+  const c = thumbCanvases.get(uid);
+  if (!img || !c) return;
+  c.width = img.width;
+  c.height = img.height;
+  c.getContext("2d")?.putImageData(img, 0, 0);
+}
+
+// Loads thumbnails in the background, three at a time
+async function loadThumbnails(list: SeriesInfo[]): Promise<void> {
+  const run = ++thumbRun;
+  const queue = list.filter((s) => !thumbs.has(s.uid));
+
+  const worker = async (): Promise<void> => {
+    for (let s = queue.shift(); s !== undefined; s = queue.shift()) {
+      if (run !== thumbRun) return; // a newer selection superseded this one
+      try {
+        const img = await getThumbnail(s.uid, THUMB_PX);
+        if (run !== thumbRun) return;
+        thumbs.set(s.uid, img);
+        paintThumb(s.uid);
+      } catch (err) {
+        // A missing thumbnail is not worth interrupting the user
+        console.warn(`Thumbnail failed for series ${s.uid}`, err);
+      }
+    }
+  };
+  await Promise.all([worker(), worker(), worker()]);
 }
 
 // ---------- View transform ----------
@@ -510,6 +556,8 @@ async function loadSeries(uid: string): Promise<void> {
 }
 
 async function showSeries(list: SeriesInfo[]): Promise<void> {
+  thumbRun++; // cancels thumbnail loading for the previous selection
+  thumbs.clear();
   seriesData = list;
   activeUid = "";
   renderSeriesList();
@@ -528,6 +576,7 @@ async function showSeries(list: SeriesInfo[]): Promise<void> {
     return;
   }
   await loadSeries(first.uid);
+  void loadThumbnails(list);
 }
 
 async function loadInputs(fetcher: () => Promise<SeriesInfo[]>): Promise<void> {

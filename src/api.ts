@@ -73,3 +73,30 @@ function parseSlice(buf: ArrayBuffer): SliceData {
     pixels,
   };
 }
+
+// Response (little-endian): [width u32][height u32][width*height bytes, 8-bit gray]
+export async function getThumbnail(uid: string, maxPx: number): Promise<ImageData> {
+  const buf = await invoke<ArrayBuffer>("get_thumbnail", { uid, maxPx });
+  if (buf.byteLength < 8) {
+    throw new Error(`Thumbnail response too short (${buf.byteLength} bytes)`);
+  }
+  const dv = new DataView(buf);
+  const w = dv.getUint32(0, true);
+  const h = dv.getUint32(4, true);
+  if (w === 0 || h === 0 || buf.byteLength - 8 < w * h) {
+    throw new Error(`Thumbnail size mismatch: ${w}x${h}, ${buf.byteLength - 8} bytes`);
+  }
+
+  // Expand gray to RGBA for ImageData
+  const gray = new Uint8Array(buf, 8, w * h);
+  const rgba = new Uint8ClampedArray(w * h * 4);
+  for (let i = 0; i < gray.length; i++) {
+    const g = gray[i] as number;
+    const o = i * 4;
+    rgba[o] = g;
+    rgba[o + 1] = g;
+    rgba[o + 2] = g;
+    rgba[o + 3] = 255;
+  }
+  return new ImageData(rgba, w, h);
+}

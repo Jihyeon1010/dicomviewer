@@ -213,7 +213,9 @@ fn open_files(files: Vec<String>, state: tauri::State<AppState>) -> Vec<SeriesIn
 }
 
 #[tauri::command(async)]
-fn select_series(uid: String, state: tauri::State<AppState>) -> usize {
+// Frames of one series in display order: instance number first, then file,
+// then frame (keeps multiframe order stable).
+fn series_slices(state: &AppState, uid: &str) -> Vec<SliceInfo> {
     let mut v: Vec<SliceInfo> = state
         .all
         .lock()
@@ -222,10 +224,15 @@ fn select_series(uid: String, state: tauri::State<AppState>) -> usize {
         .filter(|s| s.series_uid == uid)
         .cloned()
         .collect();
-    // Instance number first, then file, then frame (keeps multiframe order stable)
     v.sort_by(|a, b| {
         (a.instance_number, &a.path, a.frame).cmp(&(b.instance_number, &b.path, b.frame))
     });
+    v
+}
+
+#[tauri::command(async)]
+fn select_series(uid: String, state: tauri::State<AppState>) -> usize {
+    let v = series_slices(&state, &uid);
     let n = v.len();
     *state.slices.lock().unwrap() = v;
     n
@@ -329,6 +336,128 @@ fn get_slice_meta(index: usize, state: tauri::State<AppState>) -> Result<SliceMe
     })
 }
 
+// Raw sample at index `i`. Decoded pixel data is little-endian and tightly packed;
+// the caller checks the buffer length first.
+fn sample_at(data: &[u8], bits: u32, signed: bool, i: usize) -> f64 {
+    match (bits, signed) {
+        (8, false) => data[i] as f64,
+        (8, true) => data[i] as i8 as f64,
+        (16, false) => u16::from_le_bytes([data[2 * i], data[2 * i + 1]]) as f64,
+        (16, true) => i16::from_le_bytes([data[2 * i], data[2 * i + 1]]) as f64,
+        _ => 0.0,
+    }
+}
+
+// Response (little-endian): [width u32][height u32][width*height bytes, 8-bit gray].
+// Shows the middle image of the series, windowed with the file's own window when
+// present and with the 1st-99th percentile of the image otherwise.
+#[tauri::command(async)]
+fn get_thumbnail(
+    uid: String,
+    max_px: u32,
+    state: tauri::State<AppState>,
+) -> Result<tauri::ipc::Response, String> {
+    let max_px = max_px.clamp(16, 512) as usize;
+    let slices = series_slices(&state, &uid);
+    let s = slices.get(slices.len() / 2).ok_or("Series not found")?;
+
+    // Opened directly instead of through open_cached: the shared cache holds the
+    // file shown in the viewer and must not be evicted by background thumbnails.
+    let obj = dicom::object::open_file(&s.path).map_err(|e| e.to_string())?;
+    let px = obj
+        .decode_pixel_data_frame(s.frame)
+        .map_err(|e| e.to_string())?;
+    if px.samples_per_pixel() != 1 {
+        return Err("Color images are not supported yet".into());
+    }
+
+    let rows = px.rows() as usize;
+    let cols = px.columns() as usize;
+    let bits = px.bits_allocated() as u32;
+    let signed = px.pixel_representation() as u32 == 1;
+    let data = px.data();
+    if rows == 0
+        || cols == 0
+        || (bits != 8 && bits != 16)
+        || data.len() < rows * cols * (bits as usize / 8)
+    {
+        return Err("Unsupported or truncated pixel data".into());
+    }
+
+    // Output size keeps the aspect ratio and never upscales
+    let longest = rows.max(cols);
+    let (ow, oh) = if longest <= max_px {
+        (cols, rows)
+    } else {
+        (
+            (cols * max_px / longest).max(1),
+            (rows * max_px / longest).max(1),
+        )
+    };
+
+    // Box-average each output pixel over its block of source pixels
+    let mut values: Vec<f32> = Vec::with_capacity(ow * oh);
+    for oy in 0..oh {
+        let y0 = oy * rows / oh;
+        let y1 = ((oy + 1) * rows / oh).max(y0 + 1).min(rows);
+        for ox in 0..ow {
+            let x0 = ox * cols / ow;
+            let x1 = ((ox + 1) * cols / ow).max(x0 + 1).min(cols);
+            let mut sum = 0.0f64;
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    sum += sample_at(data, bits, signed, y * cols + x);
+                }
+            }
+            values.push((sum / ((y1 - y0) * (x1 - x0)) as f64) as f32);
+        }
+    }
+
+    // Rescale is linear, so applying it after averaging gives the same result
+    let mut slope = f64_of(&obj, tags::RESCALE_SLOPE, 1.0);
+    if slope == 0.0 {
+        slope = 1.0;
+    }
+    let intercept = f64_of(&obj, tags::RESCALE_INTERCEPT, 0.0);
+    for v in values.iter_mut() {
+        *v = (*v as f64 * slope + intercept) as f32;
+    }
+
+    let window = match (
+        first_f64(&obj, tags::WINDOW_CENTER),
+        first_f64(&obj, tags::WINDOW_WIDTH),
+    ) {
+        (Some(c), Some(w)) if w > 0.0 => Some((c - w / 2.0, c + w / 2.0)),
+        _ => None,
+    };
+    let (lo, hi) = window.unwrap_or_else(|| {
+        let mut sorted = values.clone();
+        sorted.sort_by(|a, b| a.total_cmp(b));
+        let at = |q: f32| sorted[((sorted.len() - 1) as f32 * q) as usize] as f64;
+        (at(0.01), at(0.99))
+    });
+    let width = (hi - lo).max(1e-6);
+
+    let mono1 = obj
+        .element(tags::PHOTOMETRIC_INTERPRETATION)
+        .ok()
+        .and_then(|e| e.to_str().ok().map(|s| s.trim() == "MONOCHROME1"))
+        .unwrap_or(false);
+
+    let mut out = Vec::with_capacity(8 + ow * oh);
+    out.extend_from_slice(&(ow as u32).to_le_bytes());
+    out.extend_from_slice(&(oh as u32).to_le_bytes());
+    out.extend(values.iter().map(|&v| {
+        let g = (((v as f64 - lo) / width) * 255.0).clamp(0.0, 255.0) as u8;
+        if mono1 {
+            255 - g
+        } else {
+            g
+        }
+    }));
+    Ok(tauri::ipc::Response::new(out))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -339,7 +468,8 @@ pub fn run() {
             open_files,
             select_series,
             get_slice,
-            get_slice_meta
+            get_slice_meta,
+            get_thumbnail
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
