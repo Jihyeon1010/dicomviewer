@@ -1,4 +1,5 @@
-import { getSeriesGeometry, getSlice, getSliceMeta } from "./api";
+import { getSeriesGeometry } from "./api";
+import { sliceCache } from "./slice-cache";
 import { cleanName, compact, fmtAge, fmtDate, fmtTime, num } from "./format";
 import {
   edgeLabels,
@@ -76,6 +77,10 @@ const MEASURE_COLOR = "#7dffb2";
 // Views smaller than this cannot hold the full overlay
 const SMALL_W = 360;
 const SMALL_H = 260;
+
+// Images fetched ahead of the shown one: in the direction of travel, and a few behind it
+const PREFETCH_AHEAD = 8;
+const PREFETCH_BEHIND = 2;
 
 const clamp = (v: number, lo: number, hi: number): number => Math.min(hi, Math.max(lo, v));
 
@@ -275,6 +280,7 @@ export class Viewport {
   private drawQueued = false;
   private drag: Drag | null = null;
   private wheelAcc = 0;
+  private dir: 1 | -1 = 1; // direction of the last move, used to prefetch ahead
   private cineRaf = 0; // requestAnimationFrame id while playing, 0 otherwise
   private cineLast = 0;
   private measurements = new Map<string, Measurement[]>(); // keyed by series and image
@@ -319,11 +325,13 @@ export class Viewport {
   /** Shows a series (or clears the viewport). Resolves once the first image is loaded. */
   setSeries(series: SeriesInfo | null): Promise<void> {
     this.stopPlay();
+    sliceCache.cancel(this);
     this.fetchToken++; // drops responses that are still in flight for the old series
     this.loading = false;
     this.series = series;
     this.count = series?.slice_count ?? 0;
     this.index = 0;
+    this.dir = 1;
     this.fps = 10;
     this.firstLoad = true;
     this.autoFit = true;
@@ -357,8 +365,13 @@ export class Viewport {
 
   setVisible(on: boolean): void {
     this.el.hidden = !on;
-    if (on) this.requestDraw();
-    else this.stopPlay();
+    if (on) {
+      this.requestDraw();
+      this.planPrefetch();
+    } else {
+      this.stopPlay();
+      sliceCache.cancel(this); // hidden views do not need images ahead of time
+    }
   }
 
   private async loadGeometry(uid: string): Promise<void> {
@@ -377,11 +390,9 @@ export class Viewport {
     const token = ++this.fetchToken;
     this.loading = true;
     try {
-      // Metadata is optional: a failure there must not block the image
-      const [slice, m] = await Promise.all([
-        getSlice(series.uid, this.index),
-        getSliceMeta(series.uid, this.index).catch(() => null),
-      ]);
+      // From the shared cache: an image that was prefetched resolves immediately.
+      // Metadata is optional; a failure there is already turned into null by the cache.
+      const { slice, meta: m } = await sliceCache.get(series.uid, this.index);
       if (token !== this.fetchToken) return; // a newer request superseded this one
 
       const dimsChanged =
@@ -408,6 +419,7 @@ export class Viewport {
       this.setStatus("");
       this.draw();
       this.host.stateChanged(this); // grayscale or colour decides which controls apply
+      this.planPrefetch();
     } catch (err) {
       if (token === this.fetchToken) {
         this.stopPlay();
@@ -416,6 +428,20 @@ export class Viewport {
     } finally {
       if (token === this.fetchToken) this.loading = false;
     }
+  }
+
+  // Asks the cache to load the images around the shown one in the background
+  private planPrefetch(): void {
+    const series = this.series;
+    if (!series || !this.current || this.el.hidden) return;
+    const wanted: number[] = [];
+    for (let k = 1; k <= PREFETCH_AHEAD; k++) wanted.push(this.index + this.dir * k);
+    for (let k = 1; k <= PREFETCH_BEHIND; k++) wanted.push(this.index - this.dir * k);
+    sliceCache.plan(
+      this,
+      series.uid,
+      wanted.filter((i) => i >= 0 && i < this.count),
+    );
   }
 
   // ---------- Navigation and window ----------
@@ -427,6 +453,7 @@ export class Viewport {
     if (!fromCine) this.stopPlay(); // scrolling by hand pauses playback
     this.draft = null; // measurements belong to one image
     this.measuring = false;
+    this.dir = clamped > this.index ? 1 : -1;
     this.index = clamped;
     this.refreshOverlay();
     this.host.stateChanged(this);

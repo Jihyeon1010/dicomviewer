@@ -28,6 +28,7 @@ import { createTagsDialog } from "./tags-dialog";
 import type { SeriesInfo, VolumeInfo } from "./types";
 import { syncedIndex, Viewport, type ToolId, type ViewportHost } from "./viewport";
 import { mountIcons, setIcon, setLabel } from "./icons";
+import { sliceCache } from "./slice-cache";
 
 // ---------- Elements ----------
 const viewportsEl = byId("viewports", HTMLDivElement);
@@ -661,6 +662,7 @@ async function exportImage(copy: boolean): Promise<void> {
 async function showSeries(list: SeriesInfo[]): Promise<void> {
   thumbRun++; // cancels thumbnail loading for the previous selection
   thumbs.clear();
+  sliceCache.clear(); // indices of the old files must not be served for the new ones
   seriesData = list;
   hasLoaded = true;
   volume = null;
