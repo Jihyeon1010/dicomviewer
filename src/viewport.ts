@@ -1,5 +1,4 @@
 import { getSeriesGeometry } from "./api";
-import { sliceCache } from "./slice-cache";
 import { cleanName, compact, fmtAge, fmtDate, fmtTime, num } from "./format";
 import {
   edgeLabels,
@@ -11,6 +10,7 @@ import {
 import { angleText, areaText, lengthText, roiLines, shapeAreaPx, type Spacing } from "./measure";
 import { GLRenderer } from "./renderer";
 import type { OverlayMode } from "./settings";
+import { seriesSource, sliceCache, type SliceSource } from "./slice-cache";
 import {
   cssTransform,
   imageToScreen,
@@ -25,12 +25,22 @@ import {
 } from "./transform2d";
 import type { SeriesGeometry, SeriesInfo, SliceData, SliceMeta } from "./types";
 
+import { autoOrient, type OrientMode } from "./orient-auto";
+import type { Plane } from "./types";
+
 export type MeasureKind = "length" | "angle" | "ellipse" | "rect";
-export type ToolId = "window" | "pan" | "zoom" | "scroll" | MeasureKind;
-type DragMode = Exclude<ToolId, MeasureKind>;
+export type ToolId = "window" | "pan" | "zoom" | "scroll" | "cross" | MeasureKind;
+type DragMode = "window" | "pan" | "zoom" | "scroll";
 
 export function isMeasureTool(t: ToolId): t is MeasureKind {
   return t === "length" || t === "angle" || t === "ellipse" || t === "rect";
+}
+
+/** A line across the whole image that marks where another plane cuts this view. */
+export interface RefLine {
+  axis: "x" | "y"; // "x": a vertical line at image x = pos; "y": a horizontal line at image y = pos
+  pos: number;
+  color: string;
 }
 
 export interface OverlayOptions {
@@ -47,6 +57,8 @@ export interface ViewportHost {
   sliceChanged(vp: Viewport): void;  // the user moved to another image
   windowChanged(vp: Viewport): void; // the user changed window/level
   stateChanged(vp: Viewport): void;  // anything the toolbar shows
+  pick(vp: Viewport, p: Pt): void;   // the crosshair tool was used at an image position
+  orientMode(): OrientMode;
 }
 
 interface Drag {
@@ -267,12 +279,16 @@ export class Viewport {
   private readonly host: ViewportHost;
   private readonly ui: Ui;
   private renderer: GLRenderer | null = null;
+  private source: SliceSource | null = null; // null: the plain images of `series`
   private current: SliceData | null = null;
   private meta: SliceMeta | null = null;
   private zoom = 1;
   private panX = 0;
   private panY = 0;
   private orient: Orient = { ...NO_ORIENT };
+  private plane: Plane = "axial"; // which plane this view shows; decides the standard orientation
+  private baseOrient: Orient = { ...NO_ORIENT }; // the automatic part of the orientation
+  private autoPending = true; // the automatic orientation is applied once per content
   private autoFit = true; // keep the image fitted until the user zooms or pans
   private firstLoad = true; // apply the file's default WL/WW only once per series
   private fetchToken = 0;
@@ -283,13 +299,22 @@ export class Viewport {
   private dir: 1 | -1 = 1; // direction of the last move, used to prefetch ahead
   private cineRaf = 0; // requestAnimationFrame id while playing, 0 otherwise
   private cineLast = 0;
-  private measurements = new Map<string, Measurement[]>(); // keyed by series and image
+  private measurements = new Map<string, Measurement[]>(); // keyed by source and image
   private draft: Draft | null = null;
   private measuring = false; // mouse button held while drawing a drag-style measurement
+  private refLines: RefLine[] = [];
+  private crossing = false; // mouse button held with the crosshair tool
+  private crossRaf = 0;
+  private crossPt: { x: number; y: number } | null = null;
 
   /** True when the shown image is in colour; windowing does not apply to those. */
   get color(): boolean {
     return this.current?.samples === 3;
+  }
+
+  /** True when this view shows a reformatted plane instead of the images of a series. */
+  get isReformat(): boolean {
+    return this.source !== null;
   }
 
   get playing(): boolean {
@@ -322,15 +347,16 @@ export class Viewport {
 
   // ---------- Content ----------
 
-  /** Shows a series (or clears the viewport). Resolves once the first image is loaded. */
-  setSeries(series: SeriesInfo | null): Promise<void> {
+  // Forgets the shown content; the caller loads the first image afterwards
+  private reset(series: SeriesInfo | null, source: SliceSource | null, count: number, index: number): void {
     this.stopPlay();
     sliceCache.cancel(this);
-    this.fetchToken++; // drops responses that are still in flight for the old series
+    this.fetchToken++; // drops responses that are still in flight for the old content
     this.loading = false;
     this.series = series;
-    this.count = series?.slice_count ?? 0;
-    this.index = 0;
+    this.source = source;
+    this.count = count;
+    this.index = clamp(index, 0, Math.max(0, count - 1));
     this.dir = 1;
     this.fps = 10;
     this.firstLoad = true;
@@ -340,18 +366,57 @@ export class Viewport {
     this.geometry = null;
     this.extraLines = [];
     this.orient = { ...NO_ORIENT };
+    this.baseOrient = { ...NO_ORIENT };
+    this.autoPending = true;
     this.draft = null;
     this.measuring = false;
+    this.crossing = false;
+    this.refLines = [];
     if (series === null) this.measurements.clear();
     this.ui.readout.textContent = "";
     this.setStatus("");
     this.el.classList.toggle("empty", series === null);
     this.refreshOverlay();
     this.host.stateChanged(this);
+  }
 
+  /** Shows a series (or clears the viewport). Resolves once the first image is loaded. */
+  setSeries(series: SeriesInfo | null): Promise<void> {
+    this.plane ="axial";
+    this.reset(series, null, series?.slice_count ?? 0, 0);
     if (!series) return Promise.resolve();
     void this.loadGeometry(series.uid);
     return this.loadSlice();
+  }
+
+  /**
+   * Shows a reformatted view of the volume of `series`. `count` is the number of positions
+   * the view can scroll through. Resolves once the first image is loaded.
+   */
+  setReformat(
+    series: SeriesInfo,
+    source: SliceSource,
+    count: number,
+    index: number,
+    plane: Plane,
+  ): Promise<void> {
+    this.plane = plane;
+    this.reset(series, source, count, index);
+    return this.loadSlice();
+  }
+
+  /** Swaps the images of a reformatted view and keeps position, zoom and window. */
+  replaceSource(source: SliceSource): void {
+    if (!this.source) return;
+    this.source = source;
+    sliceCache.cancel(this);
+    void this.loadSlice();
+  }
+
+  /** Reference lines of other planes, drawn across the image. */
+  setRefLines(lines: RefLine[]): void {
+    this.refLines = lines;
+    this.updateMeasurements();
   }
 
   setEmptyMessage(title: string, sub: string): void {
@@ -377,22 +442,27 @@ export class Viewport {
   private async loadGeometry(uid: string): Promise<void> {
     try {
       const g = await getSeriesGeometry(uid);
-      if (this.series?.uid === uid) this.geometry = g;
+      if (this.series?.uid === uid && !this.source) this.geometry = g;
     } catch (err) {
       // Linking with other viewports is simply unavailable without geometry
       console.warn(`Geometry unavailable for series ${uid}`, err);
     }
   }
 
+  private activeSource(): SliceSource | null {
+    if (this.source) return this.source;
+    return this.series ? seriesSource(this.series.uid) : null;
+  }
+
   private async loadSlice(): Promise<void> {
-    const series = this.series;
-    if (!series || this.count === 0) return;
+    const src = this.activeSource();
+    if (!src || this.count === 0) return;
     const token = ++this.fetchToken;
     this.loading = true;
     try {
-      // From the shared cache: an image that was prefetched resolves immediately.
-      // Metadata is optional; a failure there is already turned into null by the cache.
-      const { slice, meta: m } = await sliceCache.get(series.uid, this.index);
+      // From the shared cache: an image that was prefetched resolves immediately
+      // Metadata is optional; a failure there is already turned into null by the source.
+      const { slice, meta: m } = await sliceCache.get(src, this.index);
       if (token !== this.fetchToken) return; // a newer request superseded this one
 
       const dimsChanged =
@@ -400,6 +470,11 @@ export class Viewport {
       this.current = slice;
       this.meta = m;
       this.renderer?.upload(slice);
+
+      if (this.autoPending) {
+        this.autoPending = false;
+        this.applyAutoOrient(m);
+      }
 
       if (this.firstLoad) {
         if (slice.defaultWl !== null && slice.defaultWw !== null) {
@@ -432,14 +507,14 @@ export class Viewport {
 
   // Asks the cache to load the images around the shown one in the background
   private planPrefetch(): void {
-    const series = this.series;
-    if (!series || !this.current || this.el.hidden) return;
+    const src = this.activeSource();
+    if (!src || !this.current || this.el.hidden) return;
     const wanted: number[] = [];
     for (let k = 1; k <= PREFETCH_AHEAD; k++) wanted.push(this.index + this.dir * k);
     for (let k = 1; k <= PREFETCH_BEHIND; k++) wanted.push(this.index - this.dir * k);
     sliceCache.plan(
       this,
-      series.uid,
+      src,
       wanted.filter((i) => i >= 0 && i < this.count),
     );
   }
@@ -543,8 +618,24 @@ export class Viewport {
     this.orientChanged();
   }
 
+  // The orientation that the current mode asks for; the images of a series all share it
+  private applyAutoOrient(meta: SliceMeta | null): void {
+    this.baseOrient =
+      this.host.orientMode() === "standard"
+        ? autoOrient(edgeLabels(meta), this.plane)
+        : { ...NO_ORIENT };
+    this.orient = { ...this.baseOrient };
+  }
+
+  /** The mode changed: orientation goes back to what the mode gives, user turns are dropped. */
+  refreshOrientMode(): void {
+    if (!this.current) return;
+    this.applyAutoOrient(this.meta);
+    this.orientChanged();
+  }
+
   resetOrientation(): void {
-    this.orient = { ...NO_ORIENT };
+    this.orient = { ...this.baseOrient };
     this.orientChanged();
   }
 
@@ -795,7 +886,7 @@ export class Viewport {
   }
 
   private sliceKey(): string {
-    return `${this.series?.uid ?? ""}#${this.index}`;
+    return `${this.source?.id ?? this.series?.uid ?? ""}#${this.index}`;
   }
 
   /** Cancels a measurement in progress. Returns true when there was one. */
@@ -944,18 +1035,50 @@ export class Viewport {
     return out;
   }
 
+  // Lines that mark where other planes cut this view, across the whole image
+  private refNodes(): SVGElement[] {
+    const s = this.current;
+    if (!s) return [];
+    return this.refLines.map((l) => {
+      const a: Pt = l.axis === "x" ? { x: l.pos, y: 0 } : { x: 0, y: l.pos };
+      const b: Pt = l.axis === "x" ? { x: l.pos, y: s.rows } : { x: s.cols, y: l.pos };
+      const p = this.toScreen(a);
+      const q = this.toScreen(b);
+      return svgEl("line", {
+        x1: p.x, y1: p.y, x2: q.x, y2: q.y,
+        stroke: l.color, "stroke-width": 1, "stroke-opacity": 0.85,
+      });
+    });
+  }
+
   private updateMeasurements(): void {
     const svg = this.ui.measure;
     if (!this.current || this.el.hidden) {
       svg.replaceChildren();
       return;
     }
-    const nodes: SVGElement[] = [];
+    const nodes: SVGElement[] = [...this.refNodes()];
     for (const m of this.measurements.get(this.sliceKey()) ?? []) {
       nodes.push(...this.shapeNodes(m.kind, m.pts, m.lines));
     }
     if (this.draft) nodes.push(...this.shapeNodes(this.draft.kind, this.draft.pts, this.liveLines(this.draft)));
     svg.replaceChildren(...nodes);
+  }
+
+  // ---------- Crosshair ----------
+
+  // At most one pick per frame: moving the crosshair makes other views load new images
+  private pickAt(clientX: number, clientY: number): void {
+    this.crossPt = { x: clientX, y: clientY };
+    if (this.crossRaf) return;
+    this.crossRaf = requestAnimationFrame(() => {
+      this.crossRaf = 0;
+      const p = this.crossPt;
+      this.crossPt = null;
+      if (!p) return;
+      const r = this.el.getBoundingClientRect();
+      this.host.pick(this, this.toImage(p.x - r.left, p.y - r.top));
+    });
   }
 
   // ---------- Mouse ----------
@@ -1005,8 +1128,15 @@ export class Viewport {
         e.preventDefault();
         return;
       }
+      if (tool === "cross" && e.button === 0 && !panOverride) {
+        this.crossing = true;
+        this.pickAt(e.clientX, e.clientY);
+        e.preventDefault();
+        return;
+      }
 
-      const mode: DragMode = panOverride || isMeasureTool(tool) ? "pan" : tool;
+      const mode: DragMode =
+        panOverride || isMeasureTool(tool) || tool === "cross" ? "pan" : tool;
       this.drag = {
         mode,
         x: e.clientX, y: e.clientY,
@@ -1020,6 +1150,7 @@ export class Viewport {
 
     window.addEventListener("mouseup", () => {
       this.drag = null;
+      this.crossing = false;
       if (this.measuring) {
         this.measuring = false;
         this.finishDragMeasure();
@@ -1027,6 +1158,8 @@ export class Viewport {
     });
 
     window.addEventListener("mousemove", (e: MouseEvent) => {
+      if (this.crossing) this.pickAt(e.clientX, e.clientY);
+
       // The last point of a measurement in progress follows the cursor
       const dr = this.draft;
       if (dr && (dr.kind === "angle" || this.measuring)) {
@@ -1071,7 +1204,8 @@ export class Viewport {
 
     el.addEventListener("dblclick", () => {
       // Double clicks finish an angle or add a degenerate shape; only fit when idle
-      if (!isMeasureTool(this.host.tool())) this.fit();
+      const tool = this.host.tool();
+      if (!isMeasureTool(tool) && tool !== "cross") this.fit();
     });
   }
 }

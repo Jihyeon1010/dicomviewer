@@ -1,7 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  Plane,
   SeriesGeometry,
   SeriesInfo,
+  SlabMode,
   SliceData,
   SliceMeta,
   TagEntry,
@@ -9,6 +11,7 @@ import type {
 } from "./types";
 
 const HEADER_BYTES = 40;
+const MPR_HEADER_BYTES = 48;
 const THUMB_HEADER_BYTES = 12;
 
 export function openFolder(dir: string): Promise<SeriesInfo[]> {
@@ -33,12 +36,13 @@ export async function getSlice(uid: string, index: number): Promise<SliceData> {
   return parseSlice(buf);
 }
 
-// 40-byte header (little-endian):
+// Header (little-endian), 40 bytes:
 // [rows u32][cols u32][bits u32][signed u32]
 // [slope f32][intercept f32][wc f32][ww f32][mono1 u32][samples u32]
-// followed by the pixels: 8/16-bit grayscale, or 8-bit interleaved RGB when samples is 3
-function parseSlice(buf: ArrayBuffer): SliceData {
-  if (buf.byteLength < HEADER_BYTES) {
+// followed by the pixels: 8/16-bit grayscale, or 8-bit interleaved RGB when samples is 3.
+// Reformatted images use a 48-byte header: the same 40 bytes plus two spacing values.
+function parseSlice(buf: ArrayBuffer, headerBytes = HEADER_BYTES): SliceData {
+  if (buf.byteLength < headerBytes) {
     throw new Error(`Slice response too short (${buf.byteLength} bytes)`);
   }
   const dv = new DataView(buf);
@@ -66,17 +70,17 @@ function parseSlice(buf: ArrayBuffer): SliceData {
 
   const length = rows * cols * samples;
   const expected = length * (bits / 8);
-  const actual = buf.byteLength - HEADER_BYTES;
+  const actual = buf.byteLength - headerBytes;
   if (actual < expected) {
     throw new Error(`Pixel data length mismatch: expected ${expected}, got ${actual}`);
   }
 
   const pixels =
     bits === 8
-      ? new Uint8Array(buf, HEADER_BYTES, length)
+      ? new Uint8Array(buf, headerBytes, length)
       : signed
-        ? new Int16Array(buf, HEADER_BYTES, length)
-        : new Uint16Array(buf, HEADER_BYTES, length);
+        ? new Int16Array(buf, headerBytes, length)
+        : new Uint16Array(buf, headerBytes, length);
 
   return {
     rows,
@@ -91,6 +95,28 @@ function parseSlice(buf: ArrayBuffer): SliceData {
     samples,
     pixels,
   };
+}
+
+export interface MprSlice {
+  slice: SliceData;
+  spacing: [number, number]; // mm per output pixel: [horizontal, vertical]
+}
+
+/** One reformatted image of the built volume of a series. */
+export async function getMprSlice(
+  uid: string,
+  plane: Plane,
+  index: number,
+  slab: SlabMode,
+  thicknessMm: number,
+): Promise<MprSlice> {
+  const buf = await invoke<ArrayBuffer>("get_mpr_slice", { uid, plane, index, slab, thicknessMm });
+  if (buf.byteLength < MPR_HEADER_BYTES) {
+    throw new Error(`Reformatted image response too short (${buf.byteLength} bytes)`);
+  }
+  const dv = new DataView(buf);
+  const spacing: [number, number] = [dv.getFloat32(40, true), dv.getFloat32(44, true)];
+  return { slice: parseSlice(buf, MPR_HEADER_BYTES), spacing };
 }
 
 // Response (little-endian): [width u32][height u32][channels u32][width*height*channels bytes]

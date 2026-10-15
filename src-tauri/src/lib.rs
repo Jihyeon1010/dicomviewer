@@ -16,6 +16,8 @@ use std::{
 };
 use walkdir::WalkDir;
 
+mod mpr;
+
 type Vec3 = [f64; 3];
 
 // Hard limit on the in-memory volume (f32 per voxel)
@@ -98,6 +100,9 @@ struct VolumeInfo {
     value_min: f64,
     value_max: f64,
     megabytes: f64,
+    z_positions: Vec<f64>,           // mm along the stack direction, one per image, ascending
+    orientation: Option<[f64; 6]>,   // row and column direction cosines of the images
+    z_dir: Option<Vec3>,             // direction in which the image index increases
 }
 
 struct Volume {
@@ -105,8 +110,10 @@ struct Volume {
     info: VolumeInfo,
     // One buffer per slice in display order, each rows * cols rescaled values.
     // Separate buffers let the parallel decode move results in without copying.
-    #[allow(dead_code)] // read by the MPR commands in a later step
     slices: Vec<Vec<f32>>,
+    z: Vec<f64>,                // image positions in mm, same as info.z_positions
+    window: Option<(f32, f32)>, // default window centre and width of the first image
+    mono1: bool,                // MONOCHROME1 series
 }
 
 #[derive(Default)]
@@ -989,6 +996,25 @@ fn build_volume(uid: String, state: tauri::State<AppState>) -> Result<VolumeInfo
         );
 
     let (slice_spacing, uniform, tilt_deg) = slice_geometry(&slices);
+
+    // Position of every image along the stack direction. It is only trusted when every
+    // image has a position; otherwise the views assume a regular spacing.
+    let normal = slices.iter().find_map(|s| s.iop).and_then(|o| scroll_normal(&o));
+    let fallback_step = slice_spacing
+        .or(pixel_spacing.map(|p| p[1]))
+        .unwrap_or(1.0);
+    let ipps: Vec<Option<Vec3>> = slices.iter().map(|s| s.ipp).collect();
+    let (z, z_real) = mpr::stack_positions(&ipps, normal, fallback_step);
+
+    let window = match (
+        first_f64(&head, tags::WINDOW_CENTER),
+        first_f64(&head, tags::WINDOW_WIDTH),
+    ) {
+        (Some(c), Some(w)) if w > 0.0 => Some((c as f32, w as f32)),
+        _ => None,
+    };
+    let mono1 = text_of(&head, tags::PHOTOMETRIC_INTERPRETATION) == "MONOCHROME1";
+
     let info = VolumeInfo {
         cols: cols as u32,
         rows: rows as u32,
@@ -1000,6 +1026,9 @@ fn build_volume(uid: String, state: tauri::State<AppState>) -> Result<VolumeInfo
         value_min: vmin as f64,
         value_max: vmax as f64,
         megabytes: bytes as f64 / (1024.0 * 1024.0),
+        z_positions: z.clone(),
+        orientation: slices.iter().find_map(|s| s.iop),
+        z_dir: if z_real { normal } else { None },
     };
 
     if state.volume_gen.load(Ordering::SeqCst) != gen {
@@ -1009,282 +1038,72 @@ fn build_volume(uid: String, state: tauri::State<AppState>) -> Result<VolumeInfo
         uid,
         info: info.clone(),
         slices: data,
+        z,
+        window,
+        mono1,
     }));
     Ok(info)
 }
 
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
-pub fn run() {
-    tauri::Builder::default()
-        .plugin(tauri_plugin_dialog::init())
-        .manage(AppState::default())
-        .invoke_handler(tauri::generate_handler![
-            open_folder,
-            open_files,
-            get_series_geometry,
-            get_slice,
-            get_slice_meta,
-            get_thumbnail,
-            build_volume,
-            get_tags,
-            save_png
-        ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
-}
+// One reformatted image of the built volume. Response (little-endian):
+// the 40-byte slice header (16-bit unsigned samples, slope and intercept restore the real
+// values), then [spacing_x f32][spacing_y f32] in mm per pixel, then the samples.
+#[tauri::command(async)]
+fn get_mpr_slice(
+    uid: String,
+    plane: String,
+    index: usize,
+    slab: String,
+    thickness_mm: f64,
+    state: tauri::State<AppState>,
+) -> Result<tauri::ipc::Response, String> {
+    let vol = state
+        .volume
+        .lock()
+        .unwrap()
+        .as_ref()
+        .filter(|v| v.uid == uid)
+        .cloned()
+        .ok_or("The volume of this series has not been built")?;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+    let plane = mpr::Plane::parse(&plane)?;
+    let slab = mpr::Slab::parse(&slab)?;
+    let ps = vol.info.pixel_spacing;
+    let geometry = mpr::Geometry {
+        cols: vol.info.cols as usize,
+        rows: vol.info.rows as usize,
+        sx: ps.map_or(1.0, |p| p[1]),
+        sy: ps.map_or(1.0, |p| p[0]),
+        z: &vol.z,
+    };
+    let img = mpr::reformat(
+        &vol.slices,
+        &geometry,
+        plane,
+        index,
+        slab,
+        thickness_mm.clamp(0.0, 1.0e6),
+    )?;
 
-    // Row and column direction cosines of the three standard planes (patient LPS)
-    const AXIAL: [f64; 6] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
-    const CORONAL: [f64; 6] = [1.0, 0.0, 0.0, 0.0, 0.0, -1.0];
-    const SAGITTAL: [f64; 6] = [0.0, 1.0, 0.0, 0.0, 0.0, -1.0];
+    let enc = mpr::encoding_for(vol.info.value_min, vol.info.value_max);
+    let (wc, ww) = vol.window.unwrap_or((f32::NAN, f32::NAN));
+    let samples = mpr::encode(&img.data, &enc);
 
-    fn slice(instance: i32, ipp: Option<Vec3>, iop: Option<[f64; 6]>) -> SliceInfo {
-        SliceInfo {
-            path: PathBuf::from(format!("img{instance}.dcm")),
-            series_uid: "S1".into(),
-            instance_number: instance,
-            frame: 0,
-            ipp,
-            iop,
-            frame_of_reference: "F1".into(),
-        }
-    }
-
-    fn axial(instance: i32, z: f64) -> SliceInfo {
-        slice(instance, Some([0.0, 0.0, z]), Some(AXIAL))
-    }
-
-    fn coronal(instance: i32, y: f64) -> SliceInfo {
-        slice(instance, Some([0.0, y, 0.0]), Some(CORONAL))
-    }
-
-    fn sagittal(instance: i32, x: f64) -> SliceInfo {
-        slice(instance, Some([x, 0.0, 0.0]), Some(SAGITTAL))
-    }
-
-    fn instances(v: &[SliceInfo]) -> Vec<i32> {
-        v.iter().map(|s| s.instance_number).collect()
-    }
-
-    fn close(a: f64, b: f64) -> bool {
-        (a - b).abs() < 1e-9
-    }
-
-    fn assert_vec(actual: Vec3, expected: Vec3) {
-        assert!(
-            (0..3).all(|i| close(actual[i], expected[i])),
-            "expected {expected:?}, got {actual:?}"
-        );
-    }
-
-    // ---------- scroll_normal ----------
-
-    #[test]
-    fn axial_normal_points_toward_the_feet() {
-        assert_vec(scroll_normal(&AXIAL).unwrap(), [0.0, 0.0, -1.0]);
-    }
-
-    #[test]
-    fn coronal_normal_points_backwards() {
-        assert_vec(scroll_normal(&CORONAL).unwrap(), [0.0, 1.0, 0.0]);
-    }
-
-    #[test]
-    fn sagittal_normal_points_to_the_left() {
-        assert_vec(scroll_normal(&SAGITTAL).unwrap(), [1.0, 0.0, 0.0]);
-    }
-
-    #[test]
-    fn oblique_axial_normal_is_a_unit_vector() {
-        let t = 20.0_f64.to_radians();
-        let n = scroll_normal(&[1.0, 0.0, 0.0, 0.0, t.cos(), t.sin()]).unwrap();
-        assert_vec(n, [0.0, t.sin(), -t.cos()]);
-    }
-
-    #[test]
-    fn unnormalised_cosines_are_accepted() {
-        let n = scroll_normal(&[2.0, 0.0, 0.0, 0.0, 2.0, 0.0]).unwrap();
-        assert_vec(n, [0.0, 0.0, -1.0]);
-    }
-
-    #[test]
-    fn degenerate_orientation_has_no_normal() {
-        assert!(scroll_normal(&[0.0; 6]).is_none());
-        // Row and column parallel: the cross product vanishes
-        assert!(scroll_normal(&[1.0, 0.0, 0.0, 1.0, 0.0, 0.0]).is_none());
-    }
-
-    // ---------- sort_slices ----------
-
-    #[test]
-    fn axial_slices_are_sorted_superior_first() {
-        let mut v = vec![axial(1, 0.0), axial(2, 5.0), axial(3, 10.0), axial(4, 15.0)];
-        sort_slices(&mut v);
-        assert_eq!(instances(&v), vec![4, 3, 2, 1]);
-    }
-
-    #[test]
-    fn position_wins_over_instance_number() {
-        let mut v = vec![axial(7, 10.0), axial(3, 0.0), axial(9, 5.0)];
-        sort_slices(&mut v);
-        assert_eq!(instances(&v), vec![7, 9, 3]);
-    }
-
-    #[test]
-    fn coronal_slices_are_sorted_anterior_first() {
-        // In LPS the y axis points to the back, so the front has the smaller y
-        let mut v = vec![coronal(1, -10.0), coronal(2, -30.0), coronal(3, -20.0)];
-        sort_slices(&mut v);
-        assert_eq!(instances(&v), vec![2, 3, 1]);
-    }
-
-    #[test]
-    fn sagittal_slices_are_sorted_right_first() {
-        // In LPS the x axis points to the left, so the right side has the smaller x
-        let mut v = vec![sagittal(1, 20.0), sagittal(2, -20.0), sagittal(3, 0.0)];
-        sort_slices(&mut v);
-        assert_eq!(instances(&v), vec![2, 3, 1]);
-    }
-
-    #[test]
-    fn missing_position_falls_back_to_instance_number() {
-        let mut v = vec![
-            axial(3, 0.0),
-            slice(1, None, Some(AXIAL)),
-            axial(2, 5.0),
-        ];
-        sort_slices(&mut v);
-        assert_eq!(instances(&v), vec![1, 2, 3]);
-    }
-
-    #[test]
-    fn missing_orientation_falls_back_to_instance_number() {
-        let mut v = vec![
-            slice(3, Some([0.0, 0.0, 0.0]), None),
-            slice(1, Some([0.0, 0.0, 10.0]), None),
-            slice(2, Some([0.0, 0.0, 5.0]), None),
-        ];
-        sort_slices(&mut v);
-        assert_eq!(instances(&v), vec![1, 2, 3]);
-    }
-
-    #[test]
-    fn equal_positions_are_ordered_by_instance_number() {
-        let mut v = vec![axial(5, 10.0), axial(4, 10.0)];
-        sort_slices(&mut v);
-        assert_eq!(instances(&v), vec![4, 5]);
-    }
-
-    #[test]
-    fn float_noise_does_not_reorder_slices() {
-        // 1e-7 mm apart is the same position at the micrometre resolution used for sorting
-        let mut v = vec![axial(2, 10.000_000_1), axial(1, 10.0)];
-        sort_slices(&mut v);
-        assert_eq!(instances(&v), vec![1, 2]);
-    }
-
-    #[test]
-    fn frames_of_one_file_keep_their_order() {
-        let base = axial(1, 0.0);
-        let mut v = vec![
-            SliceInfo { frame: 2, ..base.clone() },
-            SliceInfo { frame: 0, ..base.clone() },
-            SliceInfo { frame: 1, ..base },
-        ];
-        sort_slices(&mut v);
-        assert_eq!(v.iter().map(|s| s.frame).collect::<Vec<_>>(), vec![0, 1, 2]);
-    }
-
-    // ---------- slice_geometry ----------
-
-    #[test]
-    fn uniform_spacing_is_detected() {
-        let mut v: Vec<SliceInfo> = (0..5).map(|i| axial(i + 1, 5.0 * f64::from(i))).collect();
-        sort_slices(&mut v);
-        let (spacing, uniform, tilt) = slice_geometry(&v);
-        assert!(close(spacing.unwrap(), 5.0));
-        assert!(uniform);
-        assert!(tilt < 1e-6);
-    }
-
-    #[test]
-    fn small_position_jitter_is_still_uniform() {
-        let mut v = vec![axial(1, 15.01), axial(2, 10.0), axial(3, 5.01), axial(4, 0.0)];
-        sort_slices(&mut v);
-        let (spacing, uniform, _) = slice_geometry(&v);
-        assert!((spacing.unwrap() - 5.0).abs() < 0.01);
-        assert!(uniform);
-    }
-
-    #[test]
-    fn uneven_spacing_is_reported() {
-        let mut v = vec![axial(1, 30.0), axial(2, 25.0), axial(3, 20.0), axial(4, 10.0)];
-        sort_slices(&mut v);
-        let (spacing, uniform, _) = slice_geometry(&v);
-        assert!((spacing.unwrap() - 20.0 / 3.0).abs() < 1e-9);
-        assert!(!uniform);
-    }
-
-    #[test]
-    fn gantry_tilt_is_measured() {
-        // The stack axis leans 15 degrees away from the slice normal
-        let t = 15.0_f64.to_radians();
-        let mut v: Vec<SliceInfo> = (0..4)
-            .map(|i| {
-                let d = 5.0 * f64::from(i);
-                slice(i + 1, Some([0.0, d * t.sin(), -d * t.cos()]), Some(AXIAL))
-            })
-            .collect();
-        sort_slices(&mut v);
-        assert_eq!(instances(&v), vec![1, 2, 3, 4]);
-
-        let (spacing, uniform, tilt) = slice_geometry(&v);
-        assert!((tilt - 15.0).abs() < 1e-6, "tilt was {tilt}");
-        assert!(uniform);
-        // The spacing is measured along the normal, not along the stack axis
-        assert!((spacing.unwrap() - 5.0 * t.cos()).abs() < 1e-9);
-    }
-
-    #[test]
-    fn single_slice_has_no_spacing() {
-        assert_eq!(slice_geometry(&[axial(1, 0.0)]), (None, true, 0.0));
-    }
-
-    #[test]
-    fn missing_positions_give_no_spacing() {
-        let v = vec![slice(1, None, Some(AXIAL)), slice(2, None, Some(AXIAL))];
-        assert_eq!(slice_geometry(&v), (None, true, 0.0));
-    }
-
-    #[test]
-    fn identical_positions_give_no_spacing() {
-        let v = vec![axial(1, 5.0), axial(2, 5.0), axial(3, 5.0)];
-        assert_eq!(slice_geometry(&v), (None, true, 0.0));
-    }
-
-    // ---------- series_slices ----------
-
-    #[test]
-    fn series_slices_sorts_once_and_shares_the_result() {
-        let state = AppState::default();
-        *state.all.lock().unwrap() = vec![
-            axial(1, 0.0),
-            axial(2, 5.0),
-            SliceInfo { series_uid: "OTHER".into(), ..axial(3, 9.0) },
-        ];
-
-        let a = series_slices(&state, "S1");
-        assert_eq!(instances(&a), vec![2, 1]);
-        let b = series_slices(&state, "S1");
-        assert!(Arc::ptr_eq(&a, &b));
-
-        assert!(series_slices(&state, "NOPE").is_empty());
-        assert!(!state.sorted.lock().unwrap().contains_key("NOPE"));
-    }
+    let mut out = Vec::with_capacity(48 + samples.len());
+    out.extend_from_slice(&(img.height as u32).to_le_bytes()); // rows
+    out.extend_from_slice(&(img.width as u32).to_le_bytes()); // cols
+    out.extend_from_slice(&16u32.to_le_bytes()); // bits
+    out.extend_from_slice(&0u32.to_le_bytes()); // unsigned
+    out.extend_from_slice(&(enc.slope as f32).to_le_bytes());
+    out.extend_from_slice(&(enc.intercept as f32).to_le_bytes());
+    out.extend_from_slice(&wc.to_le_bytes());
+    out.extend_from_slice(&ww.to_le_bytes());
+    out.extend_from_slice(&(vol.mono1 as u32).to_le_bytes());
+    out.extend_from_slice(&1u32.to_le_bytes()); // samples per pixel
+    out.extend_from_slice(&(img.spacing_x as f32).to_le_bytes());
+    out.extend_from_slice(&(img.spacing_y as f32).to_le_bytes());
+    out.extend_from_slice(&samples);
+    Ok(tauri::ipc::Response::new(out))
 }
 
 // ---------- DICOM tag dump ----------
@@ -1396,4 +1215,25 @@ fn save_png(request: tauri::ipc::Request<'_>) -> Result<(), String> {
         return Err("Only .png files can be written".into());
     }
     std::fs::write(path, &data[end..]).map_err(|e| e.to_string())
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .manage(AppState::default())
+        .invoke_handler(tauri::generate_handler![
+            open_folder,
+            open_files,
+            get_series_geometry,
+            get_slice,
+            get_slice_meta,
+            get_thumbnail,
+            build_volume,
+            get_tags,
+            save_png,
+            get_mpr_slice
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
 }

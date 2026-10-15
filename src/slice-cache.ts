@@ -6,13 +6,43 @@ export interface CachedSlice {
   meta: SliceMeta | null;
 }
 
+/** Where a viewport gets its images from: the images of a series, or a reformatted view. */
+export interface SliceSource {
+  /** Identifies the images in the cache; sources with the same id must give the same images. */
+  id: string;
+  load(index: number): Promise<CachedSlice>;
+  /** Maps indices that give the same image to one index (a projection through the whole volume). */
+  canonical?(index: number): number;
+}
+
+async function fetchSeriesSlice(uid: string, index: number): Promise<CachedSlice> {
+  // Metadata is optional: a failure there must not block the image
+  const [slice, meta] = await Promise.all([
+    getSlice(uid, index),
+    getSliceMeta(uid, index).catch(() => null),
+  ]);
+  return { slice, meta };
+}
+
+const seriesSources = new Map<string, SliceSource>();
+
+/** The plain images of a series. */
+export function seriesSource(uid: string): SliceSource {
+  let s = seriesSources.get(uid);
+  if (!s) {
+    s = { id: uid, load: (index) => fetchSeriesSlice(uid, index) };
+    seriesSources.set(uid, s);
+  }
+  return s;
+}
+
 interface Entry {
   promise: Promise<CachedSlice>;
   bytes: number; // 0 until the request has finished
 }
 
 interface Plan {
-  uid: string;
+  source: SliceSource;
   indices: number[]; // images still to fetch, most useful first
 }
 
@@ -21,16 +51,10 @@ const MAX_BYTES = 512 * 1024 * 1024;
 // Background requests running at the same time
 const MAX_PARALLEL = 3;
 
-const keyOf = (uid: string, index: number): string => `${uid}#${index}`;
+const keyOf = (id: string, index: number): string => `${id}#${index}`;
 
-async function fetchSlice(uid: string, index: number): Promise<CachedSlice> {
-  // Metadata is optional: a failure there must not block the image
-  const [slice, meta] = await Promise.all([
-    getSlice(uid, index),
-    getSliceMeta(uid, index).catch(() => null),
-  ]);
-  return { slice, meta };
-}
+const canonicalOf = (source: SliceSource, index: number): number =>
+  source.canonical ? source.canonical(index) : index;
 
 /**
  * Images and their metadata, shared by all viewports. Requests are stored as promises,
@@ -45,8 +69,9 @@ class SliceCache {
   private inFlight = 0;
 
   /** The image, from the cache when it is there, otherwise fetched now. */
-  get(uid: string, index: number): Promise<CachedSlice> {
-    const key = keyOf(uid, index);
+  get(source: SliceSource, index: number): Promise<CachedSlice> {
+    const canon = canonicalOf(source, index);
+    const key = keyOf(source.id, canon);
     const hit = this.entries.get(key);
     if (hit) {
       // Mark as most recently used
@@ -54,12 +79,12 @@ class SliceCache {
       this.entries.set(key, hit);
       return hit.promise;
     }
-    return this.start(uid, index, key).promise;
+    return this.start(source, canon, key).promise;
   }
 
   /** Replaces what `owner` wants prefetched. Cheap to call after every image change. */
-  plan(owner: object, uid: string, indices: number[]): void {
-    this.plans.set(owner, { uid, indices: [...indices] });
+  plan(owner: object, source: SliceSource, indices: number[]): void {
+    this.plans.set(owner, { source, indices: [...indices] });
     this.pump();
   }
 
@@ -75,9 +100,9 @@ class SliceCache {
     this.plans.clear();
   }
 
-  private start(uid: string, index: number, key: string): Entry {
+  private start(source: SliceSource, index: number, key: string): Entry {
     const gen = this.generation;
-    const promise = fetchSlice(uid, index);
+    const promise = source.load(index);
     const entry: Entry = { promise, bytes: 0 };
     this.entries.set(key, entry);
 
@@ -112,7 +137,7 @@ class SliceCache {
       const next = this.nextWanted();
       if (!next) return;
       this.inFlight++;
-      const entry = this.start(next.uid, next.index, keyOf(next.uid, next.index));
+      const entry = this.start(next.source, next.index, keyOf(next.source.id, next.index));
       const done = (): void => {
         this.inFlight--;
         this.pump();
@@ -121,10 +146,13 @@ class SliceCache {
     }
   }
 
-  private nextWanted(): { uid: string; index: number } | null {
+  private nextWanted(): { source: SliceSource; index: number } | null {
     for (const [owner, plan] of this.plans) {
       for (let index = plan.indices.shift(); index !== undefined; index = plan.indices.shift()) {
-        if (!this.entries.has(keyOf(plan.uid, index))) return { uid: plan.uid, index };
+        const canon = canonicalOf(plan.source, index);
+        if (!this.entries.has(keyOf(plan.source.id, canon))) {
+          return { source: plan.source, index: canon };
+        }
       }
       this.plans.delete(owner); // nothing left to fetch for this owner
     }

@@ -36,6 +36,7 @@ export const ACTIONS: ActionDef[] = [
   { id: "view.flipH", label: "Flip horizontally", group: "Orientation", defaults: ["KeyH"] },
   { id: "view.flipV", label: "Flip vertically", group: "Orientation", defaults: ["Shift+KeyH"] },
   { id: "view.resetOrientation", label: "Reset orientation", group: "Orientation", defaults: ["Shift+KeyR"] },
+    { id: "view.orientMode", label: "Orientation: standard / as stored", group: "Orientation", defaults: ["Shift+KeyO"] },
 
   { id: "tool.window", label: "Window / Level tool", group: "Tools", defaults: ["KeyW"] },
   { id: "tool.pan", label: "Pan tool", group: "Tools", defaults: ["KeyP"] },
@@ -45,6 +46,7 @@ export const ACTIONS: ActionDef[] = [
   { id: "tool.angle", label: "Angle measurement", group: "Tools", defaults: ["KeyG"] },
   { id: "tool.ellipse", label: "Elliptical ROI", group: "Tools", defaults: ["KeyC"] },
   { id: "tool.rect", label: "Rectangular ROI", group: "Tools", defaults: ["KeyX"] },
+  { id: "tool.cross", label: "Crosshair tool (MPR)", group: "Tools", defaults: ["KeyK"] },
 
   { id: "measure.undo", label: "Delete last measurement", group: "Measurements", defaults: ["Backspace", "Delete"] },
   { id: "measure.clear", label: "Clear measurements on this image", group: "Measurements", defaults: ["Shift+Backspace", "Shift+Delete"] },
@@ -70,6 +72,8 @@ export const ACTIONS: ActionDef[] = [
   { id: "ui.settings", label: "Settings and shortcuts", group: "Interface", defaults: ["Comma", "Shift+Slash"] },
 
   { id: "volume.build", label: "Build 3D volume", group: "Volume", defaults: ["KeyV"] },
+
+  { id: "mpr.toggle", label: "Multiplanar view (MPR)", group: "Volume", defaults: ["Shift+KeyM"] },
 
   ...LAYOUT_PRESETS.map((l, i): ActionDef => ({
     id: `layout.${l.cols}x${l.rows}`,

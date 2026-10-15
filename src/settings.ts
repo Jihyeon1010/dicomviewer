@@ -1,5 +1,6 @@
 import { ACTIONS, type Bindings } from "./keymap";
 import { DEFAULT_LAYOUT, parseLayout, type Layout } from "./layout";
+import { ORIENT_MODES, type OrientMode } from "./orient-auto";
 
 export type OverlayMode = "full" | "minimal" | "off";
 export type SliderPosition = "bottom" | "right";
@@ -13,6 +14,7 @@ export interface Settings {
   markers: boolean;
   layout: Layout;
   sliderPos: SliderPosition;
+  orientMode: OrientMode;
   syncScroll: boolean;
   syncWindow: boolean;
   keymap: Bindings; // overrides only: actions whose keys differ from the defaults
@@ -28,6 +30,7 @@ function defaults(): Settings {
     markers: true,
     layout: { ...DEFAULT_LAYOUT },
     sliderPos: "bottom",
+    orientMode: "standard",
     syncScroll: true,
     syncWindow: false,
     keymap: {},
@@ -57,6 +60,8 @@ function sanitize(p: unknown, base: Settings): Settings {
   if (layout) out.layout = layout;
   const pos = SLIDER_POSITIONS.find((s) => s === p["sliderPos"]);
   if (pos) out.sliderPos = pos;
+  const orient = ORIENT_MODES.find((o) => o === p["orientMode"]);
+  if (orient) out.orientMode = orient;
   if (typeof p["anonymize"] === "boolean") out.anonymize = p["anonymize"];
   if (typeof p["markers"] === "boolean") out.markers = p["markers"];
   if (typeof p["syncScroll"] === "boolean") out.syncScroll = p["syncScroll"];

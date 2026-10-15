@@ -3,6 +3,7 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { buildVolume, getThumbnail, openFiles, openFolder, savePng } from "./api";
 import { byId } from "./dom";
 import { compact, num } from "./format";
+import { mountIcons, setIcon, setLabel } from "./icons";
 import {
   ACTION_BY_ID,
   ACTIONS,
@@ -15,6 +16,7 @@ import {
 } from "./keymap";
 import { LAYOUT_PRESETS, MAX_COLS, MAX_ROWS, type Layout } from "./layout";
 import { installMenu, type AppMenu } from "./menu";
+import { Mpr, type Slab } from "./mpr";
 import { createSettingsDialog } from "./settings-dialog";
 import {
   loadSettings,
@@ -24,11 +26,11 @@ import {
   type Settings,
   type SliderPosition,
 } from "./settings";
+import { seriesSource, sliceCache } from "./slice-cache";
 import { createTagsDialog } from "./tags-dialog";
-import type { SeriesInfo, VolumeInfo } from "./types";
+import type { SeriesInfo, SlabMode, VolumeInfo } from "./types";
 import { syncedIndex, Viewport, type ToolId, type ViewportHost } from "./viewport";
-import { mountIcons, setIcon, setLabel } from "./icons";
-import { sliceCache } from "./slice-cache";
+import { ORIENT_MODES, type OrientMode } from "./orient-auto";
 
 // ---------- Elements ----------
 const viewportsEl = byId("viewports", HTMLDivElement);
@@ -52,6 +54,11 @@ const tagsBtn = byId("tags-btn", HTMLButtonElement);
 const settingsBtn = byId("settings-open", HTMLButtonElement);
 const syncScrollBtn = byId("sync-scroll", HTMLButtonElement);
 const syncWindowBtn = byId("sync-window", HTMLButtonElement);
+const mprBtn = byId("mpr", HTMLButtonElement);
+const orientModeBtn = byId("orient-mode", HTMLButtonElement);
+const crossBtn = byId("cross", HTMLButtonElement);
+const slabModeSel = byId("slab-mode", HTMLSelectElement);
+const slabThickSel = byId("slab-thick", HTMLSelectElement);
 const slider = byId("slider", HTMLInputElement);
 const stageEl = byId("stage", HTMLElement);
 const sliderBar = byId("slider-bar", HTMLDivElement);
@@ -83,6 +90,11 @@ let overlayMode: OverlayMode = settings.overlay;
 let anonymize = settings.anonymize;
 let markersOn = settings.markers;
 let sliderPos: SliderPosition = settings.sliderPos;
+let orientMode: OrientMode = settings.orientMode;
+const ORIENT_LABEL: Record<OrientMode, string> = {
+  standard: "Standard",
+  stored: "As stored",
+};
 let syncScroll = settings.syncScroll;
 let syncWindow = settings.syncWindow;
 let tool: ToolId = "window";
@@ -92,6 +104,16 @@ let hasLoaded = false;
 let volume: { uid: string; info: VolumeInfo } | null = null;
 let volumeBusy: string | null = null; // uid of the series being built
 let appMenu: AppMenu | null = null;
+
+// Multiplanar reformatting: the controller while it is on, and what to restore afterwards
+interface MprSaved {
+  layout: Layout;
+  tool: ToolId;
+  series: (SeriesInfo | null)[]; // what the first four views showed
+}
+let mpr: Mpr | null = null;
+let mprSaved: MprSaved | null = null;
+let mprBusy = false;
 
 const THUMB_PX = 112; // rendered at 2x the 56 px CSS size for high-DPI screens
 const thumbs = new Map<string, ImageData>();
@@ -129,6 +151,7 @@ const TOOL_TIPS: Record<string, string> = {
   pan: "Pan",
   zoom: "Zoom",
   scroll: "Scroll",
+  cross: "Crosshair: click or drag to move all MPR views",
   length: "Measure a length",
   angle: "Measure an angle (three clicks)",
   ellipse: "Elliptical ROI",
@@ -142,6 +165,9 @@ function refreshTooltips(): void {
     setTip(b, TOOL_TIPS[t] ?? t, `tool.${t}`);
   }
   layoutBtn.title = `Choose how many views to show (up to ${MAX_COLS} × ${MAX_ROWS})`;
+  setTip(mprBtn, "Multiplanar reformat: axial, coronal and sagittal views", "mpr.toggle");
+  slabModeSel.title = "Projection through a slab: thin plane, MIP, MinIP or average";
+  slabThickSel.title = "Slab thickness";
   setTip(syncScrollBtn, "Scroll linked views together", "sync.scroll");
   setTip(syncWindowBtn, "Share window / level between views", "sync.window");
   setTip(invertBtn, "Invert", "view.invert");
@@ -198,6 +224,8 @@ const host: ViewportHost = {
   stateChanged: (vp) => {
     if (vp === active) syncControls();
   },
+  pick: (vp, p) => mpr?.pick(vp, p),
+  orientMode: () => orientMode,
 };
 
 // Viewports are created on demand when the layout grows and are then kept,
@@ -238,18 +266,25 @@ function refreshAllOverlays(): void {
 
 // ---------- Linking ----------
 function syncSlices(src: Viewport): void {
+  // The views of an MPR show different planes of one volume; they follow the crosshair
+  if (mpr?.owns(src)) {
+    mpr.scrolled(src);
+    return;
+  }
   if (!syncScroll) return;
   for (const vp of visible()) {
-    if (vp === src) continue;
+    if (vp === src || mpr?.owns(vp)) continue;
     const idx = syncedIndex(src, vp);
     if (idx !== null) vp.goto(idx, false, true);
   }
 }
 
 function syncWindows(src: Viewport): void {
-  if (!syncWindow) return;
+  // The views of an MPR always share their window
+  const group = mpr?.owns(src) ? mpr.panes : null;
   for (const vp of visible()) {
-    if (vp !== src && vp.series) vp.setWindow(src.wl, src.ww, false);
+    if (vp === src || !vp.series) continue;
+    if (syncWindow || group?.includes(vp)) vp.setWindow(src.wl, src.ww, false);
   }
 }
 
@@ -268,7 +303,7 @@ function toggleSyncWindow(): void {
 }
 
 // ---------- Layout ----------
-function applyLayout(next: Layout, persist = true): void {
+function applyLayout(next: Layout, persist = true, fill = true): void {
   layout = { cols: next.cols, rows: next.rows };
   if (persist) update({ layout });
 
@@ -281,7 +316,7 @@ function applyLayout(next: Layout, persist = true): void {
 
   const shown = visible();
   if (!shown.includes(active)) activate(shown[0] ?? first);
-  void Promise.all(fillEmptyViewports());
+  if (fill) void Promise.all(fillEmptyViewports());
   syncControls();
 }
 
@@ -303,6 +338,8 @@ function fillEmptyViewports(): Promise<void>[] {
 }
 
 function showInActive(s: SeriesInfo): void {
+  // Replacing a view of the MPR would break it; leave the MPR first
+  if (mpr) exitMpr(true);
   void active.setSeries(s);
   afterAssignment();
 }
@@ -433,6 +470,12 @@ function syncControls(): void {
   cineBtn.disabled = n <= 1;
   setIcon(cineBtn, vp.playing ? "pause" : "play");
 
+  // The crosshair tool and the slab controls only exist while an MPR is shown
+  const inMpr = mpr !== null;
+  setPressed(mprBtn, inMpr);
+  for (const el of [crossBtn, slabModeSel, slabThickSel]) el.hidden = !inMpr;
+  slabThickSel.disabled = slabModeSel.value === "none";
+
   setPressed(invertBtn, vp.invert);
   setPressed(cineBtn, vp.playing);
   setPressed(flipHBtn, vp.orientation.flipH);
@@ -443,6 +486,7 @@ function syncControls(): void {
   setPressed(syncWindowBtn, syncWindow);
   setLabel(layoutBtn, `${layout.cols} × ${layout.rows}`);
   setLabel(infoBtn, OVERLAY_LABEL[overlayMode]);
+  setLabel(orientModeBtn, ORIENT_LABEL[orientMode]);
   setIcon(sliderPosBtn, sliderPos === "bottom" ? "panel-bottom" : "panel-right");
 
   syncMenu();
@@ -479,6 +523,14 @@ function setOverlay(mode: OverlayMode): void {
 function cycleOverlay(): void {
   const next = OVERLAY_MODES[(OVERLAY_MODES.indexOf(overlayMode) + 1) % OVERLAY_MODES.length];
   setOverlay(next ?? "full");
+}
+
+function toggleOrientMode(): void {
+  const next = ORIENT_MODES[(ORIENT_MODES.indexOf(orientMode) + 1) % ORIENT_MODES.length];
+  orientMode = next ?? "standard";
+  update({ orientMode });
+  for (const vp of viewports) vp.refreshOrientMode();
+  syncControls();
 }
 
 function toggleMarkers(): void {
@@ -597,30 +649,133 @@ function volumeLines(uid: string): string[] {
 
 function applyVolumeLines(): void {
   for (const vp of viewports) {
-    vp.extraLines = vp.series ? volumeLines(vp.series.uid) : [];
+    // The views of an MPR show the volume itself; its numbers would only repeat there
+    vp.extraLines = vp.series && !vp.isReformat ? volumeLines(vp.series.uid) : [];
     vp.refreshOverlay();
   }
 }
 
+// The built volume of a series, building it first when needed. Null when it cannot be built.
+async function ensureVolume(uid: string): Promise<VolumeInfo | null> {
+  if (volume && volume.uid === uid) return volume.info;
+  // The backend keeps one volume at a time, and the MPR is reading it
+  if (mpr && mpr.series.uid !== uid) {
+    flashStatus("Close the MPR before building the volume of another series");
+    return null;
+  }
+  if (volumeBusy) {
+    flashStatus("A volume is being built");
+    return null;
+  }
+  volumeBusy = uid;
+  applyVolumeLines();
+  try {
+    const info = await buildVolume(uid);
+    // Ignore the result when other files have been opened in the meantime
+    if (!seriesData.some((x) => x.uid === uid)) return null;
+    volume = { uid, info };
+    return info;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (!msg.includes("superseded")) showError(err);
+    return null;
+  } finally {
+    volumeBusy = null;
+    applyVolumeLines();
+  }
+}
+
 async function runBuildVolume(): Promise<void> {
-  if (volumeBusy) return;
   const s = active.series;
   if (!s || s.slice_count < 2) {
     flashStatus("A volume needs a series with at least 2 images");
     return;
   }
-  volumeBusy = s.uid;
-  applyVolumeLines();
+  await ensureVolume(s.uid);
+}
+
+// ---------- MPR ----------
+const SLAB_MODES: SlabMode[] = ["none", "max", "min", "mean"];
+
+function currentSlab(): Slab {
+  const mode = SLAB_MODES.find((m) => m === slabModeSel.value) ?? "none";
+  const mm = Number(slabThickSel.value);
+  return { mode, mm: Number.isFinite(mm) && mm > 0 ? mm : 10 };
+}
+
+function applySlab(): void {
+  syncControls();
+  mpr?.setSlab(currentSlab());
+}
+
+async function enterMpr(series: SeriesInfo, info: VolumeInfo): Promise<void> {
+  closeLayoutPicker();
+  // Patient and study fields of the reformatted views come from the first image
+  const base = await sliceCache.get(seriesSource(series.uid), 0).then(
+    (c) => c.meta,
+    () => null,
+  );
+  if (volume?.uid !== series.uid) return; // other files were opened meanwhile
+
+  mprSaved = {
+    layout: { ...layout },
+    tool,
+    // The first four views, whether they exist yet or not
+    series: Array.from({ length: 4 }, (_, i) => viewports[i]?.series ?? null),
+  };
+  applyLayout({ cols: 2, rows: 2 }, false, false);
+
+  const [a, c, s] = [viewports[0], viewports[1], viewports[2]];
+  if (!a || !c || !s) return;
+  const m = new Mpr({ panes: [a, c, s], series, volume: info, baseMeta: base }, currentSlab());
+  mpr = m;
+
+  void viewports[3]?.setSeries(series); // the original images stay in the fourth view
+  activate(a);
+  setTool("cross");
+  afterAssignment();
+  await m.start();
+}
+
+function exitMpr(restore: boolean): void {
+  const m = mpr;
+  if (!m) return;
+  m.stop();
+  mpr = null;
+  const saved = mprSaved;
+  mprSaved = null;
+
+  if (restore && saved) {
+    saved.series.forEach((s, i) => {
+      void viewports[i]?.setSeries(s);
+    });
+    applyLayout(saved.layout, false);
+    if (tool === "cross") setTool(saved.tool === "cross" ? "window" : saved.tool);
+  } else if (tool === "cross") {
+    setTool("window");
+  }
+  afterAssignment();
+}
+
+async function toggleMpr(): Promise<void> {
+  if (mpr) {
+    exitMpr(true);
+    return;
+  }
+  if (mprBusy) return;
+  const s = active.series;
+  if (!s || s.slice_count < 2) {
+    flashStatus("MPR needs a series with at least 2 images");
+    return;
+  }
+  mprBusy = true;
   try {
-    const info = await buildVolume(s.uid);
-    // Ignore the result when other files have been opened in the meantime
-    if (seriesData.some((x) => x.uid === s.uid)) volume = { uid: s.uid, info };
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    if (!msg.includes("superseded")) showError(err);
+    setStatus("Building volume…");
+    const info = await ensureVolume(s.uid);
+    if (statusEl.textContent === "Building volume…") setStatus("");
+    if (info) await enterMpr(s, info);
   } finally {
-    volumeBusy = null;
-    applyVolumeLines();
+    mprBusy = false;
   }
 }
 
@@ -660,6 +815,7 @@ async function exportImage(copy: boolean): Promise<void> {
 
 // ---------- Loading ----------
 async function showSeries(list: SeriesInfo[]): Promise<void> {
+  exitMpr(false); // its volume and images belong to the old files
   thumbRun++; // cancels thumbnail loading for the previous selection
   thumbs.clear();
   sliceCache.clear(); // indices of the old files must not be served for the new ones
@@ -714,6 +870,7 @@ rotCcwBtn.addEventListener("click", () => active.rotate(-1));
 rotCwBtn.addEventListener("click", () => active.rotate(1));
 flipHBtn.addEventListener("click", () => active.flip("h"));
 flipVBtn.addEventListener("click", () => active.flip("v"));
+orientModeBtn.addEventListener("click", toggleOrientMode);
 cineBtn.addEventListener("click", () => active.togglePlay());
 infoBtn.addEventListener("click", cycleOverlay);
 markersBtn.addEventListener("click", toggleMarkers);
@@ -721,6 +878,16 @@ anonBtn.addEventListener("click", toggleAnonymize);
 sliderPosBtn.addEventListener("click", toggleSliderPos);
 syncScrollBtn.addEventListener("click", toggleSyncScroll);
 syncWindowBtn.addEventListener("click", toggleSyncWindow);
+mprBtn.addEventListener("click", () => void toggleMpr());
+
+slabModeSel.addEventListener("change", () => {
+  applySlab();
+  slabModeSel.blur();
+});
+slabThickSel.addEventListener("change", () => {
+  applySlab();
+  slabThickSel.blur();
+});
 
 presetSel.addEventListener("change", () => {
   if (presetSel.value !== "") applyPreset(Number(presetSel.value));
@@ -755,7 +922,11 @@ const dialog = createSettingsDialog({
 });
 
 const tagsDialog = createTagsDialog({
-  context: () => (active.series ? { uid: active.series.uid, index: active.index } : null),
+  // The views of an MPR have no image number of their own; the crosshair's image is used
+  context: () =>
+    active.series
+      ? { uid: active.series.uid, index: mpr?.owns(active) ? mpr.pos.k : active.index }
+      : null,
   anonymize: () => anonymize,
 });
 
@@ -798,10 +969,15 @@ const handlers: Record<string, () => void> = {
   "view.flipH": () => active.flip("h"),
   "view.flipV": () => active.flip("v"),
   "view.resetOrientation": () => active.resetOrientation(),
+  "view.orientMode": toggleOrientMode,
   "tool.window": () => setTool("window"),
   "tool.pan": () => setTool("pan"),
   "tool.zoom": () => setTool("zoom"),
   "tool.scroll": () => setTool("scroll"),
+  "tool.cross": () => {
+    if (mpr) setTool("cross");
+    else flashStatus("The crosshair tool works while an MPR is shown");
+  },
   "tool.length": () => setTool("length"),
   "tool.angle": () => setTool("angle"),
   "tool.ellipse": () => setTool("ellipse"),
@@ -818,6 +994,7 @@ const handlers: Record<string, () => void> = {
   "ui.tags": openTags,
   "ui.settings": openSettings,
   "volume.build": () => void runBuildVolume(),
+  "mpr.toggle": () => void toggleMpr(),
   "sync.scroll": toggleSyncScroll,
   "sync.window": toggleSyncWindow,
   "export.save": () => void exportImage(false),
@@ -908,5 +1085,6 @@ applyLayout(layout, false);
 refreshEmptyMessages();
 refreshPresetOptions();
 refreshTooltips();
+setTip(orientModeBtn, "Orientation: standard (radiological) or as stored in the file", "view.orientMode");
 syncControls();
 refreshAllOverlays();

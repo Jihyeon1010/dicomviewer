@@ -636,3 +636,10 @@ body.dragging #viewports::after { border-color: var(--accent); }
 /* Labels that change with the state: a minimum width keeps neighbours from jumping */
 #layout-btn .lbl { min-width: 38px; text-align: left; }
 #info .lbl { min-width: 46px; text-align: left; }
+
+/* ---------- MPR ---------- */
+/* The hidden attribute must win over the display rules of the toolbar controls */
+#toolbar [hidden] { display: none !important; }
+#viewports[data-tool="cross"] .vp { cursor: crosshair; }
+
+#orient-mode .lbl { min-width: 62px; text-align: left; }

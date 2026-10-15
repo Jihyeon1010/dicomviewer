@@ -41,6 +41,25 @@
     <div class="group">
       <button id="sync-scroll"><span class="ic" data-icon="link"></span><span class="lbl">Scroll</span></button>
       <button id="sync-window"><span class="ic" data-icon="link"></span><span class="lbl">W/L</span></button>
+      <div class="group" id="mpr-wrap">
+      <button id="mpr"><span class="ic" data-icon="mpr"></span><span class="lbl">MPR</span></button>
+      <button id="cross" class="tool ib" data-tool="cross" aria-label="Crosshair" hidden><span class="ic" data-icon="locate"></span></button>
+      <select id="slab-mode" aria-label="Slab projection" hidden>
+        <option value="none">Thin</option>
+        <option value="max">MIP</option>
+        <option value="min">MinIP</option>
+        <option value="mean">Average</option>
+      </select>
+      <select id="slab-thick" aria-label="Slab thickness" hidden>
+        <option value="3">3 mm</option>
+        <option value="5">5 mm</option>
+        <option value="10" selected>10 mm</option>
+        <option value="20">20 mm</option>
+        <option value="40">40 mm</option>
+        <option value="80">80 mm</option>
+        <option value="1000000">Full</option>
+      </select>
+    </div>
     </div>
 
     <div class="group">
@@ -55,6 +74,7 @@
       <button id="rot-cw" class="ib" aria-label="Rotate clockwise"><span class="ic" data-icon="rotate-cw"></span></button>
       <button id="flip-h" class="ib" aria-label="Flip horizontally"><span class="ic" data-icon="flip-h"></span></button>
       <button id="flip-v" class="ib" aria-label="Flip vertically"><span class="ic" data-icon="flip-v"></span></button>
+      <button id="orient-mode"><span class="ic" data-icon="compass"></span><span class="lbl">Standard</span></button>
     </div>
 
     <div class="group">

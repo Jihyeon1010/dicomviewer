@@ -60,7 +60,13 @@ export interface VolumeInfo {
   value_min: number;
   value_max: number;
   megabytes: number;
+  z_positions: number[];                  // mm along the stack direction, one per image
+  orientation: [number, number, number, number, number, number] | null; // row and column cosines
+  z_dir: [number, number, number] | null; // direction in which the image index increases
 }
+
+export type Plane = "axial" | "coronal" | "sagittal";
+export type SlabMode = "none" | "max" | "min" | "mean";
 
 // Mirrors the SeriesGeometry struct in lib.rs
 export interface SeriesGeometry {

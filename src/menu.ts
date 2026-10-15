@@ -36,7 +36,7 @@ type StdItem =
   | "Minimize" | "Maximize" | "Fullscreen" | "CloseWindow" | "Quit"
   | "Hide" | "HideOthers" | "ShowAll" | "Services";
 
-const TOOL_IDS = ["window", "pan", "zoom", "scroll", "length", "angle", "ellipse", "rect"];
+const TOOL_IDS = ["window", "pan", "zoom", "scroll", "cross", "length", "angle", "ellipse", "rect"];
 
 export async function installMenu(deps: MenuDeps): Promise<AppMenu> {
   const checks = new Map<string, CheckMenuItem>();
@@ -131,6 +131,7 @@ export async function installMenu(deps: MenuDeps): Promise<AppMenu> {
       await check("tool.pan", "Pan", () => deps.run("tool.pan")),
       await check("tool.zoom", "Zoom", () => deps.run("tool.zoom")),
       await check("tool.scroll", "Scroll", () => deps.run("tool.scroll")),
+      await check("tool.cross", "Crosshair (MPR)", () => deps.run("tool.cross")),
       await std("Separator"),
       await check("tool.length", "Length", () => deps.run("tool.length")),
       await check("tool.angle", "Angle", () => deps.run("tool.angle")),
@@ -192,6 +193,7 @@ export async function installMenu(deps: MenuDeps): Promise<AppMenu> {
       await check("ui.anonymize", "Anonymize", () => deps.run("ui.anonymize")),
       await key("Move Image Slider (Bottom / Right)", "ui.slider"),
       await std("Separator"),
+      await key("Multiplanar View (MPR)", "mpr.toggle"),
       await key("DICOM Tags…", "ui.tags"),
       await std("Separator"),
       await std("Fullscreen"),
