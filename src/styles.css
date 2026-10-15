@@ -429,3 +429,25 @@ body.dragging #viewports::after { border-color: var(--accent); }
 .vp.small .vp-empty-sub { display: none; }
 .vp.small .vp-empty-title { font-size: 13px; }
 .vp.small .overlay { padding: 4px 6px; font-size: 10px; }
+
+/* ---------- Slider position ---------- */
+#stage[data-slider="right"] { flex-direction: row; }
+#stage[data-slider="right"] #viewports { min-width: 0; }
+#stage[data-slider="right"] #slider-bar {
+  position: relative;
+  flex: none;
+  width: 36px;
+  height: auto;
+  padding: 0;
+  border-top: none;
+  border-left: 1px solid var(--border);
+}
+/* The range input is rotated so that its left end (first image) is at the top.
+   Its width, which becomes the on-screen height, is set from script. */
+#stage[data-slider="right"] #slider {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  flex: none;
+  transform: translate(-50%, -50%) rotate(90deg);
+}

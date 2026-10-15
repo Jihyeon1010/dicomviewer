@@ -2,6 +2,8 @@ import { ACTIONS, type Bindings } from "./keymap";
 import { DEFAULT_LAYOUT, parseLayout, type Layout } from "./layout";
 
 export type OverlayMode = "full" | "minimal" | "off";
+export type SliderPosition = "bottom" | "right";
+export const SLIDER_POSITIONS: SliderPosition[] = ["bottom", "right"];
 export const OVERLAY_MODES: OverlayMode[] = ["full", "minimal", "off"];
 
 export interface Settings {
@@ -10,6 +12,7 @@ export interface Settings {
   anonymize: boolean;
   markers: boolean;
   layout: Layout;
+  sliderPos: SliderPosition;
   syncScroll: boolean;
   syncWindow: boolean;
   keymap: Bindings; // overrides only: actions whose keys differ from the defaults
@@ -24,6 +27,7 @@ function defaults(): Settings {
     anonymize: false,
     markers: true,
     layout: { ...DEFAULT_LAYOUT },
+    sliderPos: "bottom",
     syncScroll: true,
     syncWindow: false,
     keymap: {},
@@ -51,6 +55,8 @@ function sanitize(p: unknown, base: Settings): Settings {
   if (mode) out.overlay = mode;
   const layout = parseLayout(p["layout"]);
   if (layout) out.layout = layout;
+  const pos = SLIDER_POSITIONS.find((s) => s === p["sliderPos"]);
+  if (pos) out.sliderPos = pos;
   if (typeof p["anonymize"] === "boolean") out.anonymize = p["anonymize"];
   if (typeof p["markers"] === "boolean") out.markers = p["markers"];
   if (typeof p["syncScroll"] === "boolean") out.syncScroll = p["syncScroll"];

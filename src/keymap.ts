@@ -46,6 +46,7 @@ export const ACTIONS: ActionDef[] = [
   { id: "ui.overlay", label: "Cycle overlay detail", group: "Interface", defaults: ["KeyO"] },
   { id: "ui.markers", label: "Toggle markers and scale bars", group: "Interface", defaults: ["KeyM"] },
   { id: "ui.anonymize", label: "Toggle anonymize", group: "Interface", defaults: ["KeyA"] },
+  { id: "ui.slider", label: "Move image slider (bottom / right)", group: "Interface", defaults: ["KeyB"] },
   { id: "ui.settings", label: "Settings and shortcuts", group: "Interface", defaults: ["Comma", "Shift+Slash"] },
   { id: "volume.build", label: "Build 3D volume", group: "Volume", defaults: ["KeyV"] },
 

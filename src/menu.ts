@@ -168,6 +168,7 @@ export async function installMenu(deps: MenuDeps): Promise<AppMenu> {
       overlayMenu,
       await check("ui.markers", "Show Markers and Scale Bars", () => deps.run("ui.markers")),
       await check("ui.anonymize", "Anonymize", () => deps.run("ui.anonymize")),
+      await key("Move Image Slider (Bottom / Right)", "ui.slider"),
       await std("Separator"),
       await std("Fullscreen"),
     ],

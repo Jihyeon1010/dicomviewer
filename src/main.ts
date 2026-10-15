@@ -3,6 +3,7 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { buildVolume, getThumbnail, openFiles, openFolder } from "./api";
 import { byId } from "./dom";
 import { compact, num } from "./format";
+
 import {
   ACTION_BY_ID,
   ACTIONS,
@@ -13,16 +14,20 @@ import {
   resolveBindings,
   type Bindings,
 } from "./keymap";
+
 import { LAYOUT_PRESETS, MAX_COLS, MAX_ROWS, type Layout } from "./layout";
 import { installMenu, type AppMenu } from "./menu";
 import { createSettingsDialog } from "./settings-dialog";
+
 import {
   loadSettings,
   OVERLAY_MODES,
   saveSettings,
   type OverlayMode,
   type Settings,
+  type SliderPosition,
 } from "./settings";
+
 import type { SeriesInfo, VolumeInfo } from "./types";
 import { syncedIndex, Viewport, type ToolId, type ViewportHost } from "./viewport";
 
@@ -49,6 +54,9 @@ const layoutPop = byId("layout-pop", HTMLDivElement);
 const layoutGrid = byId("layout-grid", HTMLDivElement);
 const layoutLabel = byId("layout-label", HTMLDivElement);
 const toolButtons = document.querySelectorAll<HTMLButtonElement>("#tools .tool");
+const stageEl = byId("stage", HTMLElement);
+const sliderBar = byId("slider-bar", HTMLDivElement);
+const sliderPosBtn = byId("slider-pos", HTMLButtonElement);
 
 // ---------- Settings ----------
 let settings: Settings = loadSettings();
@@ -65,10 +73,16 @@ const OVERLAY_LABEL: Record<OverlayMode, string> = {
   off: "Off",
 };
 
+const SLIDER_LABEL: Record<SliderPosition, string> = {
+  bottom: "Bottom",
+  right: "Right",
+};
+
 let layout: Layout = settings.layout;
 let overlayMode: OverlayMode = settings.overlay;
 let anonymize = settings.anonymize;
 let markersOn = settings.markers;
+let sliderPos: SliderPosition = settings.sliderPos;
 let syncScroll = settings.syncScroll;
 let syncWindow = settings.syncWindow;
 let tool: ToolId = "window";
@@ -133,6 +147,7 @@ function refreshTooltips(): void {
   setTip(markersBtn, "Orientation markers and scale bars", "ui.markers");
   setTip(anonBtn, "Hide patient identifiers on screen", "ui.anonymize");
   setTip(settingsBtn, "Settings and keyboard shortcuts", "ui.settings");
+  setTip(sliderPosBtn, "Move the image slider to the bottom or the right side", "ui.slider");
 }
 
 function refreshPresetOptions(): void {
@@ -410,9 +425,31 @@ function syncControls(): void {
   setPressed(syncWindowBtn, syncWindow);
   layoutBtn.textContent = `Layout: ${layout.cols} × ${layout.rows}`;
   infoBtn.textContent = `Info: ${OVERLAY_LABEL[overlayMode]}`;
+  sliderPosBtn.textContent = `Slider: ${SLIDER_LABEL[sliderPos]}`;
 
   syncMenu();
 }
+
+// A native range input has no vertical mode that works everywhere, so on the right
+// it is rotated by 90 degrees and its length is set to the height of the bar.
+function fitSlider(): void {
+  slider.style.width =
+    sliderPos === "right" ? `${Math.max(40, sliderBar.clientHeight - 24)}px` : "";
+}
+
+function applySliderPos(pos: SliderPosition, persist = true): void {
+  sliderPos = pos;
+  if (persist) update({ sliderPos });
+  stageEl.dataset["slider"] = pos;
+  fitSlider();
+  syncControls();
+}
+
+function toggleSliderPos(): void {
+  applySliderPos(sliderPos === "bottom" ? "right" : "bottom");
+}
+
+new ResizeObserver(() => fitSlider()).observe(sliderBar);
 
 function setOverlay(mode: OverlayMode): void {
   overlayMode = mode;
@@ -623,6 +660,7 @@ resetBtn.addEventListener("click", () => active.resetWindow());
 infoBtn.addEventListener("click", cycleOverlay);
 markersBtn.addEventListener("click", toggleMarkers);
 anonBtn.addEventListener("click", toggleAnonymize);
+sliderPosBtn.addEventListener("click", toggleSliderPos);
 syncScrollBtn.addEventListener("click", toggleSyncScroll);
 syncWindowBtn.addEventListener("click", toggleSyncWindow);
 
@@ -681,6 +719,7 @@ const handlers: Record<string, () => void> = {
   "ui.overlay": cycleOverlay,
   "ui.markers": toggleMarkers,
   "ui.anonymize": toggleAnonymize,
+  "ui.slider": toggleSliderPos,
   "ui.settings": () => dialog.open(),
   "volume.build": () => void runBuildVolume(),
   "sync.scroll": toggleSyncScroll,
@@ -755,6 +794,7 @@ installMenu({
 // ---------- Init ----------
 first.setActive(true);
 setTool("window");
+applySliderPos(sliderPos, false);
 applyLayout(layout, false);
 refreshEmptyMessages();
 refreshPresetOptions();
