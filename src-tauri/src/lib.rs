@@ -1033,6 +1033,260 @@ pub fn run() {
         .expect("error while running tauri application");
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Row and column direction cosines of the three standard planes (patient LPS)
+    const AXIAL: [f64; 6] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+    const CORONAL: [f64; 6] = [1.0, 0.0, 0.0, 0.0, 0.0, -1.0];
+    const SAGITTAL: [f64; 6] = [0.0, 1.0, 0.0, 0.0, 0.0, -1.0];
+
+    fn slice(instance: i32, ipp: Option<Vec3>, iop: Option<[f64; 6]>) -> SliceInfo {
+        SliceInfo {
+            path: PathBuf::from(format!("img{instance}.dcm")),
+            series_uid: "S1".into(),
+            instance_number: instance,
+            frame: 0,
+            ipp,
+            iop,
+            frame_of_reference: "F1".into(),
+        }
+    }
+
+    fn axial(instance: i32, z: f64) -> SliceInfo {
+        slice(instance, Some([0.0, 0.0, z]), Some(AXIAL))
+    }
+
+    fn coronal(instance: i32, y: f64) -> SliceInfo {
+        slice(instance, Some([0.0, y, 0.0]), Some(CORONAL))
+    }
+
+    fn sagittal(instance: i32, x: f64) -> SliceInfo {
+        slice(instance, Some([x, 0.0, 0.0]), Some(SAGITTAL))
+    }
+
+    fn instances(v: &[SliceInfo]) -> Vec<i32> {
+        v.iter().map(|s| s.instance_number).collect()
+    }
+
+    fn close(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-9
+    }
+
+    fn assert_vec(actual: Vec3, expected: Vec3) {
+        assert!(
+            (0..3).all(|i| close(actual[i], expected[i])),
+            "expected {expected:?}, got {actual:?}"
+        );
+    }
+
+    // ---------- scroll_normal ----------
+
+    #[test]
+    fn axial_normal_points_toward_the_feet() {
+        assert_vec(scroll_normal(&AXIAL).unwrap(), [0.0, 0.0, -1.0]);
+    }
+
+    #[test]
+    fn coronal_normal_points_backwards() {
+        assert_vec(scroll_normal(&CORONAL).unwrap(), [0.0, 1.0, 0.0]);
+    }
+
+    #[test]
+    fn sagittal_normal_points_to_the_left() {
+        assert_vec(scroll_normal(&SAGITTAL).unwrap(), [1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn oblique_axial_normal_is_a_unit_vector() {
+        let t = 20.0_f64.to_radians();
+        let n = scroll_normal(&[1.0, 0.0, 0.0, 0.0, t.cos(), t.sin()]).unwrap();
+        assert_vec(n, [0.0, t.sin(), -t.cos()]);
+    }
+
+    #[test]
+    fn unnormalised_cosines_are_accepted() {
+        let n = scroll_normal(&[2.0, 0.0, 0.0, 0.0, 2.0, 0.0]).unwrap();
+        assert_vec(n, [0.0, 0.0, -1.0]);
+    }
+
+    #[test]
+    fn degenerate_orientation_has_no_normal() {
+        assert!(scroll_normal(&[0.0; 6]).is_none());
+        // Row and column parallel: the cross product vanishes
+        assert!(scroll_normal(&[1.0, 0.0, 0.0, 1.0, 0.0, 0.0]).is_none());
+    }
+
+    // ---------- sort_slices ----------
+
+    #[test]
+    fn axial_slices_are_sorted_superior_first() {
+        let mut v = vec![axial(1, 0.0), axial(2, 5.0), axial(3, 10.0), axial(4, 15.0)];
+        sort_slices(&mut v);
+        assert_eq!(instances(&v), vec![4, 3, 2, 1]);
+    }
+
+    #[test]
+    fn position_wins_over_instance_number() {
+        let mut v = vec![axial(7, 10.0), axial(3, 0.0), axial(9, 5.0)];
+        sort_slices(&mut v);
+        assert_eq!(instances(&v), vec![7, 9, 3]);
+    }
+
+    #[test]
+    fn coronal_slices_are_sorted_anterior_first() {
+        // In LPS the y axis points to the back, so the front has the smaller y
+        let mut v = vec![coronal(1, -10.0), coronal(2, -30.0), coronal(3, -20.0)];
+        sort_slices(&mut v);
+        assert_eq!(instances(&v), vec![2, 3, 1]);
+    }
+
+    #[test]
+    fn sagittal_slices_are_sorted_right_first() {
+        // In LPS the x axis points to the left, so the right side has the smaller x
+        let mut v = vec![sagittal(1, 20.0), sagittal(2, -20.0), sagittal(3, 0.0)];
+        sort_slices(&mut v);
+        assert_eq!(instances(&v), vec![2, 3, 1]);
+    }
+
+    #[test]
+    fn missing_position_falls_back_to_instance_number() {
+        let mut v = vec![
+            axial(3, 0.0),
+            slice(1, None, Some(AXIAL)),
+            axial(2, 5.0),
+        ];
+        sort_slices(&mut v);
+        assert_eq!(instances(&v), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn missing_orientation_falls_back_to_instance_number() {
+        let mut v = vec![
+            slice(3, Some([0.0, 0.0, 0.0]), None),
+            slice(1, Some([0.0, 0.0, 10.0]), None),
+            slice(2, Some([0.0, 0.0, 5.0]), None),
+        ];
+        sort_slices(&mut v);
+        assert_eq!(instances(&v), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn equal_positions_are_ordered_by_instance_number() {
+        let mut v = vec![axial(5, 10.0), axial(4, 10.0)];
+        sort_slices(&mut v);
+        assert_eq!(instances(&v), vec![4, 5]);
+    }
+
+    #[test]
+    fn float_noise_does_not_reorder_slices() {
+        // 1e-7 mm apart is the same position at the micrometre resolution used for sorting
+        let mut v = vec![axial(2, 10.000_000_1), axial(1, 10.0)];
+        sort_slices(&mut v);
+        assert_eq!(instances(&v), vec![1, 2]);
+    }
+
+    #[test]
+    fn frames_of_one_file_keep_their_order() {
+        let base = axial(1, 0.0);
+        let mut v = vec![
+            SliceInfo { frame: 2, ..base.clone() },
+            SliceInfo { frame: 0, ..base.clone() },
+            SliceInfo { frame: 1, ..base },
+        ];
+        sort_slices(&mut v);
+        assert_eq!(v.iter().map(|s| s.frame).collect::<Vec<_>>(), vec![0, 1, 2]);
+    }
+
+    // ---------- slice_geometry ----------
+
+    #[test]
+    fn uniform_spacing_is_detected() {
+        let mut v: Vec<SliceInfo> = (0..5).map(|i| axial(i + 1, 5.0 * f64::from(i))).collect();
+        sort_slices(&mut v);
+        let (spacing, uniform, tilt) = slice_geometry(&v);
+        assert!(close(spacing.unwrap(), 5.0));
+        assert!(uniform);
+        assert!(tilt < 1e-6);
+    }
+
+    #[test]
+    fn small_position_jitter_is_still_uniform() {
+        let mut v = vec![axial(1, 15.01), axial(2, 10.0), axial(3, 5.01), axial(4, 0.0)];
+        sort_slices(&mut v);
+        let (spacing, uniform, _) = slice_geometry(&v);
+        assert!((spacing.unwrap() - 5.0).abs() < 0.01);
+        assert!(uniform);
+    }
+
+    #[test]
+    fn uneven_spacing_is_reported() {
+        let mut v = vec![axial(1, 30.0), axial(2, 25.0), axial(3, 20.0), axial(4, 10.0)];
+        sort_slices(&mut v);
+        let (spacing, uniform, _) = slice_geometry(&v);
+        assert!((spacing.unwrap() - 20.0 / 3.0).abs() < 1e-9);
+        assert!(!uniform);
+    }
+
+    #[test]
+    fn gantry_tilt_is_measured() {
+        // The stack axis leans 15 degrees away from the slice normal
+        let t = 15.0_f64.to_radians();
+        let mut v: Vec<SliceInfo> = (0..4)
+            .map(|i| {
+                let d = 5.0 * f64::from(i);
+                slice(i + 1, Some([0.0, d * t.sin(), -d * t.cos()]), Some(AXIAL))
+            })
+            .collect();
+        sort_slices(&mut v);
+        assert_eq!(instances(&v), vec![1, 2, 3, 4]);
+
+        let (spacing, uniform, tilt) = slice_geometry(&v);
+        assert!((tilt - 15.0).abs() < 1e-6, "tilt was {tilt}");
+        assert!(uniform);
+        // The spacing is measured along the normal, not along the stack axis
+        assert!((spacing.unwrap() - 5.0 * t.cos()).abs() < 1e-9);
+    }
+
+    #[test]
+    fn single_slice_has_no_spacing() {
+        assert_eq!(slice_geometry(&[axial(1, 0.0)]), (None, true, 0.0));
+    }
+
+    #[test]
+    fn missing_positions_give_no_spacing() {
+        let v = vec![slice(1, None, Some(AXIAL)), slice(2, None, Some(AXIAL))];
+        assert_eq!(slice_geometry(&v), (None, true, 0.0));
+    }
+
+    #[test]
+    fn identical_positions_give_no_spacing() {
+        let v = vec![axial(1, 5.0), axial(2, 5.0), axial(3, 5.0)];
+        assert_eq!(slice_geometry(&v), (None, true, 0.0));
+    }
+
+    // ---------- series_slices ----------
+
+    #[test]
+    fn series_slices_sorts_once_and_shares_the_result() {
+        let state = AppState::default();
+        *state.all.lock().unwrap() = vec![
+            axial(1, 0.0),
+            axial(2, 5.0),
+            SliceInfo { series_uid: "OTHER".into(), ..axial(3, 9.0) },
+        ];
+
+        let a = series_slices(&state, "S1");
+        assert_eq!(instances(&a), vec![2, 1]);
+        let b = series_slices(&state, "S1");
+        assert!(Arc::ptr_eq(&a, &b));
+
+        assert!(series_slices(&state, "NOPE").is_empty());
+        assert!(!state.sorted.lock().unwrap().contains_key("NOPE"));
+    }
+}
+
 // ---------- DICOM tag dump ----------
 
 const MAX_TAG_ENTRIES: usize = 5000;
