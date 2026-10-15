@@ -10,26 +10,28 @@
 <body>
   <header id="toolbar">
     <div class="group">
-      <button id="open-files">Open files</button>
-      <button id="open">Open folder</button>
+      <button id="open-files"><span class="ic" data-icon="file"></span><span class="lbl">Files</span></button>
+      <button id="open"><span class="ic" data-icon="folder"></span><span class="lbl">Folder</span></button>
     </div>
 
     <div class="group" id="tools" role="toolbar" aria-label="Mouse tools">
-      <button class="tool" data-tool="window">W/L</button>
-      <button class="tool" data-tool="pan">Pan</button>
-      <button class="tool" data-tool="zoom">Zoom</button>
-      <button class="tool" data-tool="scroll">Scroll</button>
+      <button class="tool ib" data-tool="window" aria-label="Window / Level"><span class="ic" data-icon="sliders"></span></button>
+      <button class="tool ib" data-tool="pan" aria-label="Pan"><span class="ic" data-icon="move"></span></button>
+      <button class="tool ib" data-tool="zoom" aria-label="Zoom"><span class="ic" data-icon="zoom"></span></button>
+      <button class="tool ib" data-tool="scroll" aria-label="Scroll"><span class="ic" data-icon="scroll"></span></button>
     </div>
 
     <div class="group" id="measure-tools" role="toolbar" aria-label="Measurement tools">
-      <button class="tool" data-tool="length">Length</button>
-      <button class="tool" data-tool="angle">Angle</button>
-      <button class="tool" data-tool="ellipse">Ellipse</button>
-      <button class="tool" data-tool="rect">Rect</button>
+      <button class="tool ib" data-tool="length" aria-label="Length"><span class="ic" data-icon="ruler"></span></button>
+      <button class="tool ib" data-tool="angle" aria-label="Angle"><span class="ic" data-icon="angle"></span></button>
+      <button class="tool ib" data-tool="ellipse" aria-label="Elliptical ROI"><span class="ic" data-icon="ellipse"></span></button>
+      <button class="tool ib" data-tool="rect" aria-label="Rectangular ROI"><span class="ic" data-icon="rect"></span></button>
     </div>
 
     <div class="group" id="layout-wrap">
-      <button id="layout-btn" aria-haspopup="true" aria-expanded="false">Layout: 1 × 1</button>
+      <button id="layout-btn" aria-haspopup="true" aria-expanded="false">
+        <span class="ic" data-icon="layout"></span><span class="lbl">1 × 1</span>
+      </button>
       <div id="layout-pop" hidden>
         <div id="layout-grid"></div>
         <div id="layout-label"></div>
@@ -37,35 +39,35 @@
     </div>
 
     <div class="group">
-      <button id="sync-scroll">Sync scroll</button>
-      <button id="sync-window">Sync W/L</button>
+      <button id="sync-scroll"><span class="ic" data-icon="link"></span><span class="lbl">Scroll</span></button>
+      <button id="sync-window"><span class="ic" data-icon="link"></span><span class="lbl">W/L</span></button>
     </div>
 
     <div class="group">
-      <select id="preset"></select>
-      <button id="invert">Invert</button>
-      <button id="fit">Fit</button>
-      <button id="reset">Reset</button>
+      <select id="preset" aria-label="Window presets"></select>
+      <button id="invert" class="ib" aria-label="Invert"><span class="ic" data-icon="contrast"></span></button>
+      <button id="fit" class="ib" aria-label="Fit to window"><span class="ic" data-icon="fit"></span></button>
+      <button id="reset" class="ib" aria-label="Reset window"><span class="ic" data-icon="undo"></span></button>
     </div>
 
     <div class="group">
-      <button id="rot-ccw">Rot L</button>
-      <button id="rot-cw">Rot R</button>
-      <button id="flip-h">Flip H</button>
-      <button id="flip-v">Flip V</button>
+      <button id="rot-ccw" class="ib" aria-label="Rotate counterclockwise"><span class="ic" data-icon="rotate-ccw"></span></button>
+      <button id="rot-cw" class="ib" aria-label="Rotate clockwise"><span class="ic" data-icon="rotate-cw"></span></button>
+      <button id="flip-h" class="ib" aria-label="Flip horizontally"><span class="ic" data-icon="flip-h"></span></button>
+      <button id="flip-v" class="ib" aria-label="Flip vertically"><span class="ic" data-icon="flip-v"></span></button>
     </div>
 
     <div class="group">
-      <button id="cine">Play</button>
+      <button id="cine" class="ib" aria-label="Play or pause cine"><span class="ic" data-icon="play"></span></button>
     </div>
 
     <div class="group">
-      <button id="info">Info: Full</button>
-      <button id="markers">Markers</button>
-      <button id="slider-pos">Slider: Bottom</button>
-      <button id="anonymize">Anonymize</button>
-      <button id="tags-btn">Tags</button>
-      <button id="settings-open">Settings</button>
+      <button id="info"><span class="ic" data-icon="info"></span><span class="lbl">Full</span></button>
+      <button id="markers" class="ib" aria-label="Markers and scale bars"><span class="ic" data-icon="crosshair"></span></button>
+      <button id="slider-pos" class="ib" aria-label="Image slider position"><span class="ic" data-icon="panel-bottom"></span></button>
+      <button id="anonymize" class="ib" aria-label="Anonymize"><span class="ic" data-icon="eye-off"></span></button>
+      <button id="tags-btn" class="ib" aria-label="DICOM tags"><span class="ic" data-icon="list"></span></button>
+      <button id="settings-open" class="ib" aria-label="Settings"><span class="ic" data-icon="cog"></span></button>
     </div>
   </header>
 

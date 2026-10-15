@@ -27,6 +27,7 @@ import {
 import { createTagsDialog } from "./tags-dialog";
 import type { SeriesInfo, VolumeInfo } from "./types";
 import { syncedIndex, Viewport, type ToolId, type ViewportHost } from "./viewport";
+import { mountIcons, setIcon, setLabel } from "./icons";
 
 // ---------- Elements ----------
 const viewportsEl = byId("viewports", HTMLDivElement);
@@ -74,10 +75,6 @@ const OVERLAY_LABEL: Record<OverlayMode, string> = {
   full: "Full",
   minimal: "Minimal",
   off: "Off",
-};
-const SLIDER_LABEL: Record<SliderPosition, string> = {
-  bottom: "Bottom",
-  right: "Right",
 };
 
 let layout: Layout = settings.layout;
@@ -433,7 +430,7 @@ function syncControls(): void {
   // Windowing does not apply to colour images
   for (const el of [resetBtn, presetSel]) el.disabled = n === 0 || vp.color;
   cineBtn.disabled = n <= 1;
-  cineBtn.textContent = vp.playing ? "Pause" : "Play";
+  setIcon(cineBtn, vp.playing ? "pause" : "play");
 
   setPressed(invertBtn, vp.invert);
   setPressed(cineBtn, vp.playing);
@@ -443,9 +440,9 @@ function syncControls(): void {
   setPressed(anonBtn, anonymize);
   setPressed(syncScrollBtn, syncScroll);
   setPressed(syncWindowBtn, syncWindow);
-  layoutBtn.textContent = `Layout: ${layout.cols} × ${layout.rows}`;
-  infoBtn.textContent = `Info: ${OVERLAY_LABEL[overlayMode]}`;
-  sliderPosBtn.textContent = `Slider: ${SLIDER_LABEL[sliderPos]}`;
+  setLabel(layoutBtn, `${layout.cols} × ${layout.rows}`);
+  setLabel(infoBtn, OVERLAY_LABEL[overlayMode]);
+  setIcon(sliderPosBtn, sliderPos === "bottom" ? "panel-bottom" : "panel-right");
 
   syncMenu();
 }
@@ -901,6 +898,7 @@ installMenu({
   });
 
 // ---------- Init ----------
+mountIcons(); // must run before the first syncControls call swaps icons
 first.setActive(true);
 setTool("window");
 applySliderPos(sliderPos, false);
