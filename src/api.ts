@@ -1,5 +1,12 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { SeriesGeometry, SeriesInfo, SliceData, SliceMeta, VolumeInfo } from "./types";
+import type {
+  SeriesGeometry,
+  SeriesInfo,
+  SliceData,
+  SliceMeta,
+  TagEntry,
+  VolumeInfo,
+} from "./types";
 
 const HEADER_BYTES = 40;
 const THUMB_HEADER_BYTES = 12;
@@ -128,4 +135,18 @@ export async function getThumbnail(uid: string, maxPx: number): Promise<ImageDat
 // Builds the in-memory volume of a series. The Rust side keeps it for later use.
 export function buildVolume(uid: string): Promise<VolumeInfo> {
   return invoke<VolumeInfo>("build_volume", { uid });
+}
+
+export function getTags(uid: string, index: number): Promise<TagEntry[]> {
+  return invoke<TagEntry[]>("get_tags", { uid, index });
+}
+
+// Raw body: [path length u32 LE][path, UTF-8][PNG bytes]
+export async function savePng(path: string, png: Uint8Array): Promise<void> {
+  const p = new TextEncoder().encode(path);
+  const payload = new Uint8Array(4 + p.length + png.length);
+  new DataView(payload.buffer).setUint32(0, p.length, true);
+  payload.set(p, 4);
+  payload.set(png, 4 + p.length);
+  await invoke("save_png", payload);
 }

@@ -451,3 +451,107 @@ body.dragging #viewports::after { border-color: var(--accent); }
   flex: none;
   transform: translate(-50%, -50%) rotate(90deg);
 }
+
+/* ---------- Measurements and pixel readout ---------- */
+.vp-measure {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  pointer-events: none;
+}
+.vp-measure line,
+.vp-measure path,
+.vp-measure rect,
+.vp-measure ellipse,
+.vp-measure circle { filter: drop-shadow(0 0 1px #000); }
+.vp-measure .m-text {
+  font: 11px ui-monospace, Menlo, monospace;
+  fill: #7dffb2;
+  paint-order: stroke;
+  stroke: #000;
+  stroke-width: 3px;
+  stroke-linejoin: round;
+}
+
+.vp-readout {
+  position: absolute;
+  bottom: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 2px 8px;
+  font: 11px ui-monospace, Menlo, monospace;
+  color: var(--text);
+  white-space: pre;
+  background: rgba(0, 0, 0, 0.55);
+  border-radius: 4px;
+  pointer-events: none;
+}
+.vp-readout:empty { display: none; }
+.vp.empty .vp-measure,
+.vp.empty .vp-readout { display: none; }
+
+#viewports[data-tool="length"] .vp,
+#viewports[data-tool="angle"] .vp,
+#viewports[data-tool="ellipse"] .vp,
+#viewports[data-tool="rect"] .vp { cursor: crosshair; }
+
+/* ---------- DICOM tags dialog ---------- */
+#tags-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.6);
+}
+#tags-backdrop[hidden] { display: none; }
+
+#tags {
+  width: min(900px, calc(100vw - 48px));
+  height: min(700px, calc(100vh - 48px));
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.6);
+}
+#tags-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border);
+}
+#tags-search {
+  flex: 1;
+  height: 28px;
+  padding: 0 10px;
+  color: var(--text);
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font: inherit;
+  user-select: text;
+  -webkit-user-select: text;
+}
+#tags-count { font-size: 12px; color: var(--muted); white-space: nowrap; }
+#tags-note { padding: 0 16px; font-size: 12px; color: var(--accent); }
+#tags-note:not(:empty) { padding-top: 8px; }
+#tags-list {
+  flex: 1;
+  overflow: auto;
+  padding: 8px 16px 16px;
+  font: 12px/1.6 ui-monospace, Menlo, monospace;
+  user-select: text;
+  -webkit-user-select: text;
+}
+.tag-row { display: flex; gap: 12px; white-space: nowrap; }
+.tag-row span { overflow: hidden; text-overflow: ellipsis; }
+.tag-id { flex: none; width: 100px; color: var(--muted); }
+.tag-name { flex: none; width: 260px; }
+.tag-vr { flex: none; width: 24px; color: var(--muted); }
+.tag-value { flex: 1; min-width: 0; }

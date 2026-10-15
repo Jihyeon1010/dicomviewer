@@ -1,9 +1,8 @@
-import { open } from "@tauri-apps/plugin-dialog";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { buildVolume, getThumbnail, openFiles, openFolder } from "./api";
+import { buildVolume, getThumbnail, openFiles, openFolder, savePng } from "./api";
 import { byId } from "./dom";
 import { compact, num } from "./format";
-
 import {
   ACTION_BY_ID,
   ACTIONS,
@@ -14,11 +13,9 @@ import {
   resolveBindings,
   type Bindings,
 } from "./keymap";
-
 import { LAYOUT_PRESETS, MAX_COLS, MAX_ROWS, type Layout } from "./layout";
 import { installMenu, type AppMenu } from "./menu";
 import { createSettingsDialog } from "./settings-dialog";
-
 import {
   loadSettings,
   OVERLAY_MODES,
@@ -27,7 +24,7 @@ import {
   type Settings,
   type SliderPosition,
 } from "./settings";
-
+import { createTagsDialog } from "./tags-dialog";
 import type { SeriesInfo, VolumeInfo } from "./types";
 import { syncedIndex, Viewport, type ToolId, type ViewportHost } from "./viewport";
 
@@ -41,22 +38,28 @@ const openFilesBtn = byId("open-files", HTMLButtonElement);
 const invertBtn = byId("invert", HTMLButtonElement);
 const fitBtn = byId("fit", HTMLButtonElement);
 const resetBtn = byId("reset", HTMLButtonElement);
+const rotCcwBtn = byId("rot-ccw", HTMLButtonElement);
+const rotCwBtn = byId("rot-cw", HTMLButtonElement);
+const flipHBtn = byId("flip-h", HTMLButtonElement);
+const flipVBtn = byId("flip-v", HTMLButtonElement);
+const cineBtn = byId("cine", HTMLButtonElement);
 const infoBtn = byId("info", HTMLButtonElement);
 const markersBtn = byId("markers", HTMLButtonElement);
 const anonBtn = byId("anonymize", HTMLButtonElement);
+const tagsBtn = byId("tags-btn", HTMLButtonElement);
 const settingsBtn = byId("settings-open", HTMLButtonElement);
 const syncScrollBtn = byId("sync-scroll", HTMLButtonElement);
 const syncWindowBtn = byId("sync-window", HTMLButtonElement);
 const slider = byId("slider", HTMLInputElement);
+const stageEl = byId("stage", HTMLElement);
+const sliderBar = byId("slider-bar", HTMLDivElement);
+const sliderPosBtn = byId("slider-pos", HTMLButtonElement);
 const layoutWrap = byId("layout-wrap", HTMLDivElement);
 const layoutBtn = byId("layout-btn", HTMLButtonElement);
 const layoutPop = byId("layout-pop", HTMLDivElement);
 const layoutGrid = byId("layout-grid", HTMLDivElement);
 const layoutLabel = byId("layout-label", HTMLDivElement);
-const toolButtons = document.querySelectorAll<HTMLButtonElement>("#tools .tool");
-const stageEl = byId("stage", HTMLElement);
-const sliderBar = byId("slider-bar", HTMLDivElement);
-const sliderPosBtn = byId("slider-pos", HTMLButtonElement);
+const toolButtons = document.querySelectorAll<HTMLButtonElement>(".tool");
 
 // ---------- Settings ----------
 let settings: Settings = loadSettings();
@@ -72,7 +75,6 @@ const OVERLAY_LABEL: Record<OverlayMode, string> = {
   minimal: "Minimal",
   off: "Off",
 };
-
 const SLIDER_LABEL: Record<SliderPosition, string> = {
   bottom: "Bottom",
   right: "Right",
@@ -129,6 +131,10 @@ const TOOL_TIPS: Record<string, string> = {
   pan: "Pan",
   zoom: "Zoom",
   scroll: "Scroll",
+  length: "Measure a length",
+  angle: "Measure an angle (three clicks)",
+  ellipse: "Elliptical ROI",
+  rect: "Rectangular ROI",
 };
 
 // Tooltips and preset labels are generated from the keymap, so they never go stale
@@ -143,11 +149,17 @@ function refreshTooltips(): void {
   setTip(invertBtn, "Invert", "view.invert");
   setTip(fitBtn, "Fit to window", "view.fit");
   setTip(resetBtn, "Reset window", "view.resetWindow");
+  setTip(rotCcwBtn, "Rotate counterclockwise", "view.rotateCCW");
+  setTip(rotCwBtn, "Rotate clockwise", "view.rotateCW");
+  setTip(flipHBtn, "Flip horizontally", "view.flipH");
+  setTip(flipVBtn, "Flip vertically", "view.flipV");
+  setTip(cineBtn, "Play / pause cine", "cine.toggle");
   setTip(infoBtn, "Overlay detail: full / minimal / off", "ui.overlay");
   setTip(markersBtn, "Orientation markers and scale bars", "ui.markers");
-  setTip(anonBtn, "Hide patient identifiers on screen", "ui.anonymize");
-  setTip(settingsBtn, "Settings and keyboard shortcuts", "ui.settings");
   setTip(sliderPosBtn, "Move the image slider to the bottom or the right side", "ui.slider");
+  setTip(anonBtn, "Hide patient identifiers on screen", "ui.anonymize");
+  setTip(tagsBtn, "DICOM tags of the shown image", "ui.tags");
+  setTip(settingsBtn, "Settings and keyboard shortcuts", "ui.settings");
 }
 
 function refreshPresetOptions(): void {
@@ -232,7 +244,7 @@ function syncSlices(src: Viewport): void {
   for (const vp of visible()) {
     if (vp === src) continue;
     const idx = syncedIndex(src, vp);
-    if (idx !== null) vp.goto(idx, false);
+    if (idx !== null) vp.goto(idx, false, true);
   }
 }
 
@@ -373,6 +385,7 @@ document.addEventListener("mousedown", (e: MouseEvent) => {
 
 // ---------- Tools ----------
 function setTool(next: ToolId): void {
+  for (const vp of viewports) vp.cancelDraft(); // a half-drawn measurement does not survive a tool change
   tool = next;
   viewportsEl.dataset["tool"] = next;
   for (const b of toolButtons) {
@@ -414,11 +427,18 @@ function syncControls(): void {
   slider.max = String(Math.max(0, n - 1));
   slider.value = String(vp.index);
   slider.disabled = n <= 1;
-  for (const el of [invertBtn, fitBtn]) el.disabled = n === 0;
+  for (const el of [invertBtn, fitBtn, rotCcwBtn, rotCwBtn, flipHBtn, flipVBtn, tagsBtn]) {
+    el.disabled = n === 0;
+  }
   // Windowing does not apply to colour images
   for (const el of [resetBtn, presetSel]) el.disabled = n === 0 || vp.color;
+  cineBtn.disabled = n <= 1;
+  cineBtn.textContent = vp.playing ? "Pause" : "Play";
 
   setPressed(invertBtn, vp.invert);
+  setPressed(cineBtn, vp.playing);
+  setPressed(flipHBtn, vp.orientation.flipH);
+  setPressed(flipVBtn, vp.orientation.flipV);
   setPressed(markersBtn, markersOn);
   setPressed(anonBtn, anonymize);
   setPressed(syncScrollBtn, syncScroll);
@@ -606,6 +626,40 @@ async function runBuildVolume(): Promise<void> {
   }
 }
 
+// ---------- Export ----------
+// Exports the active view at native resolution, without overlays and measurements
+async function exportImage(copy: boolean): Promise<void> {
+  // Rendered before any await: the drawing buffer must be read in the same task
+  const canvas = active.renderExport();
+  if (!canvas) {
+    flashStatus("No image to export");
+    return;
+  }
+  const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/png"));
+  if (!blob) {
+    flashStatus("Could not encode the image");
+    return;
+  }
+
+  try {
+    if (copy) {
+      await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
+      flashStatus("Image copied to the clipboard");
+      return;
+    }
+    const name = `image-${String(active.index + 1).padStart(3, "0")}.png`;
+    const path = await save({
+      defaultPath: name,
+      filters: [{ name: "PNG image", extensions: ["png"] }],
+    });
+    if (typeof path !== "string") return;
+    await savePng(path, new Uint8Array(await blob.arrayBuffer()));
+    flashStatus(anonymize ? "Image saved (text burned into the pixels is not removed)" : "Image saved");
+  } catch (err) {
+    showError(err);
+  }
+}
+
 // ---------- Loading ----------
 async function showSeries(list: SeriesInfo[]): Promise<void> {
   thumbRun++; // cancels thumbnail loading for the previous selection
@@ -657,6 +711,11 @@ openFilesBtn.addEventListener("click", async () => {
 invertBtn.addEventListener("click", () => active.toggleInvert());
 fitBtn.addEventListener("click", () => active.fit());
 resetBtn.addEventListener("click", () => active.resetWindow());
+rotCcwBtn.addEventListener("click", () => active.rotate(-1));
+rotCwBtn.addEventListener("click", () => active.rotate(1));
+flipHBtn.addEventListener("click", () => active.flip("h"));
+flipVBtn.addEventListener("click", () => active.flip("v"));
+cineBtn.addEventListener("click", () => active.togglePlay());
 infoBtn.addEventListener("click", cycleOverlay);
 markersBtn.addEventListener("click", toggleMarkers);
 anonBtn.addEventListener("click", toggleAnonymize);
@@ -685,7 +744,7 @@ void getCurrentWebview().onDragDropEvent(async (event) => {
   await loadInputs(() => openFiles(p.paths));
 });
 
-// ---------- Settings dialog and keyboard ----------
+// ---------- Dialogs ----------
 const dialog = createSettingsDialog({
   getBindings: () => bindings,
   onChange: (overrides) => {
@@ -696,8 +755,31 @@ const dialog = createSettingsDialog({
   },
 });
 
-settingsBtn.addEventListener("click", () => dialog.open());
+const tagsDialog = createTagsDialog({
+  context: () => (active.series ? { uid: active.series.uid, index: active.index } : null),
+  anonymize: () => anonymize,
+});
 
+const modalOpen = (): boolean => dialog.isOpen() || tagsDialog.isOpen();
+
+function openSettings(): void {
+  if (tagsDialog.isOpen()) tagsDialog.close();
+  dialog.open();
+}
+
+function openTags(): void {
+  if (!active.series) {
+    flashStatus("Open a series first");
+    return;
+  }
+  if (dialog.isOpen()) dialog.close();
+  void tagsDialog.open();
+}
+
+settingsBtn.addEventListener("click", openSettings);
+tagsBtn.addEventListener("click", openTags);
+
+// ---------- Keyboard ----------
 // One handler per action id; the keys that trigger them live in keymap.ts and the settings.
 // Image, view and window actions apply to the active viewport.
 const handlers: Record<string, () => void> = {
@@ -712,18 +794,35 @@ const handlers: Record<string, () => void> = {
   "view.fit": () => active.fit(),
   "view.invert": () => active.toggleInvert(),
   "view.resetWindow": () => active.resetWindow(),
+  "view.rotateCW": () => active.rotate(1),
+  "view.rotateCCW": () => active.rotate(-1),
+  "view.flipH": () => active.flip("h"),
+  "view.flipV": () => active.flip("v"),
+  "view.resetOrientation": () => active.resetOrientation(),
   "tool.window": () => setTool("window"),
   "tool.pan": () => setTool("pan"),
   "tool.zoom": () => setTool("zoom"),
   "tool.scroll": () => setTool("scroll"),
+  "tool.length": () => setTool("length"),
+  "tool.angle": () => setTool("angle"),
+  "tool.ellipse": () => setTool("ellipse"),
+  "tool.rect": () => setTool("rect"),
+  "measure.undo": () => active.undoMeasurement(),
+  "measure.clear": () => active.clearMeasurements(),
+  "cine.toggle": () => active.togglePlay(),
+  "cine.faster": () => active.changeFps(1.25),
+  "cine.slower": () => active.changeFps(0.8),
   "ui.overlay": cycleOverlay,
   "ui.markers": toggleMarkers,
   "ui.anonymize": toggleAnonymize,
   "ui.slider": toggleSliderPos,
-  "ui.settings": () => dialog.open(),
+  "ui.tags": openTags,
+  "ui.settings": openSettings,
   "volume.build": () => void runBuildVolume(),
   "sync.scroll": toggleSyncScroll,
   "sync.window": toggleSyncWindow,
+  "export.save": () => void exportImage(false),
+  "export.copy": () => void exportImage(true),
 };
 for (let i = 1; i <= PRESET_COUNT; i++) {
   handlers[`preset.${i}`] = () => applyPreset(i - 1);
@@ -736,12 +835,20 @@ for (const a of ACTIONS) {
 }
 
 window.addEventListener("keydown", (e: KeyboardEvent) => {
-  // While the dialog is open it owns the keyboard (including key capture)
+  // While a dialog is open it owns the keyboard (including key capture)
   if (dialog.handleKey(e)) return;
-  if (e.key === "Escape" && !layoutPop.hidden) {
-    e.preventDefault();
-    closeLayoutPicker();
-    return;
+  if (tagsDialog.handleKey(e)) return;
+
+  if (e.key === "Escape") {
+    if (!layoutPop.hidden) {
+      e.preventDefault();
+      closeLayoutPicker();
+      return;
+    }
+    if (active.cancelDraft()) {
+      e.preventDefault();
+      return;
+    }
   }
   if (e.target instanceof HTMLSelectElement || e.target instanceof HTMLInputElement) return;
 
@@ -751,22 +858,24 @@ window.addEventListener("keydown", (e: KeyboardEvent) => {
   if (!id) return;
 
   e.preventDefault();
+  // Space would otherwise also activate a focused button
+  if (e.code === "Space" && e.target instanceof HTMLElement) e.target.blur();
   // Toggles must not flip repeatedly while a key is held
   if (e.repeat && !ACTION_BY_ID.get(id)?.repeat) return;
   handlers[id]?.();
 });
 
 // ---------- Native menu ----------
-// Menu actions are ignored while the settings dialog is open (it owns the keyboard)
+// Menu actions are ignored while a dialog is open (it owns the keyboard)
 const whenIdle = (fn: () => void) => (): void => {
-  if (!dialog.isOpen()) fn();
+  if (!modalOpen()) fn();
 };
 
 installMenu({
   appName: "DICOM Viewer",
   presetNames: PRESETS.map((p) => p.name),
   run: (id) => {
-    if (dialog.isOpen() && id !== "ui.settings") {
+    if (modalOpen() && id !== "ui.settings" && id !== "ui.tags") {
       syncMenu(); // undo the native check toggle; the action itself is ignored
       return;
     }
@@ -775,7 +884,7 @@ installMenu({
   openFiles: whenIdle(() => openFilesBtn.click()),
   openFolder: whenIdle(() => openBtn.click()),
   setOverlay: (mode) => {
-    if (dialog.isOpen()) {
+    if (modalOpen()) {
       syncMenu();
       return;
     }

@@ -1,8 +1,8 @@
+import { LAYOUT_PRESETS } from "./layout";
+
 // Key combos are strings: optional "Ctrl+", "Alt+", "Shift+" prefixes (in that order)
 // followed by a KeyboardEvent.code, e.g. "ArrowDown" or "Shift+Equal".
 // Using `code` (physical key) keeps shortcuts working with any input language.
-
-import { LAYOUT_PRESETS } from "./layout";
 
 export type Bindings = Record<string, string[]>; // action id -> key combos
 
@@ -17,6 +17,8 @@ export interface ActionDef {
 // Number of window preset actions (preset.1 ... preset.N); main.ts must define as many presets
 export const PRESET_COUNT = 6;
 
+// Actions of one group must stay together: the settings dialog prints a heading
+// whenever the group changes from one entry to the next.
 export const ACTIONS: ActionDef[] = [
   { id: "slice.prev", label: "Previous image", group: "Navigation", defaults: ["ArrowUp", "ArrowLeft"], repeat: true },
   { id: "slice.next", label: "Next image", group: "Navigation", defaults: ["ArrowDown", "ArrowRight"], repeat: true },
@@ -29,10 +31,23 @@ export const ACTIONS: ActionDef[] = [
   { id: "view.zoomOut", label: "Zoom out", group: "View", defaults: ["Minus", "NumpadSubtract"], repeat: true },
   { id: "view.fit", label: "Fit to window", group: "View", defaults: ["Digit0", "Numpad0"] },
 
+  { id: "view.rotateCW", label: "Rotate clockwise", group: "Orientation", defaults: ["KeyE"] },
+  { id: "view.rotateCCW", label: "Rotate counterclockwise", group: "Orientation", defaults: ["Shift+KeyE"] },
+  { id: "view.flipH", label: "Flip horizontally", group: "Orientation", defaults: ["KeyH"] },
+  { id: "view.flipV", label: "Flip vertically", group: "Orientation", defaults: ["Shift+KeyH"] },
+  { id: "view.resetOrientation", label: "Reset orientation", group: "Orientation", defaults: ["Shift+KeyR"] },
+
   { id: "tool.window", label: "Window / Level tool", group: "Tools", defaults: ["KeyW"] },
   { id: "tool.pan", label: "Pan tool", group: "Tools", defaults: ["KeyP"] },
   { id: "tool.zoom", label: "Zoom tool", group: "Tools", defaults: ["KeyZ"] },
   { id: "tool.scroll", label: "Scroll tool", group: "Tools", defaults: ["KeyS"] },
+  { id: "tool.length", label: "Length measurement", group: "Tools", defaults: ["KeyD"] },
+  { id: "tool.angle", label: "Angle measurement", group: "Tools", defaults: ["KeyG"] },
+  { id: "tool.ellipse", label: "Elliptical ROI", group: "Tools", defaults: ["KeyC"] },
+  { id: "tool.rect", label: "Rectangular ROI", group: "Tools", defaults: ["KeyX"] },
+
+  { id: "measure.undo", label: "Delete last measurement", group: "Measurements", defaults: ["Backspace", "Delete"] },
+  { id: "measure.clear", label: "Clear measurements on this image", group: "Measurements", defaults: ["Shift+Backspace", "Shift+Delete"] },
 
   { id: "view.invert", label: "Invert image", group: "Window", defaults: ["KeyI"] },
   { id: "view.resetWindow", label: "Reset window", group: "Window", defaults: ["KeyR"] },
@@ -43,14 +58,20 @@ export const ACTIONS: ActionDef[] = [
     defaults: [`Digit${i + 1}`],
   })),
 
+  { id: "cine.toggle", label: "Play / pause cine", group: "Cine", defaults: ["Space"] },
+  { id: "cine.faster", label: "Cine faster", group: "Cine", defaults: ["BracketRight"], repeat: true },
+  { id: "cine.slower", label: "Cine slower", group: "Cine", defaults: ["BracketLeft"], repeat: true },
+
   { id: "ui.overlay", label: "Cycle overlay detail", group: "Interface", defaults: ["KeyO"] },
   { id: "ui.markers", label: "Toggle markers and scale bars", group: "Interface", defaults: ["KeyM"] },
   { id: "ui.anonymize", label: "Toggle anonymize", group: "Interface", defaults: ["KeyA"] },
   { id: "ui.slider", label: "Move image slider (bottom / right)", group: "Interface", defaults: ["KeyB"] },
+  { id: "ui.tags", label: "DICOM tags", group: "Interface", defaults: ["KeyT"] },
   { id: "ui.settings", label: "Settings and shortcuts", group: "Interface", defaults: ["Comma", "Shift+Slash"] },
+
   { id: "volume.build", label: "Build 3D volume", group: "Volume", defaults: ["KeyV"] },
 
-    ...LAYOUT_PRESETS.map((l, i) => ({
+  ...LAYOUT_PRESETS.map((l, i): ActionDef => ({
     id: `layout.${l.cols}x${l.rows}`,
     label: `Layout ${l.cols} × ${l.rows}`,
     group: "Layout",
@@ -58,6 +79,10 @@ export const ACTIONS: ActionDef[] = [
   })),
   { id: "sync.scroll", label: "Toggle scroll sync", group: "Layout", defaults: ["KeyL"] },
   { id: "sync.window", label: "Toggle window sync", group: "Layout", defaults: ["Shift+KeyL"] },
+
+  // No default keys: the File menu uses Cmd+S and Cmd+Shift+C
+  { id: "export.save", label: "Save image as PNG", group: "File", defaults: [] },
+  { id: "export.copy", label: "Copy image to the clipboard", group: "File", defaults: [] },
 ];
 
 export const ACTION_BY_ID = new Map<string, ActionDef>(
@@ -205,7 +230,8 @@ export function comboFromEvent(e: KeyboardEvent): string | null {
   return parts.join("+");
 }
 
-// Keys that activate focused controls or leave dialogs; not assignable
+// Keys that activate focused controls or leave dialogs; not assignable.
+// (Space is a default for cine playback, but cannot be assigned again by hand.)
 const RESERVED_CODES = new Set(["Escape", "Tab", "Enter", "NumpadEnter", "Space"]);
 
 /** Returns a message if the combo cannot be assigned, otherwise null. */

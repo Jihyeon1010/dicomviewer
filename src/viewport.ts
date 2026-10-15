@@ -7,11 +7,30 @@ import {
   scaleBarPath,
   scaleBarPathVertical,
 } from "./guides";
+import { angleText, areaText, lengthText, roiLines, shapeAreaPx, type Spacing } from "./measure";
 import { GLRenderer } from "./renderer";
 import type { OverlayMode } from "./settings";
+import {
+  cssTransform,
+  imageToScreen,
+  NO_ORIENT,
+  orientedLabels,
+  orientText,
+  screenToImage,
+  type Orient,
+  type Pt,
+  type Size,
+  type ViewParams,
+} from "./transform2d";
 import type { SeriesGeometry, SeriesInfo, SliceData, SliceMeta } from "./types";
 
-export type ToolId = "window" | "pan" | "zoom" | "scroll";
+export type MeasureKind = "length" | "angle" | "ellipse" | "rect";
+export type ToolId = "window" | "pan" | "zoom" | "scroll" | MeasureKind;
+type DragMode = Exclude<ToolId, MeasureKind>;
+
+export function isMeasureTool(t: ToolId): t is MeasureKind {
+  return t === "length" || t === "angle" || t === "ellipse" || t === "rect";
+}
 
 export interface OverlayOptions {
   mode: OverlayMode;
@@ -30,7 +49,7 @@ export interface ViewportHost {
 }
 
 interface Drag {
-  mode: ToolId;
+  mode: DragMode;
   x: number; y: number;   // pointer start (client coordinates)
   ax: number; ay: number; // anchor point in viewport coordinates
   wl: number; ww: number;
@@ -38,7 +57,27 @@ interface Drag {
   index: number;
 }
 
+// A finished measurement; points are in image coordinates, the text is fixed at creation
+interface Measurement {
+  kind: MeasureKind;
+  pts: Pt[];
+  lines: string[];
+}
+
+// A measurement being drawn; the last point follows the cursor
+interface Draft {
+  kind: MeasureKind;
+  pts: Pt[];
+}
+
 const SVG_NS = "http://www.w3.org/2000/svg";
+const MEASURE_COLOR = "#7dffb2";
+
+// Views smaller than this cannot hold the full overlay
+const SMALL_W = 360;
+const SMALL_H = 260;
+
+const clamp = (v: number, lo: number, hi: number): number => Math.min(hi, Math.max(lo, v));
 
 function div(className: string): HTMLDivElement {
   const d = document.createElement("div");
@@ -46,9 +85,14 @@ function div(className: string): HTMLDivElement {
   return d;
 }
 
-// Views smaller than this cannot hold the full overlay
-const SMALL_W = 360;
-const SMALL_H = 260;
+function svgEl<K extends keyof SVGElementTagNameMap>(
+  tag: K,
+  attrs: Record<string, string | number>,
+): SVGElementTagNameMap[K] {
+  const el = document.createElementNS(SVG_NS, tag);
+  for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, String(v));
+  return el;
+}
 
 function svgWithPath(): { svg: SVGSVGElement; path: SVGPathElement } {
   const svg = document.createElementNS(SVG_NS, "svg");
@@ -64,6 +108,10 @@ function svgWithPath(): { svg: SVGSVGElement; path: SVGPathElement } {
 function buildUi(root: HTMLElement) {
   const canvas = document.createElement("canvas");
   canvas.className = "vp-canvas";
+
+  const measure = document.createElementNS(SVG_NS, "svg");
+  measure.setAttribute("class", "vp-measure");
+  measure.setAttribute("aria-hidden", "true");
 
   const tl = div("overlay tl");
   const tr = div("overlay tr");
@@ -84,15 +132,20 @@ function buildUi(root: HTMLElement) {
   const vBar = div("scalebar v");
   vBar.append(v.svg, vLabel);
 
+  const readout = div("vp-readout");
   const status = div("vp-status");
   const emptyTitle = div("vp-empty-title");
   const emptySub = div("vp-empty-sub");
   const empty = div("vp-empty");
   empty.append(emptyTitle, emptySub);
 
-  root.append(canvas, tl, tr, bl, br, markerT, markerB, markerL, markerR, hBar, vBar, status, empty);
+  root.append(
+    canvas, measure, tl, tr, bl, br,
+    markerT, markerB, markerL, markerR,
+    hBar, vBar, readout, status, empty,
+  );
   return {
-    canvas, tl, tr, bl, br,
+    canvas, measure, readout, tl, tr, bl, br,
     markerT, markerB, markerL, markerR,
     hBar, hSvg: h.svg, hPath: h.path, hLabel,
     vBar, vSvg: v.svg, vPath: v.path, vLabel,
@@ -145,7 +198,7 @@ function imageLines(index: number, count: number, s: SliceData | null, m: SliceM
     : "";
   // pixel_spacing is [row, column]; shown as horizontal x vertical, like the matrix size
   const spacing = m?.pixel_spacing
-    ? `Px ${num(m.pixel_spacing[1], 3)} × ${num(m.pixel_spacing[0], 3)} mm`
+    ? `Px ${num(m.pixel_spacing[1], 3)} × ${num(m.pixel_spacing[0], 3)} mm${m.spacing_is_imager ? " (detector)" : ""}`
     : "";
   return compact([
     count ? `Im ${index + 1} / ${count}` : "",
@@ -202,6 +255,7 @@ export class Viewport {
   wl = 40;
   ww = 400;
   invert = false;
+  fps = 10; // cine playback rate
   geometry: SeriesGeometry | null = null;
   extraLines: string[] = []; // appended to the bottom-left overlay (volume info)
 
@@ -213,16 +267,31 @@ export class Viewport {
   private zoom = 1;
   private panX = 0;
   private panY = 0;
+  private orient: Orient = { ...NO_ORIENT };
   private autoFit = true; // keep the image fitted until the user zooms or pans
   private firstLoad = true; // apply the file's default WL/WW only once per series
   private fetchToken = 0;
+  private loading = false;
   private drawQueued = false;
   private drag: Drag | null = null;
   private wheelAcc = 0;
+  private cineRaf = 0; // requestAnimationFrame id while playing, 0 otherwise
+  private cineLast = 0;
+  private measurements = new Map<string, Measurement[]>(); // keyed by series and image
+  private draft: Draft | null = null;
+  private measuring = false; // mouse button held while drawing a drag-style measurement
 
   /** True when the shown image is in colour; windowing does not apply to those. */
   get color(): boolean {
     return this.current?.samples === 3;
+  }
+
+  get playing(): boolean {
+    return this.cineRaf !== 0;
+  }
+
+  get orientation(): Orient {
+    return this.orient;
   }
 
   constructor(host: ViewportHost) {
@@ -249,16 +318,24 @@ export class Viewport {
 
   /** Shows a series (or clears the viewport). Resolves once the first image is loaded. */
   setSeries(series: SeriesInfo | null): Promise<void> {
+    this.stopPlay();
     this.fetchToken++; // drops responses that are still in flight for the old series
+    this.loading = false;
     this.series = series;
     this.count = series?.slice_count ?? 0;
     this.index = 0;
+    this.fps = 10;
     this.firstLoad = true;
     this.autoFit = true;
     this.current = null;
     this.meta = null;
     this.geometry = null;
     this.extraLines = [];
+    this.orient = { ...NO_ORIENT };
+    this.draft = null;
+    this.measuring = false;
+    if (series === null) this.measurements.clear();
+    this.ui.readout.textContent = "";
     this.setStatus("");
     this.el.classList.toggle("empty", series === null);
     this.refreshOverlay();
@@ -281,6 +358,7 @@ export class Viewport {
   setVisible(on: boolean): void {
     this.el.hidden = !on;
     if (on) this.requestDraw();
+    else this.stopPlay();
   }
 
   private async loadGeometry(uid: string): Promise<void> {
@@ -297,6 +375,7 @@ export class Viewport {
     const series = this.series;
     if (!series || this.count === 0) return;
     const token = ++this.fetchToken;
+    this.loading = true;
     try {
       // Metadata is optional: a failure there must not block the image
       const [slice, m] = await Promise.all([
@@ -316,6 +395,7 @@ export class Viewport {
           this.wl = slice.defaultWl;
           this.ww = slice.defaultWw;
         }
+        if (m?.cine_fps) this.fps = clamp(m.cine_fps, 1, 60);
         this.firstLoad = false;
       }
       if (dimsChanged) {
@@ -323,21 +403,30 @@ export class Viewport {
         this.ui.canvas.width = slice.cols;
         this.ui.canvas.height = slice.rows;
         if (this.autoFit) this.fitView();
+        else this.applyTransform();
       }
       this.setStatus("");
       this.draw();
       this.host.stateChanged(this); // grayscale or colour decides which controls apply
     } catch (err) {
-      if (token === this.fetchToken) this.showError(err);
+      if (token === this.fetchToken) {
+        this.stopPlay();
+        this.showError(err);
+      }
+    } finally {
+      if (token === this.fetchToken) this.loading = false;
     }
   }
 
   // ---------- Navigation and window ----------
 
-  goto(next: number, notify = true): void {
+  goto(next: number, notify = true, fromCine = false): void {
     if (this.count === 0) return;
     const clamped = Math.max(0, Math.min(this.count - 1, next));
     if (clamped === this.index) return;
+    if (!fromCine) this.stopPlay(); // scrolling by hand pauses playback
+    this.draft = null; // measurements belong to one image
+    this.measuring = false;
     this.index = clamped;
     this.refreshOverlay();
     this.host.stateChanged(this);
@@ -369,11 +458,99 @@ export class Viewport {
     this.host.stateChanged(this);
   }
 
+  // ---------- Cine ----------
+
+  togglePlay(): void {
+    if (this.playing) this.stopPlay();
+    else this.startPlay();
+  }
+
+  startPlay(): void {
+    if (this.playing || this.count < 2) return;
+    this.cancelDraft();
+    this.cineLast = performance.now();
+    this.cineRaf = requestAnimationFrame(this.tick);
+    this.refreshOverlay();
+    this.host.stateChanged(this);
+  }
+
+  stopPlay(): void {
+    if (!this.playing) return;
+    cancelAnimationFrame(this.cineRaf);
+    this.cineRaf = 0;
+    this.refreshOverlay();
+    this.host.stateChanged(this);
+  }
+
+  changeFps(factor: number): void {
+    this.fps = clamp(this.fps * factor, 1, 60);
+    this.refreshOverlay();
+  }
+
+  // Advances only when the previous image has arrived, so requests never pile up
+  private tick = (now: number): void => {
+    if (!this.playing) return;
+    if (!this.loading && this.count > 1 && now - this.cineLast >= 1000 / this.fps) {
+      this.cineLast = now;
+      this.goto((this.index + 1) % this.count, true, true);
+    }
+    if (!this.playing) return; // stopped while advancing
+    this.cineRaf = requestAnimationFrame(this.tick);
+  };
+
+  // ---------- Orientation ----------
+
+  rotate(dir: 1 | -1): void {
+    // On a mirrored image a clockwise turn on screen is a counterclockwise turn of the stored rotation
+    const mirrored = this.orient.flipH !== this.orient.flipV;
+    const step = mirrored ? -dir : dir;
+    this.orient = { ...this.orient, rot: (this.orient.rot + step + 4) % 4 };
+    this.orientChanged();
+  }
+
+  flip(axis: "h" | "v"): void {
+    this.orient =
+      axis === "h"
+        ? { ...this.orient, flipH: !this.orient.flipH }
+        : { ...this.orient, flipV: !this.orient.flipV };
+    this.orientChanged();
+  }
+
+  resetOrientation(): void {
+    this.orient = { ...NO_ORIENT };
+    this.orientChanged();
+  }
+
+  private orientChanged(): void {
+    if (this.autoFit && this.current) this.fitView();
+    else this.applyTransform();
+    this.refreshOverlay();
+    this.host.stateChanged(this);
+  }
+
   // ---------- View transform ----------
 
+  private size(): Size {
+    const s = this.current;
+    return { cols: s?.cols ?? 1, rows: s?.rows ?? 1 };
+  }
+
+  private viewParams(): ViewParams {
+    return { zoom: this.zoom, panX: this.panX, panY: this.panY };
+  }
+
+  private toScreen(p: Pt): Pt {
+    return imageToScreen(p, this.size(), this.viewParams(), this.orient);
+  }
+
+  private toImage(sx: number, sy: number): Pt {
+    return screenToImage({ x: sx, y: sy }, this.size(), this.viewParams(), this.orient);
+  }
+
   private applyTransform(): void {
-    this.ui.canvas.style.transform =
-      `translate(${this.panX}px, ${this.panY}px) scale(${this.zoom})`;
+    this.ui.canvas.style.transform = this.current
+      ? cssTransform(this.size(), this.viewParams(), this.orient)
+      : "";
   }
 
   private fitView(): void {
@@ -381,9 +558,14 @@ export class Viewport {
     if (!s) return;
     const r = this.el.getBoundingClientRect();
     if (r.width === 0 || r.height === 0) return;
-    this.zoom = Math.min(r.width / s.cols, r.height / s.rows);
-    this.panX = (r.width - s.cols * this.zoom) / 2;
-    this.panY = (r.height - s.rows * this.zoom) / 2;
+    // A quarter turn swaps the displayed width and height
+    const odd = this.orient.rot % 2 === 1;
+    const dw = odd ? s.rows : s.cols;
+    const dh = odd ? s.cols : s.rows;
+    this.zoom = Math.min(r.width / dw, r.height / dh);
+    // The image center stays fixed under rotation and mirroring
+    this.panX = r.width / 2 - (this.zoom * s.cols) / 2;
+    this.panY = r.height / 2 - (this.zoom * s.rows) / 2;
     this.autoFit = true;
     this.applyTransform();
   }
@@ -394,7 +576,7 @@ export class Viewport {
   }
 
   private zoomAt(factor: number, cx: number, cy: number): void {
-    const z2 = Math.min(50, Math.max(0.05, this.zoom * factor));
+    const z2 = clamp(this.zoom * factor, 0.05, 50);
     const k = z2 / this.zoom;
     this.panX = cx - (cx - this.panX) * k;
     this.panY = cy - (cy - this.panY) * k;
@@ -428,12 +610,36 @@ export class Viewport {
     this.refreshOverlay();
   }
 
+  /**
+   * The image at its native resolution with the current window, inversion, rotation and
+   * mirroring, without overlays or measurements. Null when there is nothing to export.
+   */
+  renderExport(): HTMLCanvasElement | null {
+    const s = this.current;
+    if (!s || !this.renderer) return null;
+    // Draw and read back in the same task: the drawing buffer is cleared once it is composited
+    this.renderer.draw({ wl: this.wl, ww: this.ww, invert: this.invert });
+
+    const odd = this.orient.rot % 2 === 1;
+    const out = document.createElement("canvas");
+    out.width = odd ? s.rows : s.cols;
+    out.height = odd ? s.cols : s.rows;
+    const ctx = out.getContext("2d");
+    if (!ctx) return null;
+    ctx.translate(out.width / 2, out.height / 2);
+    ctx.scale(this.orient.flipH ? -1 : 1, this.orient.flipV ? -1 : 1);
+    ctx.rotate((this.orient.rot * Math.PI) / 2);
+    ctx.drawImage(this.ui.canvas, -s.cols / 2, -s.rows / 2);
+    return out;
+  }
+
   // ---------- Overlay ----------
 
   refreshOverlay(): void {
     this.el.classList.toggle("small", this.isSmall());
     this.updateText();
     this.updateGuides();
+    this.updateMeasurements();
   }
 
   private isSmall(): boolean {
@@ -461,16 +667,19 @@ export class Viewport {
         ? `Im ${this.index + 1} / ${this.count}`
         : "";
 
-    const zoomText = `Zoom ${Math.round(this.zoom * 100)}%`;
-    if (!s) {
-      br.textContent = "";
-    } else if (s.samples === 3) {
-      br.textContent = `${this.invert ? "(inverted)\n" : ""}${zoomText}`;
-    } else {
-      br.textContent =
-        `WL ${Math.round(this.wl)}  WW ${Math.round(this.ww)}${this.invert ? "  (inverted)" : ""}\n` +
-        zoomText;
+    const lines: string[] = [];
+    if (this.playing) lines.push(`Cine ${Math.round(this.fps)} fps`);
+    const ot = orientText(this.orient);
+    if (ot) lines.push(ot);
+    if (s && s.samples === 1) {
+      lines.push(
+        `WL ${Math.round(this.wl)}  WW ${Math.round(this.ww)}${this.invert ? "  (inverted)" : ""}`,
+      );
+    } else if (s && this.invert) {
+      lines.push("(inverted)");
     }
+    if (s) lines.push(`Zoom ${Math.round(this.zoom * 100)}%`);
+    br.textContent = lines.join("\n");
   }
 
   // Orientation markers and scale bars. Independent of the text overlay mode.
@@ -478,15 +687,21 @@ export class Viewport {
     const ui = this.ui;
     const show = this.host.overlay().markers && this.current !== null;
 
-    const labels = show ? edgeLabels(this.meta) : null;
+    const base = show ? edgeLabels(this.meta) : null;
+    const labels = base ? orientedLabels(base, this.orient) : null;
     ui.markerT.textContent = labels?.top ?? "";
     ui.markerB.textContent = labels?.bottom ?? "";
     ui.markerL.textContent = labels?.left ?? "";
     ui.markerR.textContent = labels?.right ?? "";
 
-    // Horizontal ruler: the column spacing is the horizontal step in millimetres
+    // A quarter turn makes the screen's horizontal axis the image's row direction
     const colSpacing = this.meta?.pixel_spacing?.[1] ?? 0;
-    const bar = show && colSpacing > 0 ? scaleBar(this.zoom / colSpacing) : null;
+    const rowSpacing = this.meta?.pixel_spacing?.[0] ?? 0;
+    const swap = this.orient.rot % 2 === 1;
+    const hSpacing = swap ? rowSpacing : colSpacing;
+    const vSpacing = swap ? colSpacing : rowSpacing;
+
+    const bar = show && hSpacing > 0 ? scaleBar(this.zoom / hSpacing) : null;
     ui.hBar.classList.toggle("on", bar !== null);
     if (bar) {
       ui.hSvg.setAttribute("width", String(bar.px + 2));
@@ -495,9 +710,7 @@ export class Viewport {
       ui.hLabel.textContent = bar.label;
     }
 
-    // Vertical ruler: the row spacing is the vertical step in millimetres
-    const rowSpacing = this.meta?.pixel_spacing?.[0] ?? 0;
-    const barV = show && rowSpacing > 0 ? scaleBar(this.zoom / rowSpacing) : null;
+    const barV = show && vSpacing > 0 ? scaleBar(this.zoom / vSpacing) : null;
     ui.vBar.classList.toggle("on", barV !== null);
     if (barV) {
       ui.vSvg.setAttribute("width", String(SCALE_BAR_HEIGHT));
@@ -515,6 +728,207 @@ export class Viewport {
   private showError(err: unknown): void {
     console.error(err);
     this.setStatus(`Error: ${err instanceof Error ? err.message : String(err)}`, true);
+  }
+
+  // ---------- Pixel readout ----------
+
+  private valueText(s: SliceData, x: number, y: number): string {
+    const i = y * s.cols + x;
+    if (s.samples === 3) {
+      return `RGB ${s.pixels[i * 3]}, ${s.pixels[i * 3 + 1]}, ${s.pixels[i * 3 + 2]}`;
+    }
+    const v = (s.pixels[i] as number) * s.slope + s.intercept;
+    return this.meta?.modality === "CT" ? `${Math.round(v)} HU` : num(v, 1);
+  }
+
+  private updateReadout(e: MouseEvent): void {
+    const el = this.ui.readout;
+    const s = this.current;
+    if (!s || this.drag || this.host.overlay().mode === "off") {
+      el.textContent = "";
+      return;
+    }
+    const r = this.el.getBoundingClientRect();
+    const p = this.toImage(e.clientX - r.left, e.clientY - r.top);
+    const x = Math.floor(p.x);
+    const y = Math.floor(p.y);
+    if (x < 0 || y < 0 || x >= s.cols || y >= s.rows) {
+      el.textContent = "";
+      return;
+    }
+    el.textContent = `(${x}, ${y})  ${this.valueText(s, x, y)}`;
+  }
+
+  // ---------- Measurements ----------
+
+  private spacing(): Spacing | null {
+    const sp = this.meta?.pixel_spacing;
+    if (!sp || !(sp[0] > 0) || !(sp[1] > 0)) return null;
+    return { row: sp[0], col: sp[1], approx: this.meta?.spacing_is_imager ?? false };
+  }
+
+  private sliceKey(): string {
+    return `${this.series?.uid ?? ""}#${this.index}`;
+  }
+
+  /** Cancels a measurement in progress. Returns true when there was one. */
+  cancelDraft(): boolean {
+    const had = this.draft !== null;
+    this.draft = null;
+    this.measuring = false;
+    if (had) this.updateMeasurements();
+    return had;
+  }
+
+  undoMeasurement(): void {
+    if (this.cancelDraft()) return;
+    const list = this.measurements.get(this.sliceKey());
+    if (list && list.length > 0) {
+      list.pop();
+      this.updateMeasurements();
+    }
+  }
+
+  clearMeasurements(): void {
+    this.draft = null;
+    this.measuring = false;
+    this.measurements.delete(this.sliceKey());
+    this.updateMeasurements();
+  }
+
+  private startMeasure(kind: MeasureKind, p: Pt): void {
+    const d = this.draft;
+    if (kind === "angle" && d !== null && d.kind === "angle") {
+      // Angle: first click, vertex, last click
+      const [a, b] = d.pts;
+      if (d.pts.length === 2 && a) {
+        d.pts = [a, p, { ...p }];
+      } else if (d.pts.length >= 3 && a && b) {
+        this.draft = null;
+        this.commit({ kind: "angle", pts: [a, b, p] });
+      }
+      this.updateMeasurements();
+      return;
+    }
+    this.draft = { kind, pts: [p, { ...p }] };
+    this.measuring = kind !== "angle"; // the others are drawn by dragging
+    this.updateMeasurements();
+  }
+
+  private commit(d: Draft): void {
+    const s = this.current;
+    const [p0, p1, p2] = d.pts;
+    if (!s || !p0 || !p1) return;
+    const sp = this.spacing();
+
+    let lines: string[];
+    if (d.kind === "length") {
+      lines = [lengthText(p0, p1, sp)];
+    } else if (d.kind === "angle") {
+      if (!p2) return;
+      const t = angleText(p0, p1, p2, sp);
+      if (t === null) return;
+      lines = [t];
+    } else {
+      lines = roiLines(d.kind, p0, p1, s, sp, this.meta?.modality ?? "");
+    }
+
+    const key = this.sliceKey();
+    const list = this.measurements.get(key) ?? [];
+    list.push({ kind: d.kind, pts: d.pts.map((p) => ({ ...p })), lines });
+    this.measurements.set(key, list);
+  }
+
+  private finishDragMeasure(): void {
+    const d = this.draft;
+    this.draft = null;
+    const [a, b] = d?.pts ?? [];
+    if (d && a && b) {
+      const sa = this.toScreen(a);
+      const sb = this.toScreen(b);
+      if (Math.hypot(sa.x - sb.x, sa.y - sb.y) >= 4) this.commit(d); // ignore plain clicks
+    }
+    this.updateMeasurements();
+  }
+
+  // Cheap text for a measurement that is still being drawn
+  private liveLines(d: Draft): string[] {
+    const [p0, p1, p2] = d.pts;
+    if (!p0 || !p1) return [];
+    const sp = this.spacing();
+    if (d.kind === "length") return [lengthText(p0, p1, sp)];
+    if (d.kind === "angle") {
+      const t = p2 ? angleText(p0, p1, p2, sp) : null;
+      return t ? [t] : [];
+    }
+    return [`Area ${areaText(shapeAreaPx(d.kind, p0, p1), sp)}`];
+  }
+
+  private textNode(at: Pt, lines: string[]): SVGTextElement {
+    const w = this.el.clientWidth;
+    const h = this.el.clientHeight;
+    const x = clamp(at.x, 4, Math.max(4, w - 150));
+    const y = clamp(at.y, 14, Math.max(14, h - 14 * lines.length));
+    const t = svgEl("text", { x, y, class: "m-text" });
+    lines.forEach((line, i) => {
+      const span = svgEl("tspan", { x, dy: i === 0 ? 0 : 14 });
+      span.textContent = line;
+      t.append(span);
+    });
+    return t;
+  }
+
+  private shapeNodes(kind: MeasureKind, pts: Pt[], lines: string[]): SVGElement[] {
+    const s = pts.map((p) => this.toScreen(p));
+    const first = s[0];
+    const second = s[1];
+    if (!first || !second) return [];
+
+    const stroke = { stroke: MEASURE_COLOR, "stroke-width": 1.5, fill: "none" };
+    const dot = (p: Pt) => svgEl("circle", { cx: p.x, cy: p.y, r: 3, fill: MEASURE_COLOR });
+    const out: SVGElement[] = [];
+    let labelAt: Pt;
+
+    if (kind === "length") {
+      out.push(svgEl("line", { x1: first.x, y1: first.y, x2: second.x, y2: second.y, ...stroke }));
+      out.push(dot(first), dot(second));
+      labelAt = { x: (first.x + second.x) / 2 + 8, y: (first.y + second.y) / 2 - 8 };
+    } else if (kind === "angle") {
+      const third = s[2];
+      const d = [`M${first.x} ${first.y}`, `L${second.x} ${second.y}`];
+      if (third) d.push(`L${third.x} ${third.y}`);
+      out.push(svgEl("path", { d: d.join(" "), ...stroke }), dot(second));
+      labelAt = { x: second.x + 10, y: second.y - 10 };
+    } else {
+      // A quarter turn keeps boxes axis-aligned, so the screen bounding box is exact
+      const x = Math.min(first.x, second.x);
+      const y = Math.min(first.y, second.y);
+      const w = Math.abs(second.x - first.x);
+      const h = Math.abs(second.y - first.y);
+      out.push(
+        kind === "rect"
+          ? svgEl("rect", { x, y, width: w, height: h, ...stroke })
+          : svgEl("ellipse", { cx: x + w / 2, cy: y + h / 2, rx: w / 2, ry: h / 2, ...stroke }),
+      );
+      labelAt = { x, y: y + h + 14 };
+    }
+
+    if (lines.length > 0) out.push(this.textNode(labelAt, lines));
+    return out;
+  }
+
+  private updateMeasurements(): void {
+    const svg = this.ui.measure;
+    if (!this.current || this.el.hidden) {
+      svg.replaceChildren();
+      return;
+    }
+    const nodes: SVGElement[] = [];
+    for (const m of this.measurements.get(this.sliceKey()) ?? []) {
+      nodes.push(...this.shapeNodes(m.kind, m.pts, m.lines));
+    }
+    if (this.draft) nodes.push(...this.shapeNodes(this.draft.kind, this.draft.pts, this.liveLines(this.draft)));
+    svg.replaceChildren(...nodes);
   }
 
   // ---------- Mouse ----------
@@ -547,14 +961,27 @@ export class Viewport {
     );
 
     el.addEventListener("contextmenu", (e) => e.preventDefault());
+    el.addEventListener("mousemove", (e: MouseEvent) => this.updateReadout(e));
+    el.addEventListener("mouseleave", () => {
+      this.ui.readout.textContent = "";
+    });
 
     el.addEventListener("mousedown", (e: MouseEvent) => {
       this.host.activate(this);
       if (!this.current) return;
       const panOverride = e.button === 1 || e.button === 2 || (e.button === 0 && e.shiftKey);
       const r = el.getBoundingClientRect();
+      const tool = this.host.tool();
+
+      if (isMeasureTool(tool) && e.button === 0 && !panOverride) {
+        this.startMeasure(tool, this.toImage(e.clientX - r.left, e.clientY - r.top));
+        e.preventDefault();
+        return;
+      }
+
+      const mode: DragMode = panOverride || isMeasureTool(tool) ? "pan" : tool;
       this.drag = {
-        mode: panOverride ? "pan" : this.host.tool(),
+        mode,
         x: e.clientX, y: e.clientY,
         ax: e.clientX - r.left, ay: e.clientY - r.top,
         wl: this.wl, ww: this.ww,
@@ -564,9 +991,23 @@ export class Viewport {
       e.preventDefault();
     });
 
-    window.addEventListener("mouseup", () => { this.drag = null; });
+    window.addEventListener("mouseup", () => {
+      this.drag = null;
+      if (this.measuring) {
+        this.measuring = false;
+        this.finishDragMeasure();
+      }
+    });
 
     window.addEventListener("mousemove", (e: MouseEvent) => {
+      // The last point of a measurement in progress follows the cursor
+      const dr = this.draft;
+      if (dr && (dr.kind === "angle" || this.measuring)) {
+        const r = el.getBoundingClientRect();
+        dr.pts[dr.pts.length - 1] = this.toImage(e.clientX - r.left, e.clientY - r.top);
+        this.updateMeasurements();
+      }
+
       const d = this.drag;
       if (!d) return;
       const dx = e.clientX - d.x;
@@ -581,10 +1022,11 @@ export class Viewport {
           this.panY = d.panY + dy;
           this.autoFit = false;
           this.applyTransform();
+          this.updateMeasurements();
           break;
         case "zoom": {
           // Drag up to zoom in, anchored at the point where the drag started
-          const z2 = Math.min(50, Math.max(0.05, d.zoom * Math.exp(-dy * 0.01)));
+          const z2 = clamp(d.zoom * Math.exp(-dy * 0.01), 0.05, 50);
           const k = z2 / d.zoom;
           this.panX = d.ax - (d.ax - d.panX) * k;
           this.panY = d.ay - (d.ay - d.panY) * k;
@@ -600,6 +1042,9 @@ export class Viewport {
       }
     });
 
-    el.addEventListener("dblclick", () => this.fit());
+    el.addEventListener("dblclick", () => {
+      // Double clicks finish an angle or add a degenerate shape; only fit when idle
+      if (!isMeasureTool(this.host.tool())) this.fit();
+    });
   }
 }

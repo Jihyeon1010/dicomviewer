@@ -1,6 +1,8 @@
 use dicom::core::Tag;
-use dicom::dictionary_std::tags;
-use dicom::object::{DefaultDicomObject, OpenFileOptions};
+use dicom::core::dictionary::{DataDictionary, DataDictionaryEntry};
+use dicom::core::VR;
+use dicom::dictionary_std::{tags, StandardDataDictionary};
+use dicom::object::{DefaultDicomObject, InMemDicomObject, OpenFileOptions};
 use dicom::pixeldata::{DecodedPixelData, PixelDecoder};
 use rayon::prelude::*;
 use serde::Serialize;
@@ -76,6 +78,8 @@ struct SliceMeta {
     kvp: Option<f64>,
     tube_current: Option<f64>,
     pixel_spacing: Option<[f64; 2]>, // [row spacing, column spacing] in mm, as in DICOM
+    spacing_is_imager: bool, // true when the spacing comes from ImagerPixelSpacing (approximate)
+    cine_fps: Option<f64>,   // playback rate from CineRate, FrameTime or the recommended rate
     image_orientation: Option<[f64; 6]>, // row cosines, then column cosines (patient LPS)
     patient_orientation: String, // raw "row\column" codes, used by projection images
     frame: u32,
@@ -701,9 +705,19 @@ fn get_slice_meta(
     let (path, frame) = slice_ref(&state, &uid, index)?;
     let obj = open_cached(&state, &path)?;
 
-    let spacing = multi_f64(&obj, tags::PIXEL_SPACING)
-        .or_else(|| multi_f64(&obj, tags::IMAGER_PIXEL_SPACING)) // projection radiography
+    // PixelSpacing is calibrated to the patient; ImagerPixelSpacing is measured at the
+    // detector, so lengths based on it are only approximate (projection radiography)
+    let patient_spacing = multi_f64(&obj, tags::PIXEL_SPACING).filter(|v| v.len() >= 2);
+    let used_imager = patient_spacing.is_none();
+    let spacing = patient_spacing
+        .or_else(|| multi_f64(&obj, tags::IMAGER_PIXEL_SPACING))
         .and_then(|v| if v.len() >= 2 { Some([v[0], v[1]]) } else { None });
+    let spacing_is_imager = used_imager && spacing.is_some();
+
+    let cine_fps = opt_f64(&obj, tags::CINE_RATE)
+        .or_else(|| opt_f64(&obj, tags::FRAME_TIME).filter(|t| *t > 0.0).map(|t| 1000.0 / t))
+        .or_else(|| opt_f64(&obj, tags::RECOMMENDED_DISPLAY_FRAME_RATE))
+        .filter(|f| f.is_finite() && *f > 0.0);
 
     // Fall back to the z component of ImagePositionPatient when SliceLocation is absent
     let slice_location = opt_f64(&obj, tags::SLICE_LOCATION).or_else(|| {
@@ -744,6 +758,8 @@ fn get_slice_meta(
         kvp: opt_f64(&obj, tags::KVP),
         tube_current: opt_f64(&obj, tags::X_RAY_TUBE_CURRENT),
         pixel_spacing: spacing,
+        spacing_is_imager,
+        cine_fps,
         image_orientation: orientation,
         patient_orientation: text_of(&obj, tags::PATIENT_ORIENTATION),
         frame,
@@ -1009,8 +1025,121 @@ pub fn run() {
             get_slice,
             get_slice_meta,
             get_thumbnail,
-            build_volume
+            build_volume,
+            get_tags,
+            save_png
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+// ---------- DICOM tag dump ----------
+
+const MAX_TAG_ENTRIES: usize = 5000;
+const MAX_VALUE_CHARS: usize = 300;
+
+#[derive(Serialize)]
+struct TagEntry {
+    depth: u32,
+    tag: String,   // "(0008,0060)"
+    name: String,  // dictionary alias, e.g. "Modality"
+    vr: String,
+    value: String,
+}
+
+fn clip(s: &str) -> String {
+    if s.chars().count() > MAX_VALUE_CHARS {
+        let head: String = s.chars().take(MAX_VALUE_CHARS).collect();
+        format!("{head}…")
+    } else {
+        s.to_string()
+    }
+}
+
+// Flattens a dataset (and the items of its sequences) into display rows
+fn dump_tags(obj: &InMemDicomObject, depth: u32, out: &mut Vec<TagEntry>) {
+    for e in obj.iter() {
+        if out.len() >= MAX_TAG_ENTRIES {
+            return;
+        }
+        let tag = e.header().tag;
+        let vr = e.header().vr();
+        let name = StandardDataDictionary
+            .by_tag(tag)
+            .map(|d| d.alias().to_string())
+            .unwrap_or_else(|| "(private or unknown)".to_string());
+
+        let items = e.value().items();
+        let value = if tag == tags::PIXEL_DATA {
+            "(pixel data)".to_string()
+        } else if let Some(items) = items {
+            format!("Sequence, {} item(s)", items.len())
+        } else if matches!(vr, VR::OB | VR::OW | VR::OD | VR::OF | VR::OL | VR::UN) {
+            let len = e.to_bytes().map(|b| b.len()).unwrap_or(0);
+            format!("(binary, {len} bytes)")
+        } else {
+            let text = e
+                .to_str()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|_| format!("{:?}", e.value()));
+            clip(text.trim_matches(|c: char| c.is_whitespace() || c == '\0'))
+        };
+
+        out.push(TagEntry {
+            depth,
+            tag: format!("({:04X},{:04X})", tag.group(), tag.element()),
+            name,
+            vr: String::from(vr.to_string()),
+            value,
+        });
+
+        if let Some(items) = items {
+            for item in items {
+                dump_tags(item, depth + 1, out);
+            }
+        }
+    }
+}
+
+#[tauri::command(async)]
+fn get_tags(
+    uid: String,
+    index: usize,
+    state: tauri::State<AppState>,
+) -> Result<Vec<TagEntry>, String> {
+    let (path, _frame) = slice_ref(&state, &uid, index)?;
+    let obj = open_cached(&state, &path)?;
+
+    let mut out = vec![TagEntry {
+        depth: 0,
+        tag: "(0002,0010)".into(),
+        name: "TransferSyntaxUID".into(),
+        vr: "UI".into(),
+        value: obj.meta().transfer_syntax().to_string(),
+    }];
+    dump_tags(&obj, 0, &mut out);
+    Ok(out)
+}
+
+// ---------- PNG saving ----------
+
+// Raw request body: [path length u32 LE][path, UTF-8][PNG bytes]
+#[tauri::command(async)]
+fn save_png(request: tauri::ipc::Request<'_>) -> Result<(), String> {
+    let tauri::ipc::InvokeBody::Raw(data) = request.body() else {
+        return Err("Expected raw bytes".into());
+    };
+    if data.len() < 4 {
+        return Err("Payload too short".into());
+    }
+    let n = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+    let end = 4usize
+        .checked_add(n)
+        .filter(|&e| e <= data.len())
+        .ok_or("Invalid path length")?;
+    let path = std::str::from_utf8(&data[4..end]).map_err(|e| e.to_string())?;
+    if !path.to_ascii_lowercase().ends_with(".png") {
+        return Err("Only .png files can be written".into());
+    }
+    std::fs::write(path, &data[end..]).map_err(|e| e.to_string())
 }

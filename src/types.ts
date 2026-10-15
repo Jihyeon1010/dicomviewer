@@ -44,6 +44,8 @@ export interface SliceMeta {
   patient_orientation: string; // raw "row\column" codes, e.g. "L\F"
   frame: number;
   frame_count: number;
+  spacing_is_imager: boolean; // spacing comes from ImagerPixelSpacing (approximate)
+  cine_fps: number | null;    // playback rate stored in the file
 }
 
 // Mirrors the VolumeInfo struct in lib.rs
@@ -65,4 +67,13 @@ export interface SeriesGeometry {
   frame_of_reference: string;
   normal: [number, number, number] | null;
   positions: number[] | null; // mm along the normal, one per image, ascending
+}
+
+// Mirrors the TagEntry struct in lib.rs
+export interface TagEntry {
+  depth: number;
+  tag: string;   // "(0008,0060)"
+  name: string;
+  vr: string;
+  value: string;
 }

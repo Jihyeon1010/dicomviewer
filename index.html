@@ -21,6 +21,13 @@
       <button class="tool" data-tool="scroll">Scroll</button>
     </div>
 
+    <div class="group" id="measure-tools" role="toolbar" aria-label="Measurement tools">
+      <button class="tool" data-tool="length">Length</button>
+      <button class="tool" data-tool="angle">Angle</button>
+      <button class="tool" data-tool="ellipse">Ellipse</button>
+      <button class="tool" data-tool="rect">Rect</button>
+    </div>
+
     <div class="group" id="layout-wrap">
       <button id="layout-btn" aria-haspopup="true" aria-expanded="false">Layout: 1 × 1</button>
       <div id="layout-pop" hidden>
@@ -42,10 +49,22 @@
     </div>
 
     <div class="group">
+      <button id="rot-ccw">Rot L</button>
+      <button id="rot-cw">Rot R</button>
+      <button id="flip-h">Flip H</button>
+      <button id="flip-v">Flip V</button>
+    </div>
+
+    <div class="group">
+      <button id="cine">Play</button>
+    </div>
+
+    <div class="group">
       <button id="info">Info: Full</button>
       <button id="markers">Markers</button>
       <button id="slider-pos">Slider: Bottom</button>
       <button id="anonymize">Anonymize</button>
+      <button id="tags-btn">Tags</button>
       <button id="settings-open">Settings</button>
     </div>
   </header>
@@ -79,6 +98,21 @@
         <div id="keys-notice" role="status"></div>
         <div id="keys-list"></div>
       </div>
+    </div>
+  </div>
+
+  <div id="tags-backdrop" hidden>
+    <div id="tags" role="dialog" aria-modal="true" aria-labelledby="tags-title">
+      <div class="dialog-head">
+        <h2 id="tags-title">DICOM tags</h2>
+        <button id="tags-close" type="button">Close</button>
+      </div>
+      <div id="tags-bar">
+        <input id="tags-search" type="search" placeholder="Filter by tag, name or value" />
+        <span id="tags-count"></span>
+      </div>
+      <div id="tags-note"></div>
+      <div id="tags-list"></div>
     </div>
   </div>
 </body>
