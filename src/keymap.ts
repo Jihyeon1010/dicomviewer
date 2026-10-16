@@ -46,10 +46,13 @@ export const ACTIONS: ActionDef[] = [
   { id: "tool.angle", label: "Angle measurement", group: "Tools", defaults: ["KeyG"] },
   { id: "tool.ellipse", label: "Elliptical ROI", group: "Tools", defaults: ["KeyC"] },
   { id: "tool.rect", label: "Rectangular ROI", group: "Tools", defaults: ["KeyX"] },
+  { id: "tool.aneurysm", label: "Aneurysm measurement", group: "Tools", defaults: ["KeyN"] },
+  { id: "tool.calibrate", label: "Calibrate length", group: "Tools", defaults: ["KeyJ"] },
   { id: "tool.cross", label: "Crosshair tool (MPR)", group: "Tools", defaults: ["KeyK"] },
 
   { id: "measure.undo", label: "Delete last measurement", group: "Measurements", defaults: ["Backspace", "Delete"] },
   { id: "measure.clear", label: "Clear measurements on this image", group: "Measurements", defaults: ["Shift+Backspace", "Shift+Delete"] },
+  { id: "calibration.clear", label: "Remove calibration", group: "Measurements", defaults: ["Shift+KeyJ"] },
 
   { id: "view.invert", label: "Invert image", group: "Window", defaults: ["KeyI"] },
   { id: "view.resetWindow", label: "Reset window", group: "Window", defaults: ["KeyR"] },

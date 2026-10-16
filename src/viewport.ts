@@ -7,7 +7,15 @@ import {
   scaleBarPath,
   scaleBarPathVertical,
 } from "./guides";
-import { angleText, areaText, lengthText, roiLines, shapeAreaPx, type Spacing } from "./measure";
+import {
+  aneurysmLines,
+  angleText,
+  areaText,
+  lengthText,
+  roiLines,
+  shapeAreaPx,
+  type Spacing,
+} from "./measure";
 import { GLRenderer } from "./renderer";
 import type { OverlayMode } from "./settings";
 import { seriesSource, sliceCache, type SliceSource } from "./slice-cache";
@@ -28,12 +36,12 @@ import type { SeriesGeometry, SeriesInfo, SliceData, SliceMeta } from "./types";
 import { autoOrient, type OrientMode } from "./orient-auto";
 import type { Plane } from "./types";
 
-export type MeasureKind = "length" | "angle" | "ellipse" | "rect";
-export type ToolId = "window" | "pan" | "zoom" | "scroll" | "cross" | MeasureKind;
+export type MeasureKind = "length" | "angle" | "ellipse" | "rect" | "aneurysm";
+export type ToolId = "window" | "pan" | "zoom" | "scroll" | "cross" | "calibrate" | MeasureKind;
 type DragMode = "window" | "pan" | "zoom" | "scroll";
 
 export function isMeasureTool(t: ToolId): t is MeasureKind {
-  return t === "length" || t === "angle" || t === "ellipse" || t === "rect";
+  return t === "length" || t === "angle" || t === "ellipse" || t === "rect" || t === "aneurysm";
 }
 
 /** A line across the whole image that marks where another plane cuts this view. */
@@ -59,6 +67,9 @@ export interface ViewportHost {
   stateChanged(vp: Viewport): void;  // anything the toolbar shows
   pick(vp: Viewport, p: Pt): void;   // the crosshair tool was used at an image position
   orientMode(): OrientMode;
+  // The user measured a known length with the calibration tool. The host asks for the real
+  // length and calls setCalibration() with the answer.
+  calibrate(vp: Viewport, pixels: number): void;
 }
 
 interface Drag {
@@ -68,6 +79,11 @@ interface Drag {
   wl: number; ww: number;
   panX: number; panY: number; zoom: number;
   index: number;
+}
+
+// A pixel spacing set by the user from an object of known size (millimetres per pixel)
+export interface Calibration {
+  mmPerPixel: number;
 }
 
 // A finished measurement; points are in image coordinates, the text is fixed at creation
@@ -302,6 +318,9 @@ export class Viewport {
   private measurements = new Map<string, Measurement[]>(); // keyed by source and image
   private draft: Draft | null = null;
   private measuring = false; // mouse button held while drawing a drag-style measurement
+  private calibration: Calibration | null = null;
+  private calibrating = false; // the drag in progress measures a calibration length
+  private aneurysmPts: Pt[] = []; // clicks collected so far for the aneurysm template
   private refLines: RefLine[] = [];
   private crossing = false; // mouse button held with the crosshair tool
   private crossRaf = 0;
@@ -779,8 +798,11 @@ export class Viewport {
     const full = o.mode === "full" && !this.isSmall();
     tl.textContent = full && m ? patientLines(m, o.anonymize).join("\n") : "";
     tr.textContent = full ? studyLines(m, series.description, o.anonymize).join("\n") : "";
+    const calibLine = this.calibration
+      ? [`Px ${num(this.calibration.mmPerPixel, 3)} × ${num(this.calibration.mmPerPixel, 3)} mm (calibrated)`]
+      : [];
     bl.textContent = full
-      ? [...imageLines(this.index, this.count, s, m), ...this.extraLines].join("\n")
+      ? [...imageLines(this.index, this.count, s, m), ...calibLine, ...this.extraLines].join("\n")
       : this.count
         ? `Im ${this.index + 1} / ${this.count}`
         : "";
@@ -813,8 +835,9 @@ export class Viewport {
     ui.markerR.textContent = labels?.right ?? "";
 
     // A quarter turn makes the screen's horizontal axis the image's row direction
-    const colSpacing = this.meta?.pixel_spacing?.[1] ?? 0;
-    const rowSpacing = this.meta?.pixel_spacing?.[0] ?? 0;
+    const cal = this.calibration?.mmPerPixel ?? 0;
+    const colSpacing = cal > 0 ? cal : (this.meta?.pixel_spacing?.[1] ?? 0);
+    const rowSpacing = cal > 0 ? cal : (this.meta?.pixel_spacing?.[0] ?? 0);
     const swap = this.orient.rot % 2 === 1;
     const hSpacing = swap ? rowSpacing : colSpacing;
     const vSpacing = swap ? colSpacing : rowSpacing;
@@ -880,9 +903,37 @@ export class Viewport {
   // ---------- Measurements ----------
 
   private spacing(): Spacing | null {
+    // A calibration set by the user comes first; it is only possible when the file has no
+    // patient-calibrated spacing of its own
+    if (this.calibration) {
+      const m = this.calibration.mmPerPixel;
+      return { row: m, col: m, approx: true };
+    }
     const sp = this.meta?.pixel_spacing;
     if (!sp || !(sp[0] > 0) || !(sp[1] > 0)) return null;
     return { row: sp[0], col: sp[1], approx: this.meta?.spacing_is_imager ?? false };
+  }
+
+  /** True when the file itself carries a spacing that was calibrated to the patient. */
+  hasFileSpacing(): boolean {
+    const sp = this.meta?.pixel_spacing;
+    return !!sp && sp[0] > 0 && sp[1] > 0 && !this.meta?.spacing_is_imager;
+  }
+
+  get calibrated(): boolean {
+    return this.calibration !== null;
+  }
+
+  /** Sets (or with null removes) the user's calibration for everything shown in this view. */
+  setCalibration(mmPerPixel: number | null): void {
+    this.calibration =
+      mmPerPixel !== null && Number.isFinite(mmPerPixel) && mmPerPixel > 0
+        ? { mmPerPixel }
+        : null;
+    // Measurements keep the text they were created with; they would otherwise mix units
+    this.measurements.clear();
+    this.refreshOverlay();
+    this.host.stateChanged(this);
   }
 
   private sliceKey(): string {
@@ -891,9 +942,11 @@ export class Viewport {
 
   /** Cancels a measurement in progress. Returns true when there was one. */
   cancelDraft(): boolean {
-    const had = this.draft !== null;
+    const had = this.draft !== null || this.aneurysmPts.length > 0;
     this.draft = null;
+    this.aneurysmPts = [];
     this.measuring = false;
+    this.calibrating = false;
     if (had) this.updateMeasurements();
     return had;
   }
@@ -914,8 +967,37 @@ export class Viewport {
     this.updateMeasurements();
   }
 
-  private startMeasure(kind: MeasureKind, p: Pt): void {
+  private startMeasure(kind: MeasureKind | "calibrate", p: Pt): void {
     const d = this.draft;
+
+    if (kind === "aneurysm") {
+      // Three clicks give the neck and the dome; a fourth gives the widest part of the dome
+      const pts = this.aneurysmPts;
+      if (pts.length === 0) {
+        this.aneurysmPts = [p, { ...p }];
+        this.draft = { kind: "aneurysm", pts: this.aneurysmPts };
+      } else if (pts.length === 2) {
+        pts[1] = p;
+        pts.push({ ...p });
+      } else if (pts.length === 3) {
+        pts[2] = p;
+        pts.push({ ...p });
+      } else if (pts.length === 4) {
+        pts[3] = p;
+        pts.push({ ...p });
+      }
+      this.updateMeasurements();
+      return;
+    }
+
+    if (kind === "calibrate") {
+      this.draft = { kind: "length", pts: [p, { ...p }] };
+      this.measuring = true;
+      this.calibrating = true;
+      this.updateMeasurements();
+      return;
+    }
+
     if (kind === "angle" && d !== null && d.kind === "angle") {
       // Angle: first click, vertex, last click
       const [a, b] = d.pts;
@@ -937,6 +1019,7 @@ export class Viewport {
     const s = this.current;
     const [p0, p1, p2] = d.pts;
     if (!s || !p0 || !p1) return;
+    if (d.kind === "aneurysm") return; // finished by finishAneurysm()
     const sp = this.spacing();
 
     let lines: string[];
@@ -959,18 +1042,68 @@ export class Viewport {
 
   private finishDragMeasure(): void {
     const d = this.draft;
+    const calibrating = this.calibrating;
+    this.calibrating = false;
     this.draft = null;
     const [a, b] = d?.pts ?? [];
     if (d && a && b) {
       const sa = this.toScreen(a);
       const sb = this.toScreen(b);
-      if (Math.hypot(sa.x - sb.x, sa.y - sb.y) >= 4) this.commit(d); // ignore plain clicks
+      if (Math.hypot(sa.x - sb.x, sa.y - sb.y) >= 4) {
+        if (calibrating) {
+          // The distance in image pixels; the host asks for the real length
+          this.host.calibrate(this, Math.hypot(b.x - a.x, b.y - a.y));
+        } else {
+          this.commit(d); // ignore plain clicks
+        }
+      }
     }
     this.updateMeasurements();
   }
 
+  /** Finishes the aneurysm template with the points collected so far (at least 3 clicks). */
+  finishAneurysm(): void {
+    const p = this.aneurysmPts;
+    this.aneurysmPts = [];
+    this.draft = null;
+    const neckA = p[0];
+    const neckB = p[1];
+    const dome = p[2];
+    const wa = p[3];
+    const wb = p[4];
+    const s = this.current;
+    if (s && neckA && neckB && dome) {
+      const domeWidth: [Pt, Pt] | undefined = wa && wb ? [wa, wb] : undefined;
+      const lines = aneurysmLines(
+        domeWidth ? { neckA, neckB, dome, domeWidth } : { neckA, neckB, dome },
+        this.spacing(),
+      );
+      const key = this.sliceKey();
+      const list = this.measurements.get(key) ?? [];
+      list.push({
+        kind: "aneurysm",
+        pts: [neckA, neckB, dome, ...(domeWidth ?? [])].map((q) => ({ ...q })),
+        lines,
+      });
+      this.measurements.set(key, list);
+    }
+    this.updateMeasurements();
+  }
+
+  /** Enter finishes an aneurysm measurement that has its three main points. */
+  finishAneurysmIfPending(): boolean {
+    if (this.aneurysmPts.length < 3) return false;
+    this.finishAneurysm();
+    return true;
+  }
+
   // Cheap text for a measurement that is still being drawn
   private liveLines(d: Draft): string[] {
+    if (d.kind === "aneurysm") {
+      const [a, b, c] = d.pts;
+      if (!a || !b || !c || d.pts.length < 3) return ["Neck: click two points"];
+      return aneurysmLines({ neckA: a, neckB: b, dome: c }, this.spacing());
+    }
     const [p0, p1, p2] = d.pts;
     if (!p0 || !p1) return [];
     const sp = this.spacing();
@@ -1011,6 +1144,28 @@ export class Viewport {
       out.push(svgEl("line", { x1: first.x, y1: first.y, x2: second.x, y2: second.y, ...stroke }));
       out.push(dot(first), dot(second));
       labelAt = { x: (first.x + second.x) / 2 + 8, y: (first.y + second.y) / 2 - 8 };
+    } 
+    if (kind === "aneurysm") {
+      const [a, b, c, wa, wb] = s;
+      if (a && b) {
+        out.push(svgEl("line", { x1: a.x, y1: a.y, x2: b.x, y2: b.y, ...stroke }), dot(a), dot(b));
+      }
+      if (a && b && c) {
+        // A line from the middle of the neck to the dome point shows the height
+        const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+        out.push(
+          svgEl("line", {
+            x1: mid.x, y1: mid.y, x2: c.x, y2: c.y, ...stroke, "stroke-dasharray": "4 3",
+          }),
+          dot(c),
+        );
+      }
+      if (wa && wb) {
+        out.push(svgEl("line", { x1: wa.x, y1: wa.y, x2: wb.x, y2: wb.y, ...stroke }), dot(wa), dot(wb));
+      }
+      const label = a && b ? { x: Math.max(a.x, b.x) + 10, y: Math.min(a.y, b.y) } : first;
+      if (lines.length > 0) out.push(this.textNode(label, lines));
+      return out;
     } else if (kind === "angle") {
       const third = s[2];
       const d = [`M${first.x} ${first.y}`, `L${second.x} ${second.y}`];
@@ -1123,6 +1278,12 @@ export class Viewport {
       const r = el.getBoundingClientRect();
       const tool = this.host.tool();
 
+      if (tool === "calibrate" && e.button === 0 && !panOverride) {
+        this.startMeasure("calibrate", this.toImage(e.clientX - r.left, e.clientY - r.top));
+        e.preventDefault();
+        return;
+      }
+
       if (isMeasureTool(tool) && e.button === 0 && !panOverride) {
         this.startMeasure(tool, this.toImage(e.clientX - r.left, e.clientY - r.top));
         e.preventDefault();
@@ -1136,7 +1297,9 @@ export class Viewport {
       }
 
       const mode: DragMode =
-        panOverride || isMeasureTool(tool) || tool === "cross" ? "pan" : tool;
+        panOverride || isMeasureTool(tool) || tool === "cross" || tool === "calibrate"
+          ? "pan"
+          : tool;
       this.drag = {
         mode,
         x: e.clientX, y: e.clientY,
@@ -1162,7 +1325,7 @@ export class Viewport {
 
       // The last point of a measurement in progress follows the cursor
       const dr = this.draft;
-      if (dr && (dr.kind === "angle" || this.measuring)) {
+      if (dr && (dr.kind === "angle" || dr.kind === "aneurysm" || this.measuring)) {
         const r = el.getBoundingClientRect();
         dr.pts[dr.pts.length - 1] = this.toImage(e.clientX - r.left, e.clientY - r.top);
         this.updateMeasurements();
@@ -1203,9 +1366,13 @@ export class Viewport {
     });
 
     el.addEventListener("dblclick", () => {
-      // Double clicks finish an angle or add a degenerate shape; only fit when idle
+      // A double click finishes an aneurysm measurement; otherwise it fits the image
+      if (this.aneurysmPts.length >= 3) {
+        this.finishAneurysm();
+        return;
+      }
       const tool = this.host.tool();
-      if (!isMeasureTool(tool) && tool !== "cross") this.fit();
+      if (!isMeasureTool(tool) && tool !== "cross" && tool !== "calibrate") this.fit();
     });
   }
 }

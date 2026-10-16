@@ -55,6 +55,13 @@ const settingsBtn = byId("settings-open", HTMLButtonElement);
 const syncScrollBtn = byId("sync-scroll", HTMLButtonElement);
 const syncWindowBtn = byId("sync-window", HTMLButtonElement);
 const mprBtn = byId("mpr", HTMLButtonElement);
+const calBackdrop = byId("cal-backdrop", HTMLDivElement);
+const calInfo = byId("cal-info", HTMLDivElement);
+const calValue = byId("cal-value", HTMLInputElement);
+const calUnit = byId("cal-unit", HTMLSelectElement);
+const calOk = byId("cal-ok", HTMLButtonElement);
+const calCancel = byId("cal-cancel", HTMLButtonElement);
+const calError = byId("cal-error", HTMLDivElement);
 const orientModeBtn = byId("orient-mode", HTMLButtonElement);
 const crossBtn = byId("cross", HTMLButtonElement);
 const slabModeSel = byId("slab-mode", HTMLSelectElement);
@@ -156,6 +163,8 @@ const TOOL_TIPS: Record<string, string> = {
   angle: "Measure an angle (three clicks)",
   ellipse: "Elliptical ROI",
   rect: "Rectangular ROI",
+  calibrate: "Calibrate: measure an object of known size, then enter its real length",
+  aneurysm: "Aneurysm: neck (2 clicks), dome (1 click), then optionally the dome width (2 clicks); double click or Enter to finish",
 };
 
 // Tooltips and preset labels are generated from the keymap, so they never go stale
@@ -226,6 +235,7 @@ const host: ViewportHost = {
   },
   pick: (vp, p) => mpr?.pick(vp, p),
   orientMode: () => orientMode,
+  calibrate: (vp, pixels) => askCalibration(vp, pixels),
 };
 
 // Viewports are created on demand when the layout grows and are then kept,
@@ -416,6 +426,59 @@ document.addEventListener("mousedown", (e: MouseEvent) => {
   if (layoutPop.hidden) return;
   if (e.target instanceof Node && layoutWrap.contains(e.target)) return;
   closeLayoutPicker();
+});
+
+// ---------- Calibration ----------
+let calTarget: { vp: Viewport; pixels: number } | null = null;
+
+const calOpen = (): boolean => !calBackdrop.hidden;
+
+function askCalibration(vp: Viewport, pixels: number): void {
+  if (vp.hasFileSpacing()) {
+    flashStatus("This image already has a calibrated pixel spacing in its file");
+    return;
+  }
+  calTarget = { vp, pixels };
+  calInfo.textContent = `The line you drew is ${num(pixels, 1)} pixels long. Enter its real length.`;
+  calValue.value = "";
+  calError.textContent = "";
+  calBackdrop.hidden = false;
+  calValue.focus();
+}
+
+function closeCalibration(): void {
+  calBackdrop.hidden = true;
+  calTarget = null;
+}
+
+function confirmCalibration(): void {
+  if (!calTarget) return;
+  const value = Number(calValue.value.replace(",", "."));
+  if (!Number.isFinite(value) || value <= 0) {
+    calError.textContent = "Enter a length greater than zero";
+    return;
+  }
+  const mm = calUnit.value === "cm" ? value * 10 : value;
+  const mmPerPixel = mm / calTarget.pixels;
+  calTarget.vp.setCalibration(mmPerPixel);
+  closeCalibration();
+  flashStatus(`Calibrated: ${num(mmPerPixel, 3)} mm per pixel`);
+}
+
+calOk.addEventListener("click", confirmCalibration);
+calCancel.addEventListener("click", closeCalibration);
+calBackdrop.addEventListener("click", (e) => {
+  if (e.target === calBackdrop) closeCalibration();
+});
+calValue.addEventListener("keydown", (e: KeyboardEvent) => {
+  if (e.key === "Enter") {
+    e.preventDefault();
+    confirmCalibration();
+  } else if (e.key === "Escape") {
+    e.preventDefault();
+    closeCalibration();
+  }
+  e.stopPropagation(); // typing a number must not trigger viewer shortcuts
 });
 
 // ---------- Tools ----------
@@ -930,7 +993,7 @@ const tagsDialog = createTagsDialog({
   anonymize: () => anonymize,
 });
 
-const modalOpen = (): boolean => dialog.isOpen() || tagsDialog.isOpen();
+const modalOpen = (): boolean => dialog.isOpen() || tagsDialog.isOpen() || calOpen();
 
 function openSettings(): void {
   if (tagsDialog.isOpen()) tagsDialog.close();
@@ -982,6 +1045,12 @@ const handlers: Record<string, () => void> = {
   "tool.angle": () => setTool("angle"),
   "tool.ellipse": () => setTool("ellipse"),
   "tool.rect": () => setTool("rect"),
+  "tool.calibrate": () => setTool("calibrate"),
+  "tool.aneurysm": () => setTool("aneurysm"),
+  "calibration.clear": () => {
+    active.setCalibration(null);
+    flashStatus("Calibration removed");
+  },
   "measure.undo": () => active.undoMeasurement(),
   "measure.clear": () => active.clearMeasurements(),
   "cine.toggle": () => active.togglePlay(),
@@ -1014,6 +1083,11 @@ window.addEventListener("keydown", (e: KeyboardEvent) => {
   // While a dialog is open it owns the keyboard (including key capture)
   if (dialog.handleKey(e)) return;
   if (tagsDialog.handleKey(e)) return;
+
+  if (e.key === "Enter" && active.finishAneurysmIfPending()) {
+    e.preventDefault();
+    return;
+  }
 
   if (e.key === "Escape") {
     if (!layoutPop.hidden) {

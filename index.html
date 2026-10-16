@@ -26,6 +26,8 @@
       <button class="tool ib" data-tool="angle" aria-label="Angle"><span class="ic" data-icon="angle"></span></button>
       <button class="tool ib" data-tool="ellipse" aria-label="Elliptical ROI"><span class="ic" data-icon="ellipse"></span></button>
       <button class="tool ib" data-tool="rect" aria-label="Rectangular ROI"><span class="ic" data-icon="rect"></span></button>
+      <button class="tool ib" data-tool="aneurysm" aria-label="Aneurysm"><span class="ic" data-icon="aneurysm"></span></button>
+      <button class="tool ib" data-tool="calibrate" aria-label="Calibrate length"><span class="ic" data-icon="calibrate"></span></button>
     </div>
 
     <div class="group" id="layout-wrap">
@@ -135,6 +137,30 @@
       </div>
       <div id="tags-note"></div>
       <div id="tags-list"></div>
+    </div>
+  </div>
+    <div id="cal-backdrop" hidden>
+    <div id="cal" role="dialog" aria-modal="true" aria-labelledby="cal-title">
+      <div class="dialog-head"><h2 id="cal-title">Calibrate length</h2></div>
+      <div id="cal-body">
+        <div id="cal-info"></div>
+        <div id="cal-row">
+          <input id="cal-value" type="text" inputmode="decimal" placeholder="Real length" />
+          <select id="cal-unit" aria-label="Unit">
+            <option value="mm">mm</option>
+            <option value="cm">cm</option>
+          </select>
+        </div>
+        <div id="cal-error" role="alert"></div>
+        <div id="cal-note">
+          Valid only where the object and the structure of interest are at the same distance
+          from the detector. The result is an approximation, not a clinical measurement.
+        </div>
+        <div id="cal-actions">
+          <button id="cal-cancel" type="button">Cancel</button>
+          <button id="cal-ok" type="button" class="active">Calibrate</button>
+        </div>
+      </div>
     </div>
   </div>
 </body>

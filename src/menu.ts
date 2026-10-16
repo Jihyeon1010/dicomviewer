@@ -36,7 +36,10 @@ type StdItem =
   | "Minimize" | "Maximize" | "Fullscreen" | "CloseWindow" | "Quit"
   | "Hide" | "HideOthers" | "ShowAll" | "Services";
 
-const TOOL_IDS = ["window", "pan", "zoom", "scroll", "cross", "length", "angle", "ellipse", "rect"];
+const TOOL_IDS = [
+  "window", "pan", "zoom", "scroll", "cross", "length", "angle", "ellipse", "rect",
+  "aneurysm", "calibrate",
+];
 
 export async function installMenu(deps: MenuDeps): Promise<AppMenu> {
   const checks = new Map<string, CheckMenuItem>();
@@ -137,6 +140,10 @@ export async function installMenu(deps: MenuDeps): Promise<AppMenu> {
       await check("tool.angle", "Angle", () => deps.run("tool.angle")),
       await check("tool.ellipse", "Elliptical ROI", () => deps.run("tool.ellipse")),
       await check("tool.rect", "Rectangular ROI", () => deps.run("tool.rect")),
+      await check("tool.aneurysm", "Aneurysm", () => deps.run("tool.aneurysm")),
+      await std("Separator"),
+      await check("tool.calibrate", "Calibrate Length", () => deps.run("tool.calibrate")),
+      await key("Remove Calibration", "calibration.clear"),
       await std("Separator"),
       await key("Delete Last Measurement", "measure.undo"),
       await key("Clear Measurements on This Image", "measure.clear"),

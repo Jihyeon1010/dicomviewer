@@ -63,6 +63,10 @@ const ICONS = {
   locate: '<circle cx="12" cy="12" r="3"/><path d="M12 2v5M12 17v5M2 12h5M17 12h5"/>',
   compass:
     '<circle cx="12" cy="12" r="9"/><path d="M16.2 7.8 14 14l-6.2 2.2L10 10z"/>',
+  aneurysm:
+    '<path d="M8 20h8"/><path d="M9 20c0-4-4-5-4-9a7 7 0 0 1 14 0c0 4-4 5-4 9"/><path d="M8 20h8" />',
+  calibrate:
+    '<path d="M3 7h18M3 17h18M7 7v4M12 7v3M17 7v4M7 17v-4M12 17v-3M17 17v-4"/>',
   mpr: '<path d="M21 8 12 3 3 8v8l9 5 9-5z"/><path d="M3 8l9 5 9-5M12 13v8"/>',
   list: '<path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/>',
   cog:

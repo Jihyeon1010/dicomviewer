@@ -105,3 +105,50 @@ export function roiLines(
   );
   return lines;
 }
+
+// ---------- Aneurysm template ----------
+
+export interface AneurysmPoints {
+  neckA: Pt;
+  neckB: Pt;
+  dome: Pt; // the point of the dome that is farthest from the neck
+  domeWidth?: [Pt, Pt]; // the widest part of the dome, measured across it
+}
+
+const toMm = (a: Pt, b: Pt, sp: Spacing | null): number => {
+  const kx = sp ? sp.col : 1;
+  const ky = sp ? sp.row : 1;
+  return Math.hypot((b.x - a.x) * kx, (b.y - a.y) * ky);
+};
+
+// Distance from `p` to the line through `a` and `b`, measured the same way as lengths
+function distanceToLine(p: Pt, a: Pt, b: Pt, sp: Spacing | null): number {
+  const kx = sp ? sp.col : 1;
+  const ky = sp ? sp.row : 1;
+  const ax = a.x * kx;
+  const ay = a.y * ky;
+  const dx = b.x * kx - ax;
+  const dy = b.y * ky - ay;
+  const len = Math.hypot(dx, dy);
+  if (len < 1e-9) return Math.hypot(p.x * kx - ax, p.y * ky - ay);
+  return Math.abs(dx * (p.y * ky - ay) - dy * (p.x * kx - ax)) / len;
+}
+
+export function aneurysmLines(pts: AneurysmPoints, sp: Spacing | null): string[] {
+  const unit = sp ? "mm" : "px";
+  const mark = sp?.approx ? "≈ " : "";
+  const fmt = (v: number): string => `${mark}${num(v, v >= 10 ? 1 : 2)} ${unit}`;
+
+  const neck = toMm(pts.neckA, pts.neckB, sp);
+  const height = distanceToLine(pts.dome, pts.neckA, pts.neckB, sp);
+  const lines = [`Neck ${fmt(neck)}`, `Dome height ${fmt(height)}`];
+  if (neck > 1e-9) lines.push(`Aspect ratio ${num(height / neck, 2)}`);
+
+  if (pts.domeWidth) {
+    const width = toMm(pts.domeWidth[0], pts.domeWidth[1], sp);
+    lines.push(`Dome width ${fmt(width)}`);
+    if (neck > 1e-9) lines.push(`Dome/neck ${num(width / neck, 2)}`);
+  }
+  lines.push("(one plane)");
+  return lines;
+}
