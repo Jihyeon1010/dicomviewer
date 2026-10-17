@@ -37,7 +37,7 @@ type StdItem =
   | "Hide" | "HideOthers" | "ShowAll" | "Services";
 
 const TOOL_IDS = [
-  "window", "pan", "zoom", "scroll", "cross", "length", "angle", "ellipse", "rect",
+  "window", "pan", "zoom", "scroll", "cross", "rotate", "length", "angle", "ellipse", "rect",
   "aneurysm", "calibrate",
 ];
 
@@ -135,6 +135,7 @@ export async function installMenu(deps: MenuDeps): Promise<AppMenu> {
       await check("tool.zoom", "Zoom", () => deps.run("tool.zoom")),
       await check("tool.scroll", "Scroll", () => deps.run("tool.scroll")),
       await check("tool.cross", "Crosshair (MPR)", () => deps.run("tool.cross")),
+      await check("tool.rotate", "Rotate (MPR)", () => deps.run("tool.rotate")),
       await std("Separator"),
       await check("tool.length", "Length", () => deps.run("tool.length")),
       await check("tool.angle", "Angle", () => deps.run("tool.angle")),
@@ -201,6 +202,8 @@ export async function installMenu(deps: MenuDeps): Promise<AppMenu> {
       await key("Move Image Slider (Bottom / Right)", "ui.slider"),
       await std("Separator"),
       await key("Multiplanar View (MPR)", "mpr.toggle"),
+      await key("Reset MPR Rotation", "mpr.resetRotation"),
+      await key("3D MIP View (MPR)", "mpr.mipView"),
       await key("DICOM Tags…", "ui.tags"),
       await std("Separator"),
       await std("Fullscreen"),

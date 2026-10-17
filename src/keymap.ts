@@ -49,6 +49,7 @@ export const ACTIONS: ActionDef[] = [
   { id: "tool.aneurysm", label: "Aneurysm measurement", group: "Tools", defaults: ["KeyN"] },
   { id: "tool.calibrate", label: "Calibrate length", group: "Tools", defaults: ["KeyJ"] },
   { id: "tool.cross", label: "Crosshair tool (MPR)", group: "Tools", defaults: ["KeyK"] },
+  { id: "tool.rotate", label: "Rotate tool (MPR)", group: "Tools", defaults: ["KeyQ"] },
 
   { id: "measure.undo", label: "Delete last measurement", group: "Measurements", defaults: ["Backspace", "Delete"] },
   { id: "measure.clear", label: "Clear measurements on this image", group: "Measurements", defaults: ["Shift+Backspace", "Shift+Delete"] },
@@ -77,6 +78,8 @@ export const ACTIONS: ActionDef[] = [
   { id: "volume.build", label: "Build 3D volume", group: "Volume", defaults: ["KeyV"] },
 
   { id: "mpr.toggle", label: "Multiplanar view (MPR)", group: "Volume", defaults: ["Shift+KeyM"] },
+  { id: "mpr.resetRotation", label: "Reset MPR rotation", group: "Volume", defaults: ["Shift+KeyQ"] },
+  { id: "mpr.mipView", label: "3D MIP view (MPR)", group: "Volume", defaults: ["Shift+KeyV"] },
 
   ...LAYOUT_PRESETS.map((l, i): ActionDef => ({
     id: `layout.${l.cols}x${l.rows}`,

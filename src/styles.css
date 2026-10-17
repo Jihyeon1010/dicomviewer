@@ -684,3 +684,4 @@ body.dragging #viewports::after { border-color: var(--accent); }
 #cal-actions { display: flex; justify-content: flex-end; gap: 8px; }
 #viewports[data-tool="aneurysm"] .vp,
 #viewports[data-tool="calibrate"] .vp { cursor: crosshair; }
+#viewports[data-tool="rotate"] .vp { cursor: move; }

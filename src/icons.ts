@@ -61,6 +61,10 @@ const ICONS = {
   "eye-off":
     '<path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/><path d="M3 3l18 18"/>',
   locate: '<circle cx="12" cy="12" r="3"/><path d="M12 2v5M12 17v5M2 12h5M17 12h5"/>',
+  orbit:
+    '<circle cx="12" cy="12" r="2"/><ellipse cx="12" cy="12" rx="10" ry="4" transform="rotate(-30 12 12)"/>',
+  globe:
+    '<circle cx="12" cy="12" r="8"/><path d="M4 12h16M12 4c3 3 3 13 0 16M12 4c-3 3-3 13 0 16"/>',
   compass:
     '<circle cx="12" cy="12" r="9"/><path d="M16.2 7.8 14 14l-6.2 2.2L10 10z"/>',
   aneurysm:

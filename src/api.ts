@@ -10,6 +10,8 @@ import type {
   VolumeInfo,
 } from "./types";
 
+import type { V3 } from "./vec3";
+
 const HEADER_BYTES = 40;
 const MPR_HEADER_BYTES = 48;
 const THUMB_HEADER_BYTES = 12;
@@ -102,6 +104,15 @@ export interface MprSlice {
   spacing: [number, number]; // mm per output pixel: [horizontal, vertical]
 }
 
+function parseMpr(buf: ArrayBuffer): MprSlice {
+  if (buf.byteLength < MPR_HEADER_BYTES) {
+    throw new Error(`Reformatted image response too short (${buf.byteLength} bytes)`);
+  }
+  const dv = new DataView(buf);
+  const spacing: [number, number] = [dv.getFloat32(40, true), dv.getFloat32(44, true)];
+  return { slice: parseSlice(buf, MPR_HEADER_BYTES), spacing };
+}
+
 /** One reformatted image of the built volume of a series. */
 export async function getMprSlice(
   uid: string,
@@ -111,12 +122,29 @@ export async function getMprSlice(
   thicknessMm: number,
 ): Promise<MprSlice> {
   const buf = await invoke<ArrayBuffer>("get_mpr_slice", { uid, plane, index, slab, thicknessMm });
-  if (buf.byteLength < MPR_HEADER_BYTES) {
-    throw new Error(`Reformatted image response too short (${buf.byteLength} bytes)`);
-  }
-  const dv = new DataView(buf);
-  const spacing: [number, number] = [dv.getFloat32(40, true), dv.getFloat32(44, true)];
-  return { slice: parseSlice(buf, MPR_HEADER_BYTES), spacing };
+  return parseMpr(buf);
+}
+
+/**
+ * An image on an arbitrary plane (through `origin`, spanned by the unit vectors u and v),
+ * or a projection along its normal. Coordinates are local millimetres of the volume.
+ */
+export async function getObliqueSlice(
+  uid: string,
+  origin: V3,
+  u: V3,
+  v: V3,
+  width: number,
+  height: number,
+  pixelMm: number,
+  slab: SlabMode,
+  thicknessMm: number,
+  rayStepMm: number,
+): Promise<MprSlice> {
+  const buf = await invoke<ArrayBuffer>("get_oblique_slice", {
+    uid, origin, u, v, width, height, pixelMm, slab, thicknessMm, rayStepMm,
+  });
+  return parseMpr(buf);
 }
 
 // Response (little-endian): [width u32][height u32][channels u32][width*height*channels bytes]

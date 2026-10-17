@@ -1045,46 +1045,32 @@ fn build_volume(uid: String, state: tauri::State<AppState>) -> Result<VolumeInfo
     Ok(info)
 }
 
-// One reformatted image of the built volume. Response (little-endian):
-// the 40-byte slice header (16-bit unsigned samples, slope and intercept restore the real
-// values), then [spacing_x f32][spacing_y f32] in mm per pixel, then the samples.
-#[tauri::command(async)]
-fn get_mpr_slice(
-    uid: String,
-    plane: String,
-    index: usize,
-    slab: String,
-    thickness_mm: f64,
-    state: tauri::State<AppState>,
-) -> Result<tauri::ipc::Response, String> {
-    let vol = state
+fn volume_for(state: &AppState, uid: &str) -> Result<Arc<Volume>, String> {
+    state
         .volume
         .lock()
         .unwrap()
         .as_ref()
         .filter(|v| v.uid == uid)
         .cloned()
-        .ok_or("The volume of this series has not been built")?;
+        .ok_or_else(|| "The volume of this series has not been built".to_string())
+}
 
-    let plane = mpr::Plane::parse(&plane)?;
-    let slab = mpr::Slab::parse(&slab)?;
+fn geometry_of(vol: &Volume) -> mpr::Geometry<'_> {
     let ps = vol.info.pixel_spacing;
-    let geometry = mpr::Geometry {
+    mpr::Geometry {
         cols: vol.info.cols as usize,
         rows: vol.info.rows as usize,
         sx: ps.map_or(1.0, |p| p[1]),
         sy: ps.map_or(1.0, |p| p[0]),
         z: &vol.z,
-    };
-    let img = mpr::reformat(
-        &vol.slices,
-        &geometry,
-        plane,
-        index,
-        slab,
-        thickness_mm.clamp(0.0, 1.0e6),
-    )?;
+    }
+}
 
+// Response of a reformatted image (little-endian): the 40-byte slice header (16-bit
+// unsigned samples; slope and intercept restore the real values), then
+// [spacing_x f32][spacing_y f32] in mm per pixel, then the samples.
+fn mpr_response(vol: &Volume, img: &mpr::Reformatted) -> tauri::ipc::Response {
     let enc = mpr::encoding_for(vol.info.value_min, vol.info.value_max);
     let (wc, ww) = vol.window.unwrap_or((f32::NAN, f32::NAN));
     let samples = mpr::encode(&img.data, &enc);
@@ -1103,7 +1089,66 @@ fn get_mpr_slice(
     out.extend_from_slice(&(img.spacing_x as f32).to_le_bytes());
     out.extend_from_slice(&(img.spacing_y as f32).to_le_bytes());
     out.extend_from_slice(&samples);
-    Ok(tauri::ipc::Response::new(out))
+    tauri::ipc::Response::new(out)
+}
+
+#[tauri::command(async)]
+fn get_mpr_slice(
+    uid: String,
+    plane: String,
+    index: usize,
+    slab: String,
+    thickness_mm: f64,
+    state: tauri::State<AppState>,
+) -> Result<tauri::ipc::Response, String> {
+    let vol = volume_for(&state, &uid)?;
+    let img = mpr::reformat(
+        &vol.slices,
+        &geometry_of(&vol),
+        mpr::Plane::parse(&plane)?,
+        index,
+        mpr::Slab::parse(&slab)?,
+        thickness_mm.clamp(0.0, 1.0e6),
+    )?;
+    Ok(mpr_response(&vol, &img))
+}
+
+// An image on an arbitrary plane of the volume, or a projection along its normal. Points
+// and directions are in the local millimetre coordinates of the volume.
+#[tauri::command(async)]
+#[allow(clippy::too_many_arguments)]
+fn get_oblique_slice(
+    uid: String,
+    origin: [f64; 3],
+    u: [f64; 3],
+    v: [f64; 3],
+    width: u32,
+    height: u32,
+    pixel_mm: f64,
+    slab: String,
+    thickness_mm: f64,
+    ray_step_mm: f64,
+    state: tauri::State<AppState>,
+) -> Result<tauri::ipc::Response, String> {
+    let vol = volume_for(&state, &uid)?;
+    let params = mpr::Oblique {
+        origin,
+        u,
+        v,
+        width: width as usize,
+        height: height as usize,
+        pixel_mm,
+        slab: mpr::Slab::parse(&slab)?,
+        thickness_mm: thickness_mm.clamp(0.0, 1.0e6),
+        ray_step_mm,
+    };
+    let img = mpr::reformat_oblique(
+        &vol.slices,
+        &geometry_of(&vol),
+        &params,
+        vol.info.value_min as f32,
+    )?;
+    Ok(mpr_response(&vol, &img))
 }
 
 // ---------- DICOM tag dump ----------
@@ -1232,7 +1277,8 @@ pub fn run() {
             build_volume,
             get_tags,
             save_png,
-            get_mpr_slice
+            get_mpr_slice,
+            get_oblique_slice
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

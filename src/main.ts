@@ -64,6 +64,9 @@ const calCancel = byId("cal-cancel", HTMLButtonElement);
 const calError = byId("cal-error", HTMLDivElement);
 const orientModeBtn = byId("orient-mode", HTMLButtonElement);
 const crossBtn = byId("cross", HTMLButtonElement);
+const rotateBtn = byId("rotate", HTMLButtonElement);
+const mipViewBtn = byId("mip-view", HTMLButtonElement);
+const resetRotBtn = byId("reset-rot", HTMLButtonElement);
 const slabModeSel = byId("slab-mode", HTMLSelectElement);
 const slabThickSel = byId("slab-thick", HTMLSelectElement);
 const slider = byId("slider", HTMLInputElement);
@@ -165,6 +168,7 @@ const TOOL_TIPS: Record<string, string> = {
   rect: "Rectangular ROI",
   calibrate: "Calibrate: measure an object of known size, then enter its real length",
   aneurysm: "Aneurysm: neck (2 clicks), dome (1 click), then optionally the dome width (2 clicks); double click or Enter to finish",
+  rotate: "Rotate: turn the MPR planes about the normal of the view, or drag the 3D MIP view",
 };
 
 // Tooltips and preset labels are generated from the keymap, so they never go stale
@@ -175,6 +179,8 @@ function refreshTooltips(): void {
   }
   layoutBtn.title = `Choose how many views to show (up to ${MAX_COLS} × ${MAX_ROWS})`;
   setTip(mprBtn, "Multiplanar reformat: axial, coronal and sagittal views", "mpr.toggle");
+  setTip(mipViewBtn, "3D MIP in the fourth view: drag with the rotate tool", "mpr.mipView");
+  setTip(resetRotBtn, "Reset the rotation of the MPR planes", "mpr.resetRotation");
   slabModeSel.title = "Projection through a slab: thin plane, MIP, MinIP or average";
   slabThickSel.title = "Slab thickness";
   setTip(syncScrollBtn, "Scroll linked views together", "sync.scroll");
@@ -236,6 +242,12 @@ const host: ViewportHost = {
   pick: (vp, p) => mpr?.pick(vp, p),
   orientMode: () => orientMode,
   calibrate: (vp, pixels) => askCalibration(vp, pixels),
+  rotate: (vp, phase, x, y) => {
+    if (!mpr) return;
+    if (phase === "down") mpr.rotateDown(vp, x, y);
+    else if (phase === "move") mpr.rotateMove(vp, x, y);
+    else mpr.rotateUp();
+  },
 };
 
 // Viewports are created on demand when the layout grows and are then kept,
@@ -536,7 +548,10 @@ function syncControls(): void {
   // The crosshair tool and the slab controls only exist while an MPR is shown
   const inMpr = mpr !== null;
   setPressed(mprBtn, inMpr);
-  for (const el of [crossBtn, slabModeSel, slabThickSel]) el.hidden = !inMpr;
+  for (const el of [crossBtn, rotateBtn, mipViewBtn, resetRotBtn, slabModeSel, slabThickSel]) {
+    el.hidden = !inMpr;
+  }
+  setPressed(mipViewBtn, mpr?.mipOn ?? false);
   slabThickSel.disabled = slabModeSel.value === "none";
 
   setPressed(invertBtn, vp.invert);
@@ -788,12 +803,15 @@ async function enterMpr(series: SeriesInfo, info: VolumeInfo): Promise<void> {
   };
   applyLayout({ cols: 2, rows: 2 }, false, false);
 
-  const [a, c, s] = [viewports[0], viewports[1], viewports[2]];
-  if (!a || !c || !s) return;
-  const m = new Mpr({ panes: [a, c, s], series, volume: info, baseMeta: base }, currentSlab());
+  const [a, c, s, d] = [viewports[0], viewports[1], viewports[2], viewports[3]];
+  if (!a || !c || !s || !d) return;
+  const m = new Mpr(
+    { panes: [a, c, s], extra: d, series, volume: info, baseMeta: base },
+    currentSlab(),
+  );
   mpr = m;
 
-  void viewports[3]?.setSeries(series); // the original images stay in the fourth view
+  void d.setSeries(series); // the original images stay in the fourth view
   activate(a);
   setTool("cross");
   afterAssignment();
@@ -808,13 +826,14 @@ function exitMpr(restore: boolean): void {
   const saved = mprSaved;
   mprSaved = null;
 
+  const mprTool = tool === "cross" || tool === "rotate";
   if (restore && saved) {
     saved.series.forEach((s, i) => {
       void viewports[i]?.setSeries(s);
     });
     applyLayout(saved.layout, false);
-    if (tool === "cross") setTool(saved.tool === "cross" ? "window" : saved.tool);
-  } else if (tool === "cross") {
+    if (mprTool) setTool(saved.tool === "cross" || saved.tool === "rotate" ? "window" : saved.tool);
+  } else if (mprTool) {
     setTool("window");
   }
   afterAssignment();
@@ -942,6 +961,8 @@ sliderPosBtn.addEventListener("click", toggleSliderPos);
 syncScrollBtn.addEventListener("click", toggleSyncScroll);
 syncWindowBtn.addEventListener("click", toggleSyncWindow);
 mprBtn.addEventListener("click", () => void toggleMpr());
+mipViewBtn.addEventListener("click", () => handlers["mpr.mipView"]?.());
+resetRotBtn.addEventListener("click", () => mpr?.resetRotation());
 
 slabModeSel.addEventListener("change", () => {
   applySlab();
@@ -1041,6 +1062,10 @@ const handlers: Record<string, () => void> = {
     if (mpr) setTool("cross");
     else flashStatus("The crosshair tool works while an MPR is shown");
   },
+  "tool.rotate": () => {
+    if (mpr) setTool("rotate");
+    else flashStatus("The rotate tool works while an MPR is shown");
+  },
   "tool.length": () => setTool("length"),
   "tool.angle": () => setTool("angle"),
   "tool.ellipse": () => setTool("ellipse"),
@@ -1064,6 +1089,15 @@ const handlers: Record<string, () => void> = {
   "ui.settings": openSettings,
   "volume.build": () => void runBuildVolume(),
   "mpr.toggle": () => void toggleMpr(),
+  "mpr.resetRotation": () => mpr?.resetRotation(),
+  "mpr.mipView": () => {
+    if (!mpr) {
+      flashStatus("The 3D MIP view works while an MPR is shown");
+      return;
+    }
+    mpr.setMipView(!mpr.mipOn);
+    afterAssignment();
+  },
   "sync.scroll": toggleSyncScroll,
   "sync.window": toggleSyncWindow,
   "export.save": () => void exportImage(false),

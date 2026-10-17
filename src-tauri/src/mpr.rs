@@ -383,6 +383,263 @@ pub fn encode(data: &[f32], e: &Encoding) -> Vec<u8> {
     out
 }
 
+// ---------- Oblique planes and rays ----------
+
+/// Largest side of an oblique image in pixels, and largest number of pixels
+pub const MAX_OBLIQUE_SIDE: usize = 2048;
+pub const MAX_OBLIQUE_PIXELS: usize = 4_194_304;
+
+/// An image that samples the volume on a plane through `origin`, spanned by the unit
+/// vectors `u` (image x) and `v` (image y), in the local millimetre coordinates of the
+/// volume: x = column * sx, y = row * sy, z = position of the image. With a slab mode
+/// each pixel combines samples along the normal u x v, through `thickness_mm`.
+pub struct Oblique {
+    pub origin: [f64; 3], // the point in the middle of the image
+    pub u: [f64; 3],
+    pub v: [f64; 3],
+    pub width: usize,
+    pub height: usize,
+    pub pixel_mm: f64,
+    pub slab: Option<Slab>,
+    pub thickness_mm: f64,
+    pub ray_step_mm: f64,
+}
+
+fn cross3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+// Index pair and weight for linear interpolation along an axis of `n` samples
+fn axis(f: f64, n: usize) -> (usize, usize, f32) {
+    if n < 2 {
+        return (0, 0, 0.0);
+    }
+    let i0 = (f.floor().max(0.0) as usize).min(n - 2);
+    let t = (f - i0 as f64).clamp(0.0, 1.0) as f32;
+    (i0, i0 + 1, t)
+}
+
+struct Sampler<'a> {
+    slices: &'a [Vec<f32>],
+    cols: usize,
+    rows: usize,
+    sx: f64,
+    sy: f64,
+    z: &'a [f64],
+    dz: Option<f64>, // spacing when the images are evenly spaced
+}
+
+impl<'a> Sampler<'a> {
+    fn new(slices: &'a [Vec<f32>], g: &'a Geometry) -> Self {
+        let depth = g.z.len();
+        let dz = if depth >= 2 {
+            let step = (g.z[depth - 1] - g.z[0]) / (depth as f64 - 1.0);
+            let even = step > 1e-9
+                && g.z
+                    .iter()
+                    .enumerate()
+                    .all(|(k, &z)| (z - g.z[0] - k as f64 * step).abs() <= 1e-3 * step);
+            if even {
+                Some(step)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        Sampler {
+            slices,
+            cols: g.cols,
+            rows: g.rows,
+            sx: positive(g.sx),
+            sy: positive(g.sy),
+            z: g.z,
+            dz,
+        }
+    }
+
+    fn locate(&self, zv: f64) -> (usize, usize, f32) {
+        let depth = self.z.len();
+        if depth < 2 {
+            return (0, 0, 0.0);
+        }
+        if let Some(dz) = self.dz {
+            return axis((zv - self.z[0]) / dz, depth);
+        }
+        let k = self
+            .z
+            .partition_point(|&q| q <= zv)
+            .saturating_sub(1)
+            .min(depth - 2);
+        let span = self.z[k + 1] - self.z[k];
+        let t = if span > 1e-12 {
+            ((zv - self.z[k]) / span).clamp(0.0, 1.0) as f32
+        } else {
+            0.0
+        };
+        (k, k + 1, t)
+    }
+
+    // Trilinear interpolation; the point is expected to lie inside the volume
+    fn at(&self, x: f64, y: f64, zv: f64) -> f32 {
+        let (x0, x1, tx) = axis(x / self.sx, self.cols);
+        let (y0, y1, ty) = axis(y / self.sy, self.rows);
+        let (k0, k1, tz) = self.locate(zv);
+        let plane = |k: usize| -> f32 {
+            let s = &self.slices[k];
+            let a = s[y0 * self.cols + x0];
+            let b = s[y0 * self.cols + x1];
+            let c = s[y1 * self.cols + x0];
+            let d = s[y1 * self.cols + x1];
+            let top = a + (b - a) * tx;
+            let bottom = c + (d - c) * tx;
+            top + (bottom - top) * ty
+        };
+        let p0 = plane(k0);
+        if k1 == k0 || tz == 0.0 {
+            p0
+        } else {
+            p0 + (plane(k1) - p0) * tz
+        }
+    }
+}
+
+// Part of the ray pt + t * n, t in [-half, half], that lies inside the box
+fn clip(
+    pt: [f64; 3],
+    n: [f64; 3],
+    lo: [f64; 3],
+    hi: [f64; 3],
+    half: f64,
+) -> Option<(f64, f64)> {
+    let (mut t0, mut t1) = (-half, half);
+    for a in 0..3 {
+        if n[a].abs() < 1e-12 {
+            if pt[a] < lo[a] - 1e-9 || pt[a] > hi[a] + 1e-9 {
+                return None;
+            }
+        } else {
+            let mut ta = (lo[a] - pt[a]) / n[a];
+            let mut tb = (hi[a] - pt[a]) / n[a];
+            if ta > tb {
+                std::mem::swap(&mut ta, &mut tb);
+            }
+            t0 = t0.max(ta);
+            t1 = t1.min(tb);
+        }
+    }
+    if t0 <= t1 + 1e-9 {
+        Some((t0, t1.max(t0)))
+    } else {
+        None
+    }
+}
+
+/// Samples the volume on an oblique plane, or projects along its normal. Pixels whose
+/// ray misses the volume get `background`.
+pub fn reformat_oblique(
+    slices: &[Vec<f32>],
+    g: &Geometry,
+    o: &Oblique,
+    background: f32,
+) -> Result<Reformatted, String> {
+    let depth = g.depth();
+    if depth == 0 || g.cols == 0 || g.rows == 0 || slices.len() != depth {
+        return Err("Inconsistent volume".into());
+    }
+    if slices.iter().any(|s| s.len() != g.cols * g.rows) {
+        return Err("Inconsistent volume".into());
+    }
+    let (w, h) = (o.width, o.height);
+    if w == 0 || h == 0 || w > MAX_OBLIQUE_SIDE || h > MAX_OBLIQUE_SIDE || w * h > MAX_OBLIQUE_PIXELS
+    {
+        return Err("Unsupported image size".into());
+    }
+    if !(o.pixel_mm.is_finite() && o.pixel_mm > 0.0) {
+        return Err("Invalid pixel size".into());
+    }
+    let finite = o.origin.iter().chain(&o.u).chain(&o.v).all(|x| x.is_finite());
+    let nv = cross3(o.u, o.v);
+    let nl = dot(nv, nv).sqrt();
+    if !finite || nl < 1e-6 {
+        return Err("Invalid plane".into());
+    }
+    let n = [nv[0] / nl, nv[1] / nl, nv[2] / nl];
+
+    let sampler = Sampler::new(slices, g);
+    let lo = [0.0, 0.0, g.z[0]];
+    let hi = [
+        (g.cols - 1) as f64 * positive(g.sx),
+        (g.rows - 1) as f64 * positive(g.sy),
+        g.z[depth - 1],
+    ];
+    let half = if o.slab.is_some() {
+        o.thickness_mm.max(0.0) / 2.0
+    } else {
+        0.0
+    };
+    let op = o.slab.unwrap_or(Slab::Max);
+    let (hw, hh) = (w as f64 / 2.0, h as f64 / 2.0);
+    let p = o.pixel_mm;
+
+    let mut data = vec![0f32; w * h];
+    data.par_chunks_mut(w).enumerate().for_each(|(j, row)| {
+        let b = (j as f64 + 0.5 - hh) * p;
+        for (i, out) in row.iter_mut().enumerate() {
+            let a = (i as f64 + 0.5 - hw) * p;
+            let pt = [
+                o.origin[0] + a * o.u[0] + b * o.v[0],
+                o.origin[1] + a * o.u[1] + b * o.v[1],
+                o.origin[2] + a * o.u[2] + b * o.v[2],
+            ];
+            *out = match clip(pt, n, lo, hi, half) {
+                None => background,
+                Some((t0, t1)) => {
+                    let at = |t: f64| {
+                        sampler.at(pt[0] + t * n[0], pt[1] + t * n[1], pt[2] + t * n[2])
+                    };
+                    if o.slab.is_none() {
+                        at(t0)
+                    } else {
+                        let step = o.ray_step_mm.max((t1 - t0) / 4096.0).max(1e-3);
+                        let count = ((t1 - t0) / step + 1e-9).floor() as usize + 1;
+                        let mut acc = match op {
+                            Slab::Max => f32::MIN,
+                            Slab::Min => f32::MAX,
+                            Slab::Mean => 0.0,
+                        };
+                        for m in 0..count {
+                            let v = at(t0 + m as f64 * step);
+                            acc = match op {
+                                Slab::Max => acc.max(v),
+                                Slab::Min => acc.min(v),
+                                Slab::Mean => acc + v,
+                            };
+                        }
+                        if op == Slab::Mean {
+                            acc / count as f32
+                        } else {
+                            acc
+                        }
+                    }
+                }
+            };
+        }
+    });
+
+    Ok(Reformatted {
+        width: w,
+        height: h,
+        spacing_x: p,
+        spacing_y: p,
+        data,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -626,5 +883,127 @@ mod tests {
         assert_eq!(Slab::parse("none"), Ok(None));
         assert_eq!(Slab::parse("mean"), Ok(Some(Slab::Mean)));
         assert!(Slab::parse("sum").is_err());
+    }
+}
+
+#[cfg(test)]
+mod oblique_tests {
+    use super::*;
+
+    const COLS: usize = 4;
+    const ROWS: usize = 3;
+    const DEPTH: usize = 5;
+    const Z: [f64; DEPTH] = [0.0, 1.0, 2.0, 3.0, 4.0];
+
+    // value = x + 10 y + 100 z, so trilinear interpolation reproduces it exactly
+    fn linear() -> Vec<Vec<f32>> {
+        (0..DEPTH)
+            .map(|k| {
+                (0..ROWS * COLS)
+                    .map(|n| (n % COLS) as f32 + 10.0 * (n / COLS) as f32 + 100.0 * k as f32)
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn geo() -> Geometry<'static> {
+        Geometry { cols: COLS, rows: ROWS, sx: 1.0, sy: 1.0, z: &Z }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn plane(
+        origin: [f64; 3],
+        u: [f64; 3],
+        v: [f64; 3],
+        width: usize,
+        height: usize,
+        slab: Option<Slab>,
+        thickness_mm: f64,
+    ) -> Oblique {
+        Oblique {
+            origin,
+            u,
+            v,
+            width,
+            height,
+            pixel_mm: 1.0,
+            slab,
+            thickness_mm,
+            ray_step_mm: 1.0,
+        }
+    }
+
+    const X: [f64; 3] = [1.0, 0.0, 0.0];
+    const Y: [f64; 3] = [0.0, 1.0, 0.0];
+    const ZAX: [f64; 3] = [0.0, 0.0, 1.0];
+
+    #[test]
+    fn axis_aligned_plane_matches_the_stored_values() {
+        let v = linear();
+        let o = plane([1.5, 1.0, 2.0], X, Y, 4, 3, None, 0.0);
+        let r = reformat_oblique(&v, &geo(), &o, -999.0).unwrap();
+        for j in 0..3 {
+            for i in 0..4 {
+                assert!((r.data[j * 4 + i] - (i as f32 + 10.0 * j as f32 + 200.0)).abs() < 1e-3);
+            }
+        }
+    }
+
+    #[test]
+    fn pixels_outside_the_volume_get_the_background() {
+        let v = linear();
+        let o = plane([1.5, 1.0, 2.0], X, Y, 8, 3, None, 0.0);
+        let r = reformat_oblique(&v, &geo(), &o, -999.0).unwrap();
+        // Pixel 0 lies at x = -2, pixel 2 at x = 0
+        assert_eq!(r.data[0], -999.0);
+        assert!((r.data[2] - 200.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn rotated_plane_interpolates_linearly() {
+        let v = linear();
+        let (c, s) = (30f64.to_radians().cos(), 30f64.to_radians().sin());
+        let o = plane([1.5, 1.0, 2.0], [c, s, 0.0], [-s, c, 0.0], 4, 3, None, 0.0);
+        let r = reformat_oblique(&v, &geo(), &o, -999.0).unwrap();
+        // Pixel (2, 1) lies half a pixel along u from the origin
+        let (x, y) = (1.5 + 0.5 * c, 1.0 + 0.5 * s);
+        let expected = (x + 10.0 * y + 200.0) as f32;
+        assert!((r.data[4 + 2] - expected).abs() < 1e-3, "got {}", r.data[4 + 2]);
+    }
+
+    #[test]
+    fn slab_projections_along_the_normal() {
+        let v = linear();
+        // Normal along z; the ray at x = y = 0 passes the values 0, 100, ... 400
+        let at = |slab| {
+            let o = plane([1.5, 1.0, 2.0], X, Y, 4, 3, Some(slab), 4.0);
+            reformat_oblique(&v, &geo(), &o, -999.0).unwrap().data[0]
+        };
+        assert!((at(Slab::Max) - 400.0).abs() < 1e-3);
+        assert!(at(Slab::Min).abs() < 1e-3);
+        assert!((at(Slab::Mean) - 200.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn projection_through_the_side_of_the_volume() {
+        let v = linear();
+        // u = y, v = z, so the normal is x; rays are clipped to the box
+        let o = plane([1.5, 1.0, 2.0], Y, ZAX, 3, 5, Some(Slab::Max), 10.0);
+        let r = reformat_oblique(&v, &geo(), &o, -999.0).unwrap();
+        for j in 0..5 {
+            for i in 0..3 {
+                let expected = 3.0 + 10.0 * i as f32 + 100.0 * j as f32;
+                assert!((r.data[j * 3 + i] - expected).abs() < 1e-3);
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_requests_are_rejected() {
+        let v = linear();
+        let ok = || plane([1.5, 1.0, 2.0], X, Y, 4, 3, None, 0.0);
+        assert!(reformat_oblique(&v, &geo(), &Oblique { width: 0, ..ok() }, 0.0).is_err());
+        assert!(reformat_oblique(&v, &geo(), &Oblique { pixel_mm: 0.0, ..ok() }, 0.0).is_err());
+        assert!(reformat_oblique(&v, &geo(), &Oblique { v: X, ..ok() }, 0.0).is_err());
     }
 }

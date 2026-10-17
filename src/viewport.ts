@@ -37,7 +37,8 @@ import { autoOrient, type OrientMode } from "./orient-auto";
 import type { Plane } from "./types";
 
 export type MeasureKind = "length" | "angle" | "ellipse" | "rect" | "aneurysm";
-export type ToolId = "window" | "pan" | "zoom" | "scroll" | "cross" | "calibrate" | MeasureKind;
+export type ToolId =
+  | "window" | "pan" | "zoom" | "scroll" | "cross" | "rotate" | "calibrate" | MeasureKind;
 type DragMode = "window" | "pan" | "zoom" | "scroll";
 
 export function isMeasureTool(t: ToolId): t is MeasureKind {
@@ -70,6 +71,8 @@ export interface ViewportHost {
   // The user measured a known length with the calibration tool. The host asks for the real
   // length and calls setCalibration() with the answer.
   calibrate(vp: Viewport, pixels: number): void;
+    // The rotate tool was used in this view; x and y are relative to the view
+  rotate(vp: Viewport, phase: "down" | "move" | "up", x: number, y: number): void;
 }
 
 interface Drag {
@@ -320,6 +323,7 @@ export class Viewport {
   private measuring = false; // mouse button held while drawing a drag-style measurement
   private calibration: Calibration | null = null;
   private calibrating = false; // the drag in progress measures a calibration length
+  private rotating = false; // mouse button held with the rotate tool
   private aneurysmPts: Pt[] = []; // clicks collected so far for the aneurysm template
   private refLines: RefLine[] = [];
   private crossing = false; // mouse button held with the crosshair tool
@@ -338,6 +342,17 @@ export class Viewport {
 
   get playing(): boolean {
     return this.cineRaf !== 0;
+  }
+
+  /** True while an image is being fetched. */
+  get busy(): boolean {
+    return this.loading;
+  }
+
+  /** Where the middle of the image is on screen, in the coordinates of this view. */
+  imageCenterOnScreen(): Pt | null {
+    const s = this.current;
+    return s ? this.toScreen({ x: s.cols / 2, y: s.rows / 2 }) : null;
   }
 
   get orientation(): Orient {
@@ -390,6 +405,7 @@ export class Viewport {
     this.draft = null;
     this.measuring = false;
     this.crossing = false;
+    this.rotating = false;
     this.refLines = [];
     if (series === null) this.measurements.clear();
     this.ui.readout.textContent = "";
@@ -424,11 +440,18 @@ export class Viewport {
     return this.loadSlice();
   }
 
-  /** Swaps the images of a reformatted view and keeps position, zoom and window. */
-  replaceSource(source: SliceSource): void {
+  /**
+   * Swaps the images of a reformatted view and keeps zoom and window. The number of
+   * positions and the shown position can change with the new source.
+   */
+  replaceSource(source: SliceSource, count?: number, index?: number): void {
     if (!this.source) return;
     this.source = source;
+    if (count !== undefined) this.count = Math.max(1, count);
+    if (index !== undefined) this.index = clamp(index, 0, this.count - 1);
     sliceCache.cancel(this);
+    this.refreshOverlay();
+    this.host.stateChanged(this);
     void this.loadSlice();
   }
 
@@ -1296,8 +1319,15 @@ export class Viewport {
         return;
       }
 
+      if (tool === "rotate" && e.button === 0 && !panOverride) {
+        this.rotating = true;
+        this.host.rotate(this, "down", e.clientX - r.left, e.clientY - r.top);
+        e.preventDefault();
+        return;
+      }
+
       const mode: DragMode =
-        panOverride || isMeasureTool(tool) || tool === "cross" || tool === "calibrate"
+        panOverride || isMeasureTool(tool) || tool === "cross" || tool === "calibrate" || tool === "rotate"
           ? "pan"
           : tool;
       this.drag = {
@@ -1314,6 +1344,10 @@ export class Viewport {
     window.addEventListener("mouseup", () => {
       this.drag = null;
       this.crossing = false;
+      if (this.rotating) {
+        this.rotating = false;
+        this.host.rotate(this, "up", 0, 0);
+      }
       if (this.measuring) {
         this.measuring = false;
         this.finishDragMeasure();
@@ -1322,6 +1356,11 @@ export class Viewport {
 
     window.addEventListener("mousemove", (e: MouseEvent) => {
       if (this.crossing) this.pickAt(e.clientX, e.clientY);
+
+      if (this.rotating) {
+        const r = el.getBoundingClientRect();
+        this.host.rotate(this, "move", e.clientX - r.left, e.clientY - r.top);
+      }
 
       // The last point of a measurement in progress follows the cursor
       const dr = this.draft;
@@ -1372,7 +1411,9 @@ export class Viewport {
         return;
       }
       const tool = this.host.tool();
-      if (!isMeasureTool(tool) && tool !== "cross" && tool !== "calibrate") this.fit();
+      if (!isMeasureTool(tool) && tool !== "cross" && tool !== "calibrate" && tool !== "rotate") {
+        this.fit();
+      }
     });
   }
 }
