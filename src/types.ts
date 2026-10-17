@@ -46,6 +46,10 @@ export interface SliceMeta {
   frame_count: number;
   spacing_is_imager: boolean; // spacing comes from ImagerPixelSpacing (approximate)
   cine_fps: number | null;    // playback rate stored in the file
+  frame_time_ms: number | null;        // nominal time between frames
+  positioner_primary: number | null;   // degrees, positive towards LAO
+  positioner_secondary: number | null; // degrees, positive towards cranial
+  intensity_relation: string;          // LIN, LOG or DISP
 }
 
 // Mirrors the VolumeInfo struct in lib.rs

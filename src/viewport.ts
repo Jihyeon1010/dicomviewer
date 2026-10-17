@@ -36,9 +36,12 @@ import type { SeriesGeometry, SeriesInfo, SliceData, SliceMeta } from "./types";
 import { autoOrient, type OrientMode } from "./orient-auto";
 import type { Plane } from "./types";
 
+import { Angio, positionerText, PROJECTION_MODES, type ProjectionMode, type SubtractMode } from "./angio";
+
 export type MeasureKind = "length" | "angle" | "ellipse" | "rect" | "aneurysm";
 export type ToolId =
-  | "window" | "pan" | "zoom" | "scroll" | "cross" | "rotate" | "calibrate" | MeasureKind;
+  | "window" | "pan" | "zoom" | "scroll" | "cross" | "rotate" | "maskshift" | "calibrate"
+  | MeasureKind;
 type DragMode = "window" | "pan" | "zoom" | "scroll";
 
 export function isMeasureTool(t: ToolId): t is MeasureKind {
@@ -112,6 +115,7 @@ const SMALL_H = 260;
 // Images fetched ahead of the shown one: in the direction of travel, and a few behind it
 const PREFETCH_AHEAD = 8;
 const PREFETCH_BEHIND = 2;
+const MAX_SHIFT = 100; // largest mask shift in pixels
 
 const clamp = (v: number, lo: number, hi: number): number => Math.min(hi, Math.max(lo, v));
 
@@ -324,6 +328,13 @@ export class Viewport {
   private calibration: Calibration | null = null;
   private calibrating = false; // the drag in progress measures a calibration length
   private rotating = false; // mouse button held with the rotate tool
+  private angio: Angio | null = null;
+  private shifting: { p0: Pt; dx0: number; dy0: number } | null = null;
+  private windowPending = false; // apply the default window of the next image
+  private loop: { from: number; to: number } | null = null;
+  private pingPong = false;
+  private cineDir: 1 | -1 = 1;
+  private bookmarks = new Set<number>();
   private aneurysmPts: Pt[] = []; // clicks collected so far for the aneurysm template
   private refLines: RefLine[] = [];
   private crossing = false; // mouse button held with the crosshair tool
@@ -406,6 +417,13 @@ export class Viewport {
     this.measuring = false;
     this.crossing = false;
     this.rotating = false;
+    this.angio = series && !source ? new Angio(series.uid, series.slice_count) : null;
+    this.shifting = null;
+    this.windowPending = false;
+    this.loop = null;
+    this.pingPong = false;
+    this.cineDir = 1;
+    this.bookmarks.clear();
     this.refLines = [];
     if (series === null) this.measurements.clear();
     this.ui.readout.textContent = "";
@@ -493,16 +511,21 @@ export class Viewport {
 
   private activeSource(): SliceSource | null {
     if (this.source) return this.source;
-    return this.series ? seriesSource(this.series.uid) : null;
+    if (!this.series) return null;
+    return this.angio?.source() ?? seriesSource(this.series.uid);
   }
 
-  private async loadSlice(): Promise<void> {
+    private async loadSlice(): Promise<void> {
     const src = this.activeSource();
     if (!src || this.count === 0) return;
     const token = ++this.fetchToken;
     this.loading = true;
+    // Subtraction and projections can take a moment; say so
+    const slow = window.setTimeout(() => {
+      if (token === this.fetchToken) this.setStatus("Working…");
+    }, 600);
     try {
-      // From the shared cache: an image that was prefetched resolves immediately
+      // From the shared cache: an image that was prefetched resolves immediately.
       // Metadata is optional; a failure there is already turned into null by the source.
       const { slice, meta: m } = await sliceCache.get(src, this.index);
       if (token !== this.fetchToken) return; // a newer request superseded this one
@@ -517,12 +540,14 @@ export class Viewport {
         this.autoPending = false;
         this.applyAutoOrient(m);
       }
-
-      if (this.firstLoad) {
+      if (this.firstLoad || this.windowPending) {
         if (slice.defaultWl !== null && slice.defaultWw !== null) {
           this.wl = slice.defaultWl;
           this.ww = slice.defaultWw;
         }
+        this.windowPending = false;
+      }
+      if (this.firstLoad) {
         if (m?.cine_fps) this.fps = clamp(m.cine_fps, 1, 60);
         this.firstLoad = false;
       }
@@ -543,6 +568,7 @@ export class Viewport {
         this.showError(err);
       }
     } finally {
+      window.clearTimeout(slow);
       if (token === this.fetchToken) this.loading = false;
     }
   }
@@ -636,11 +662,254 @@ export class Viewport {
     if (!this.playing) return;
     if (!this.loading && this.count > 1 && now - this.cineLast >= 1000 / this.fps) {
       this.cineLast = now;
-      this.goto((this.index + 1) % this.count, true, true);
+      this.goto(this.nextCineIndex(), true, true);
     }
     if (!this.playing) return; // stopped while advancing
     this.cineRaf = requestAnimationFrame(this.tick);
   };
+
+  // The next frame of the loop (or of the whole series), forwards or back and forth
+  private nextCineIndex(): number {
+    const lo = this.loop ? this.loop.from : 0;
+    const hi = this.loop ? Math.min(this.loop.to, this.count - 1) : this.count - 1;
+    if (hi <= lo) return lo;
+    let next = this.index + this.cineDir;
+    if (this.pingPong) {
+      if (next > hi) {
+        this.cineDir = -1;
+        next = hi - 1;
+      } else if (next < lo) {
+        this.cineDir = 1;
+        next = lo + 1;
+      }
+    } else {
+      this.cineDir = 1;
+      if (next > hi || next < lo) next = lo;
+    }
+    return clamp(next, lo, hi);
+  }
+
+  // ---------- Angiography: subtraction, projection, loop, bookmarks ----------
+
+  /** A series of several grayscale XA or RF frames: the subtraction controls apply. */
+  get angioCandidate(): boolean {
+    const m = this.meta?.modality ?? "";
+    return (
+      !this.source &&
+      this.angio !== null &&
+      (this.series?.slice_count ?? 0) >= 2 &&
+      this.current?.samples === 1 &&
+      (m === "XA" || m === "RF")
+    );
+  }
+
+  get dsaOn(): boolean {
+    return this.angio?.dsa ?? false;
+  }
+
+  get subtractMode(): SubtractMode {
+    return this.angio?.mode ?? "linear";
+  }
+
+  get projection(): ProjectionMode {
+    return this.angio?.proj ?? "off";
+  }
+
+  /** The value of the mask selector that matches the current mask. */
+  get maskChoice(): string {
+    const m = this.angio?.mask;
+    if (!m) return "1";
+    return m.from === 0 && [1, 3, 5, 10].includes(m.to + 1) ? String(m.to + 1) : "cur";
+  }
+
+  get loopRange(): { from: number; to: number } | null {
+    return this.loop;
+  }
+
+  get pingPongOn(): boolean {
+    return this.pingPong;
+  }
+
+  get bookmarked(): boolean {
+    return this.bookmarks.has(this.index);
+  }
+
+  async setDsa(on: boolean): Promise<void> {
+    const a = this.angio;
+    if (!a || !this.series || !this.angioCandidate || on === a.dsa) return;
+    // Linear detector signals are subtracted in the log domain; other data directly
+    if (on && !a.modeChosen) a.mode = this.meta?.intensity_relation === "LIN" ? "log" : "linear";
+    a.dsa = on;
+    if (!on) {
+      a.dx = 0;
+      a.dy = 0;
+    }
+    await this.applyAngio(true);
+  }
+
+  setMaskFirst(n: number): void {
+    const a = this.angio;
+    if (!a) return;
+    a.mask = { from: 0, to: Math.max(0, n - 1) };
+    a.clampMask();
+    if (a.dsa) void this.applyAngio(false);
+  }
+
+  setMaskHere(): void {
+    const a = this.angio;
+    if (!a || !a.dsa) return;
+    a.mask = { from: this.index, to: this.index };
+    void this.applyAngio(false);
+  }
+
+  setSubtractMode(mode: SubtractMode): void {
+    const a = this.angio;
+    if (!a) return;
+    a.mode = mode;
+    a.modeChosen = true;
+    if (a.dsa) void this.applyAngio(true); // the units change, so does the window
+  }
+
+  setShift(dx: number, dy: number): void {
+    const a = this.angio;
+    if (!a || !a.dsa) return;
+    const nx = clamp(Math.round(dx), -MAX_SHIFT, MAX_SHIFT);
+    const ny = clamp(Math.round(dy), -MAX_SHIFT, MAX_SHIFT);
+    if (nx === a.dx && ny === a.dy) return;
+    a.dx = nx;
+    a.dy = ny;
+    void this.applyAngio(false);
+  }
+
+  shiftMask(ddx: number, ddy: number): void {
+    const a = this.angio;
+    if (a?.dsa) this.setShift(a.dx + ddx, a.dy + ddy);
+  }
+
+  resetShift(): void {
+    this.setShift(0, 0);
+  }
+
+  setProjection(mode: ProjectionMode): void {
+    const a = this.angio;
+    if (!a || a.proj === mode) return;
+    a.proj = mode;
+    void this.applyAngio(false);
+  }
+
+  cycleProjection(): void {
+    const a = this.angio;
+    if (!a || !this.angioCandidate) return;
+    const next = PROJECTION_MODES[(PROJECTION_MODES.indexOf(a.proj) + 1) % PROJECTION_MODES.length];
+    this.setProjection(next ?? "off");
+  }
+
+  // Shows the images of the current subtraction and projection settings
+  private async applyAngio(resetWindow: boolean): Promise<void> {
+    const a = this.angio;
+    const series = this.series;
+    if (!a || !series) return;
+    this.stopPlay();
+
+    let failure: unknown = null;
+    try {
+      await a.prepare();
+    } catch (err) {
+      a.dsa = false; // fall back to the plain frames
+      a.dx = 0;
+      a.dy = 0;
+      failure = err;
+    }
+    if (this.angio !== a) return; // other content was loaded while preparing
+
+    const projecting = a.proj !== "off";
+    this.count = projecting ? 1 : series.slice_count;
+    this.index = projecting ? 0 : clamp(this.index, 0, this.count - 1);
+    if (resetWindow) this.windowPending = true;
+    sliceCache.cancel(this);
+    this.refreshOverlay();
+    this.host.stateChanged(this);
+    await this.loadSlice();
+    if (failure) this.showError(failure);
+  }
+
+  markIn(): void {
+    if (this.count < 2) return;
+    const to = this.loop?.to ?? this.count - 1;
+    this.loop = { from: this.index, to: Math.max(to, this.index) };
+    this.refreshOverlay();
+    this.host.stateChanged(this);
+  }
+
+  markOut(): void {
+    if (this.count < 2) return;
+    const from = this.loop?.from ?? 0;
+    this.loop = { from: Math.min(from, this.index), to: this.index };
+    this.refreshOverlay();
+    this.host.stateChanged(this);
+  }
+
+  clearLoop(): void {
+    this.loop = null;
+    this.refreshOverlay();
+    this.host.stateChanged(this);
+  }
+
+  togglePingPong(): void {
+    this.pingPong = !this.pingPong;
+    this.cineDir = 1;
+    this.refreshOverlay();
+    this.host.stateChanged(this);
+  }
+
+  toggleBookmark(): void {
+    if (this.count < 2) return;
+    if (!this.bookmarks.delete(this.index)) this.bookmarks.add(this.index);
+    this.refreshOverlay();
+    this.host.stateChanged(this);
+  }
+
+  /** Jumps to the next (1) or previous (-1) bookmark, wrapping around. */
+  gotoBookmark(dir: 1 | -1): void {
+    const list = [...this.bookmarks].sort((x, y) => x - y);
+    if (list.length === 0) return;
+    const next =
+      dir === 1
+        ? (list.find((i) => i > this.index) ?? list[0])
+        : ([...list].reverse().find((i) => i < this.index) ?? list[list.length - 1]);
+    if (next !== undefined) this.goto(next);
+  }
+
+  // Lines about the angiographic series for the bottom-left overlay
+  private angioLines(): string[] {
+    const m = this.meta;
+    const a = this.angio;
+    const out: string[] = [];
+
+    const pos = positionerText(m?.positioner_primary ?? null, m?.positioner_secondary ?? null);
+    if (pos) out.push(pos);
+    if (m?.frame_time_ms && !(a && a.proj !== "off")) {
+      out.push(`t ${num((this.index * m.frame_time_ms) / 1000, 2)} s`);
+    }
+    if (a?.dsa) {
+      const range =
+        a.mask.to > a.mask.from ? `${a.mask.from + 1}–${a.mask.to + 1}` : `${a.mask.from + 1}`;
+      const shift = a.dx || a.dy ? ` · shift ${a.dx}, ${a.dy}` : "";
+      out.push(`DSA ${a.mode} · mask ${range}${shift}`);
+    }
+    if (a && a.proj !== "off") out.push(`Projection: ${a.proj} over time`);
+    if (this.loop) {
+      out.push(`Loop ${this.loop.from + 1}–${this.loop.to + 1}${this.pingPong ? " · ping-pong" : ""}`);
+    } else if (this.pingPong) {
+      out.push("Ping-pong");
+    }
+    if (this.bookmarks.size > 0) {
+      const list = [...this.bookmarks].sort((x, y) => x - y).map((i) => i + 1);
+      const more = list.length > 8 ? "…" : "";
+      out.push(`${this.bookmarks.has(this.index) ? "★ " : ""}Bookmarks ${list.slice(0, 8).join(", ")}${more}`);
+    }
+    return out;
+  }
 
   // ---------- Orientation ----------
 
@@ -825,7 +1094,7 @@ export class Viewport {
       ? [`Px ${num(this.calibration.mmPerPixel, 3)} × ${num(this.calibration.mmPerPixel, 3)} mm (calibrated)`]
       : [];
     bl.textContent = full
-      ? [...imageLines(this.index, this.count, s, m), ...calibLine, ...this.extraLines].join("\n")
+      ? [...imageLines(this.index, this.count, s, m), ...this.angioLines(), ...calibLine, ...this.extraLines].join("\n")
       : this.count
         ? `Im ${this.index + 1} / ${this.count}`
         : "";
@@ -960,7 +1229,10 @@ export class Viewport {
   }
 
   private sliceKey(): string {
-    return `${this.source?.id ?? this.series?.uid ?? ""}#${this.index}`;
+    // Measurements stay with the image when the mask or the shift changes
+    const base =
+      this.source?.id ?? `${this.angio?.active ? "angio:" : ""}${this.series?.uid ?? ""}`;
+    return `${base}#${this.index}`;
   }
 
   /** Cancels a measurement in progress. Returns true when there was one. */
@@ -1326,8 +1598,23 @@ export class Viewport {
         return;
       }
 
+      if (tool === "maskshift" && e.button === 0 && !panOverride) {
+        const a = this.angio;
+        if (a?.dsa) {
+          const p = this.toImage(e.clientX - r.left, e.clientY - r.top);
+          this.shifting = { p0: p, dx0: a.dx, dy0: a.dy };
+        }
+        e.preventDefault();
+        return;
+      }
+
       const mode: DragMode =
-        panOverride || isMeasureTool(tool) || tool === "cross" || tool === "calibrate" || tool === "rotate"
+        panOverride ||
+        isMeasureTool(tool) ||
+        tool === "cross" ||
+        tool === "calibrate" ||
+        tool === "rotate" ||
+        tool === "maskshift"
           ? "pan"
           : tool;
       this.drag = {
@@ -1346,6 +1633,7 @@ export class Viewport {
       this.crossing = false;
       if (this.rotating) {
         this.rotating = false;
+        this.shifting = null;
         this.host.rotate(this, "up", 0, 0);
       }
       if (this.measuring) {
@@ -1360,6 +1648,13 @@ export class Viewport {
       if (this.rotating) {
         const r = el.getBoundingClientRect();
         this.host.rotate(this, "move", e.clientX - r.left, e.clientY - r.top);
+      }
+
+      const sh = this.shifting;
+      if (sh) {
+        const r = el.getBoundingClientRect();
+        const p = this.toImage(e.clientX - r.left, e.clientY - r.top);
+        this.setShift(sh.dx0 + Math.round(p.x - sh.p0.x), sh.dy0 + Math.round(p.y - sh.p0.y));
       }
 
       // The last point of a measurement in progress follows the cursor
@@ -1411,7 +1706,13 @@ export class Viewport {
         return;
       }
       const tool = this.host.tool();
-      if (!isMeasureTool(tool) && tool !== "cross" && tool !== "calibrate" && tool !== "rotate") {
+      if (
+        !isMeasureTool(tool) &&
+        tool !== "cross" &&
+        tool !== "calibrate" &&
+        tool !== "rotate" &&
+        tool !== "maskshift"
+      ) {
         this.fit();
       }
     });

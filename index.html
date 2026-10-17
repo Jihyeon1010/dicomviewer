@@ -44,26 +44,54 @@
       <button id="sync-scroll"><span class="ic" data-icon="link"></span><span class="lbl">Scroll</span></button>
       <button id="sync-window"><span class="ic" data-icon="link"></span><span class="lbl">W/L</span></button>
       <div class="group" id="mpr-wrap">
-      <button id="mpr"><span class="ic" data-icon="mpr"></span><span class="lbl">MPR</span></button>
-      <button id="cross" class="tool ib" data-tool="cross" aria-label="Crosshair" hidden><span class="ic" data-icon="locate"></span></button>
-      <button id="rotate" class="tool ib" data-tool="rotate" aria-label="Rotate MPR planes" hidden><span class="ic" data-icon="orbit"></span></button>
-      <button id="mip-view" class="ib" aria-label="3D MIP view" hidden><span class="ic" data-icon="globe"></span></button>
-      <button id="reset-rot" class="ib" aria-label="Reset MPR rotation" hidden><span class="ic" data-icon="undo"></span></button>
-      <select id="slab-mode" aria-label="Slab projection" hidden>
-        <option value="none">Thin</option>
-        <option value="max">MIP</option>
-        <option value="min">MinIP</option>
-        <option value="mean">Average</option>
+        <button id="mpr"><span class="ic" data-icon="mpr"></span><span class="lbl">MPR</span></button>
+        <button id="cross" class="tool ib" data-tool="cross" aria-label="Crosshair" hidden><span class="ic" data-icon="locate"></span></button>
+        <button id="rotate" class="tool ib" data-tool="rotate" aria-label="Rotate MPR planes" hidden><span class="ic" data-icon="orbit"></span></button>
+        <button id="mip-view" class="ib" aria-label="3D MIP view" hidden><span class="ic" data-icon="globe"></span></button>
+        <button id="reset-rot" class="ib" aria-label="Reset MPR rotation" hidden><span class="ic" data-icon="undo"></span></button>
+        <select id="slab-mode" aria-label="Slab projection" hidden>
+          <option value="none">Thin</option>
+          <option value="max">MIP</option>
+          <option value="min">MinIP</option>
+          <option value="mean">Average</option>
+        </select>
+        <select id="slab-thick" aria-label="Slab thickness" hidden>
+          <option value="3">3 mm</option>
+          <option value="5">5 mm</option>
+          <option value="10" selected>10 mm</option>
+          <option value="20">20 mm</option>
+          <option value="40">40 mm</option>
+          <option value="80">80 mm</option>
+          <option value="1000000">Full</option>
+        </select>
+      </div>
+      <div class="group" id="angio-wrap" hidden>
+      <button id="dsa"><span class="ic" data-icon="subtract"></span><span class="lbl">DSA</span></button>
+      <button id="mask-shift" class="tool ib" data-tool="maskshift" aria-label="Shift the mask" hidden><span class="ic" data-icon="move"></span></button>
+      <select id="dsa-mask" aria-label="Mask frames" hidden>
+        <option value="1">Mask: 1st frame</option>
+        <option value="3">Mask: first 3</option>
+        <option value="5">Mask: first 5</option>
+        <option value="10">Mask: first 10</option>
+        <option value="cur">Mask: this frame</option>
       </select>
-      <select id="slab-thick" aria-label="Slab thickness" hidden>
-        <option value="3">3 mm</option>
-        <option value="5">5 mm</option>
-        <option value="10" selected>10 mm</option>
-        <option value="20">20 mm</option>
-        <option value="40">40 mm</option>
-        <option value="80">80 mm</option>
-        <option value="1000000">Full</option>
+      <select id="dsa-mode" aria-label="Subtraction mode" hidden>
+        <option value="linear">Linear</option>
+        <option value="log">Log</option>
       </select>
+      <select id="tproj" aria-label="Projection over time">
+        <option value="off">Frames</option>
+        <option value="min">Min over time</option>
+        <option value="max">Max over time</option>
+        <option value="mean">Mean over time</option>
+      </select>
+    </div>
+
+    <div class="group" id="cine-wrap" hidden>
+      <button id="loop-in" class="ib" aria-label="Loop start"><span class="ic" data-icon="mark-in"></span></button>
+      <button id="loop-out" class="ib" aria-label="Loop end"><span class="ic" data-icon="mark-out"></span></button>
+      <button id="pingpong" class="ib" aria-label="Ping-pong playback"><span class="ic" data-icon="pingpong"></span></button>
+      <button id="bookmark" class="ib" aria-label="Bookmark this frame"><span class="ic" data-icon="bookmark"></span></button>
     </div>
     </div>
 

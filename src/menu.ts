@@ -151,6 +151,27 @@ export async function installMenu(deps: MenuDeps): Promise<AppMenu> {
     ],
   });
 
+  const angioMenu = await Submenu.new({
+    text: "Angiography",
+    items: [
+      await key("Digital Subtraction (DSA)", "dsa.toggle"),
+      await key("Use This Frame as Mask", "dsa.maskHere"),
+      await check("tool.maskshift", "Mask Shift Tool", () => deps.run("tool.maskshift")),
+      await key("Reset Mask Shift", "dsa.shiftReset"),
+      await std("Separator"),
+      await key("Projection over Time (Off / Min / Max / Mean)", "tproj.cycle"),
+      await std("Separator"),
+      await key("Loop Start Here", "cine.markIn"),
+      await key("Loop End Here", "cine.markOut"),
+      await key("Clear Loop", "cine.clearLoop"),
+      await key("Ping-Pong Playback", "cine.pingpong"),
+      await std("Separator"),
+      await key("Bookmark This Frame", "bookmark.toggle"),
+      await key("Next Bookmark", "bookmark.next"),
+      await key("Previous Bookmark", "bookmark.prev"),
+    ],
+  });
+
   const presetItems = [];
   for (const [i, name] of deps.presetNames.entries()) {
     presetItems.push(await key(name, `preset.${i + 1}`));
@@ -227,6 +248,7 @@ export async function installMenu(deps: MenuDeps): Promise<AppMenu> {
       editMenu,
       imagesMenu,
       toolsMenu,
+      angioMenu,
       viewMenu,
       windowMenu,
       helpMenu,

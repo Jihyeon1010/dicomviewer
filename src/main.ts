@@ -31,6 +31,7 @@ import { createTagsDialog } from "./tags-dialog";
 import type { SeriesInfo, SlabMode, VolumeInfo } from "./types";
 import { syncedIndex, Viewport, type ToolId, type ViewportHost } from "./viewport";
 import { ORIENT_MODES, type OrientMode } from "./orient-auto";
+import type { ProjectionMode } from "./angio";
 
 // ---------- Elements ----------
 const viewportsEl = byId("viewports", HTMLDivElement);
@@ -65,6 +66,17 @@ const calError = byId("cal-error", HTMLDivElement);
 const orientModeBtn = byId("orient-mode", HTMLButtonElement);
 const crossBtn = byId("cross", HTMLButtonElement);
 const rotateBtn = byId("rotate", HTMLButtonElement);
+const angioWrap = byId("angio-wrap", HTMLDivElement);
+const dsaBtn = byId("dsa", HTMLButtonElement);
+const maskShiftBtn = byId("mask-shift", HTMLButtonElement);
+const dsaMaskSel = byId("dsa-mask", HTMLSelectElement);
+const dsaModeSel = byId("dsa-mode", HTMLSelectElement);
+const tprojSel = byId("tproj", HTMLSelectElement);
+const cineWrap = byId("cine-wrap", HTMLDivElement);
+const loopInBtn = byId("loop-in", HTMLButtonElement);
+const loopOutBtn = byId("loop-out", HTMLButtonElement);
+const pingBtn = byId("pingpong", HTMLButtonElement);
+const bookBtn = byId("bookmark", HTMLButtonElement);
 const mipViewBtn = byId("mip-view", HTMLButtonElement);
 const resetRotBtn = byId("reset-rot", HTMLButtonElement);
 const slabModeSel = byId("slab-mode", HTMLSelectElement);
@@ -169,6 +181,7 @@ const TOOL_TIPS: Record<string, string> = {
   calibrate: "Calibrate: measure an object of known size, then enter its real length",
   aneurysm: "Aneurysm: neck (2 clicks), dome (1 click), then optionally the dome width (2 clicks); double click or Enter to finish",
   rotate: "Rotate: turn the MPR planes about the normal of the view, or drag the 3D MIP view",
+  maskshift: "Shift the DSA mask: drag over the image to align it",
 };
 
 // Tooltips and preset labels are generated from the keymap, so they never go stale
@@ -179,6 +192,12 @@ function refreshTooltips(): void {
   }
   layoutBtn.title = `Choose how many views to show (up to ${MAX_COLS} × ${MAX_ROWS})`;
   setTip(mprBtn, "Multiplanar reformat: axial, coronal and sagittal views", "mpr.toggle");
+  setTip(dsaBtn, "Digital subtraction angiography", "dsa.toggle");
+  setTip(loopInBtn, "Loop start at this frame", "cine.markIn");
+  setTip(loopOutBtn, "Loop end at this frame (Alt+L clears the loop)", "cine.markOut");
+  setTip(pingBtn, "Ping-pong playback", "cine.pingpong");
+  setTip(bookBtn, "Bookmark this frame (next: Alt+., previous: Alt+,)", "bookmark.toggle");
+  tprojSel.title = "Projection over time: Min keeps the darkest value, Max the brightest";
   setTip(mipViewBtn, "3D MIP in the fourth view: drag with the rotate tool", "mpr.mipView");
   setTip(resetRotBtn, "Reset the rotation of the MPR planes", "mpr.resetRotation");
   slabModeSel.title = "Projection through a slab: thin plane, MIP, MinIP or average";
@@ -551,6 +570,21 @@ function syncControls(): void {
   for (const el of [crossBtn, rotateBtn, mipViewBtn, resetRotBtn, slabModeSel, slabThickSel]) {
     el.hidden = !inMpr;
   }
+
+  // Angiography controls: XA or RF series with several grayscale frames
+  const angio = vp.angioCandidate;
+  angioWrap.hidden = !angio;
+  for (const el of [maskShiftBtn, dsaMaskSel, dsaModeSel]) el.hidden = !(angio && vp.dsaOn);
+  setPressed(dsaBtn, vp.dsaOn);
+  dsaMaskSel.value = vp.maskChoice;
+  dsaModeSel.value = vp.subtractMode;
+  tprojSel.value = vp.projection;
+  if (tool === "maskshift" && !vp.dsaOn) setTool("window");
+
+  cineWrap.hidden = n < 2 || vp.isReformat;
+  setPressed(loopInBtn, vp.loopRange !== null);
+  setPressed(pingBtn, vp.pingPongOn);
+  setPressed(bookBtn, vp.bookmarked);
   setPressed(mipViewBtn, mpr?.mipOn ?? false);
   slabThickSel.disabled = slabModeSel.value === "none";
 
@@ -961,6 +995,25 @@ sliderPosBtn.addEventListener("click", toggleSliderPos);
 syncScrollBtn.addEventListener("click", toggleSyncScroll);
 syncWindowBtn.addEventListener("click", toggleSyncWindow);
 mprBtn.addEventListener("click", () => void toggleMpr());
+dsaBtn.addEventListener("click", () => toggleDsa());
+dsaMaskSel.addEventListener("change", () => {
+  if (dsaMaskSel.value === "cur") active.setMaskHere();
+  else active.setMaskFirst(Number(dsaMaskSel.value));
+  dsaMaskSel.blur();
+});
+dsaModeSel.addEventListener("change", () => {
+  active.setSubtractMode(dsaModeSel.value === "log" ? "log" : "linear");
+  dsaModeSel.blur();
+});
+tprojSel.addEventListener("change", () => {
+  const modes: ProjectionMode[] = ["off", "min", "max", "mean"];
+  active.setProjection(modes.find((m) => m === tprojSel.value) ?? "off");
+  tprojSel.blur();
+});
+loopInBtn.addEventListener("click", () => active.markIn());
+loopOutBtn.addEventListener("click", () => active.markOut());
+pingBtn.addEventListener("click", () => active.togglePingPong());
+bookBtn.addEventListener("click", () => active.toggleBookmark());
 mipViewBtn.addEventListener("click", () => handlers["mpr.mipView"]?.());
 resetRotBtn.addEventListener("click", () => mpr?.resetRotation());
 
@@ -1036,6 +1089,15 @@ tagsBtn.addEventListener("click", openTags);
 // ---------- Keyboard ----------
 // One handler per action id; the keys that trigger them live in keymap.ts and the settings.
 // Image, view and window actions apply to the active viewport.
+
+function toggleDsa(): void {
+  if (!active.angioCandidate) {
+    flashStatus("DSA needs an XA series with several frames");
+    return;
+  }
+  void active.setDsa(!active.dsaOn);
+}
+
 const handlers: Record<string, () => void> = {
   "slice.prev": () => active.goto(active.index - 1),
   "slice.next": () => active.goto(active.index + 1),
@@ -1102,6 +1164,26 @@ const handlers: Record<string, () => void> = {
   "sync.window": toggleSyncWindow,
   "export.save": () => void exportImage(false),
   "export.copy": () => void exportImage(true),
+
+  "dsa.toggle": toggleDsa,
+  "tool.maskshift": () => {
+    if (active.dsaOn) setTool("maskshift");
+    else flashStatus("Turn DSA on to shift the mask");
+  },
+  "dsa.maskHere": () => active.setMaskHere(),
+  "dsa.shiftLeft": () => active.shiftMask(-1, 0),
+  "dsa.shiftRight": () => active.shiftMask(1, 0),
+  "dsa.shiftUp": () => active.shiftMask(0, -1),
+  "dsa.shiftDown": () => active.shiftMask(0, 1),
+  "dsa.shiftReset": () => active.resetShift(),
+  "tproj.cycle": () => active.cycleProjection(),
+  "cine.markIn": () => active.markIn(),
+  "cine.markOut": () => active.markOut(),
+  "cine.clearLoop": () => active.clearLoop(),
+  "cine.pingpong": () => active.togglePingPong(),
+  "bookmark.toggle": () => active.toggleBookmark(),
+  "bookmark.next": () => active.gotoBookmark(1),
+  "bookmark.prev": () => active.gotoBookmark(-1),
 };
 for (let i = 1; i <= PRESET_COUNT; i++) {
   handlers[`preset.${i}`] = () => applyPreset(i - 1);

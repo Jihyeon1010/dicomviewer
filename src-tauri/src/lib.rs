@@ -82,6 +82,10 @@ struct SliceMeta {
     pixel_spacing: Option<[f64; 2]>, // [row spacing, column spacing] in mm, as in DICOM
     spacing_is_imager: bool, // true when the spacing comes from ImagerPixelSpacing (approximate)
     cine_fps: Option<f64>,   // playback rate from CineRate, FrameTime or the recommended rate
+    frame_time_ms: Option<f64>,         // FrameTime: nominal time between frames
+    positioner_primary: Option<f64>,    // degrees, positive towards LAO
+    positioner_secondary: Option<f64>,  // degrees, positive towards cranial
+    intensity_relation: String,         // PixelIntensityRelationship: LIN, LOG or DISP
     image_orientation: Option<[f64; 6]>, // row cosines, then column cosines (patient LPS)
     patient_orientation: String, // raw "row\column" codes, used by projection images
     frame: u32,
@@ -726,6 +730,8 @@ fn get_slice_meta(
         .or_else(|| opt_f64(&obj, tags::RECOMMENDED_DISPLAY_FRAME_RATE))
         .filter(|f| f.is_finite() && *f > 0.0);
 
+    let frame_time_ms = opt_f64(&obj, tags::FRAME_TIME).filter(|t| t.is_finite() && *t > 0.0);
+
     // Fall back to the z component of ImagePositionPatient when SliceLocation is absent
     let slice_location = opt_f64(&obj, tags::SLICE_LOCATION).or_else(|| {
         multi_f64(&obj, tags::IMAGE_POSITION_PATIENT).and_then(|v| v.get(2).copied())
@@ -767,6 +773,10 @@ fn get_slice_meta(
         pixel_spacing: spacing,
         spacing_is_imager,
         cine_fps,
+        frame_time_ms,
+        positioner_primary: opt_f64(&obj, tags::POSITIONER_PRIMARY_ANGLE),
+        positioner_secondary: opt_f64(&obj, tags::POSITIONER_SECONDARY_ANGLE),
+        intensity_relation: text_of(&obj, tags::PIXEL_INTENSITY_RELATIONSHIP),
         image_orientation: orientation,
         patient_orientation: text_of(&obj, tags::PATIENT_ORIENTATION),
         frame,

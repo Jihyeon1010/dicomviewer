@@ -65,6 +65,11 @@ const ICONS = {
     '<circle cx="12" cy="12" r="2"/><ellipse cx="12" cy="12" rx="10" ry="4" transform="rotate(-30 12 12)"/>',
   globe:
     '<circle cx="12" cy="12" r="8"/><path d="M4 12h16M12 4c3 3 3 13 0 16M12 4c-3 3-3 13 0 16"/>',
+  subtract: '<circle cx="9" cy="12" r="6"/><circle cx="15" cy="12" r="6"/>',
+  "mark-in": '<path d="M8 4H5v16h3"/><path d="M10 12h10M16 8l4 4-4 4"/>',
+  "mark-out": '<path d="M16 4h3v16h-3"/><path d="M14 12H4M8 8l-4 4 4 4"/>',
+  pingpong: '<path d="M4 8h16M16 4l4 4-4 4"/><path d="M20 16H4M8 12l-4 4 4 4"/>',
+  bookmark: '<path d="M6 3h12v18l-6-4-6 4z"/>',
   compass:
     '<circle cx="12" cy="12" r="9"/><path d="M16.2 7.8 14 14l-6.2 2.2L10 10z"/>',
   aneurysm:
