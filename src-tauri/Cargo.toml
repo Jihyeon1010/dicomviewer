@@ -29,6 +29,9 @@ rayon = "1.12.0"
 dicom-pixeldata = { version = "0.10.0", features = ["image"] }
 
 
+[dev-dependencies]
+tauri = { version = "2", features = ["test"] }
+
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]
 codegen-units = 1

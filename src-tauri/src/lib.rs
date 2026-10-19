@@ -1486,3 +1486,114 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+
+// Checks against real series. They need files, so they only run on request:
+//   DICOM_SAMPLE=/path/to/series cargo test --release --lib real_series -- --ignored --nocapture
+#[cfg(test)]
+mod real_data {
+    use super::*;
+    use tauri::Manager;
+
+    #[test]
+    #[ignore]
+    fn real_series() {
+        let Ok(dir) = std::env::var("DICOM_SAMPLE") else {
+            println!("Set DICOM_SAMPLE to a folder with a DICOM series");
+            return;
+        };
+        let app = tauri::test::mock_app();
+        app.manage(AppState::default());
+        let state = app.state::<AppState>();
+
+        let t = std::time::Instant::now();
+        let series = load_paths(collect_paths(vec![dir.clone()]), &state);
+        println!("{dir}: {} series, read headers in {:?}", series.len(), t.elapsed());
+        let s = series.iter().max_by_key(|s| s.slice_count).expect("no series");
+        println!("series {:?}: {} images", s.description, s.slice_count);
+
+        let t = std::time::Instant::now();
+        let info = build_volume(s.uid.clone(), state.clone()).expect("volume");
+        println!("volume built in {:?}: {}x{}x{}, spacing {:?}, slice spacing {:?}, uniform {}, tilt {:.2}",
+            t.elapsed(), info.cols, info.rows, info.depth, info.pixel_spacing, info.slice_spacing, info.uniform, info.tilt_deg);
+        println!("values {:.0} .. {:.0}, 2%..98% = {:.0} .. {:.0}", info.value_min, info.value_max, info.value_low, info.value_high);
+        println!("orientation {:?}\nz_dir {:?}\norigin {:?}", info.orientation, info.z_dir, info.origin);
+        assert_eq!(info.z_positions.len(), info.depth as usize);
+        assert!(info.value_low <= info.value_high);
+
+        // Where the first and last image lie in the patient, from the files themselves
+        let slices = series_slices(&state, &s.uid);
+        let (first, last) = (slices.first().unwrap(), slices.last().unwrap());
+        let vol = volume_for(&state, &s.uid).unwrap();
+        let frame = match (vol.info.orientation, vol.info.z_dir) {
+            (Some(o), Some(n)) => Some(surface::Frame { x: [o[0], o[1], o[2]], y: [o[3], o[4], o[5]], z: n, origin: vol.info.origin }),
+            _ => None,
+        };
+        let place = surface::Placement { frame, coords: surface::Coords::Lps };
+        let zl = *vol.z.last().unwrap() as f32;
+        let a = place.point([0.0, 0.0, 0.0]);
+        let b = place.point([0.0, 0.0, zl]);
+        println!("first image: file position {:?}, placed {:?}", first.ipp, a);
+        println!("last image:  file position {:?}, placed {:?}", last.ipp, b);
+        if let (Some(f), Some(l)) = (first.ipp, last.ipp) {
+            let d = |p: [f32; 3], q: [f64; 3]| ((f64::from(p[0]) - q[0]).powi(2) + (f64::from(p[1]) - q[1]).powi(2) + (f64::from(p[2]) - q[2]).powi(2)).sqrt();
+            println!("distance between placed and file positions: first {:.4} mm, last {:.4} mm", d(a, f), d(b, l));
+            assert!(d(a, f) < 0.01, "the first image is not where the file says");
+            assert!(d(b, l) < 0.05 + info.tilt_deg.to_radians().sin() * zl as f64, "the last image is not where the file says");
+        }
+
+        // The data for the GPU
+        let geo = geometry_of(&vol);
+        let t = std::time::Instant::now();
+        let dims = mpr::texture_dims(&geo, 2048, 384 << 20);
+        let tex = mpr::build_texture(&vol.slices, &geo, dims).unwrap();
+        println!("texture {:?}, {:.0} MB in {:?}", dims, tex.len() as f64 * 2.0 / 1048576.0, t.elapsed());
+
+        // Surfaces
+        let dir_out = std::env::temp_dir();
+        for (label, threshold, max, part, smooth) in [
+            ("bone-like, largest", 300.0, None, "largest", 10u32),
+            ("bone-like, no smoothing", 300.0, None, "largest", 0),
+            ("vessels, max 700, largest", 200.0, Some(700.0), "largest", 10),
+        ] {
+            let q = SurfaceQuery { threshold, max_threshold: max, smooth };
+            let t = std::time::Instant::now();
+            match surface_of(&vol, &q, part, None, 0, MAX_DISPLAY_TRIANGLES) {
+                Ok(m) => {
+                    let mut lo = [f32::MAX; 3];
+                    let mut hi = [f32::MIN; 3];
+                    for p in m.positions.chunks_exact(3) {
+                        for k in 0..3 { lo[k] = lo[k].min(p[k]); hi[k] = hi[k].max(p[k]); }
+                    }
+                    println!("{label}: {} triangles in {:?}; extent x {:.1}..{:.1}, y {:.1}..{:.1}, z {:.1}..{:.1} mm",
+                        m.triangle_count(), t.elapsed(), lo[0], hi[0], lo[1], hi[1], lo[2], hi[2]);
+                    if label.starts_with("bone-like, largest") {
+                        for (ext, bytes) in [
+                            ("stl", surface::stl_bytes(&m, |p| place.point(p))),
+                            ("obj", surface::obj_bytes(&m, &place)),
+                            ("ply", surface::ply_bytes(&m, &place)),
+                        ] {
+                            let path = dir_out.join(format!("real_series_test.{ext}"));
+                            std::fs::write(&path, &bytes).unwrap();
+                            println!("  wrote {} ({:.1} MB)", path.display(), bytes.len() as f64 / 1048576.0);
+                        }
+                    }
+                }
+                Err(e) => println!("{label}: {e} (after {:?})", t.elapsed()),
+            }
+        }
+
+        // Growing from the brightest voxel near the middle of the volume
+        let mid = vol.slices.len() / 2;
+        let (mut best, mut at) = (f32::MIN, (0usize, 0usize));
+        for (idx, &v) in vol.slices[mid].iter().enumerate() {
+            if v > best { best = v; at = (idx % vol.info.cols as usize, idx / vol.info.cols as usize); }
+        }
+        let q = SurfaceQuery { threshold: best as f64 * 0.5, max_threshold: None, smooth: 10 };
+        let seed = Some([at.0 as u32, at.1 as u32, mid as u32]);
+        let t = std::time::Instant::now();
+        match surface_of(&vol, &q, "at", seed, 0, MAX_DISPLAY_TRIANGLES) {
+            Ok(m) => println!("grow from the brightest voxel of the middle image ({best:.0}) with threshold {:.0}: {} triangles in {:?}", best * 0.5, m.triangle_count(), t.elapsed()),
+            Err(e) => println!("grow from the brightest voxel ({best:.0}), threshold {:.0}: {e}", best * 0.5),
+        }
+    }
+}

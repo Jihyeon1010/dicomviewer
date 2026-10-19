@@ -56,6 +56,10 @@ npm run tauri build   # a release build and installer
 ```bash
 npm run build                    # type check (tsc) and bundle
 cd src-tauri && cargo test --lib # unit tests of the volume, MPR and surface code
+
+# Optional: run the volume, surface and export code on a real series. It checks the
+# placement of the exported files against the positions stored in the DICOM files.
+DICOM_SAMPLE=/path/to/series cargo test --release --lib real_series -- --ignored --nocapture
 ```
 
 ## Using the 3D features
