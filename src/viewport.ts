@@ -314,6 +314,9 @@ export class Viewport {
   private orient: Orient = { ...NO_ORIENT };
   private plane: Plane = "axial"; // which plane this view shows; decides the standard orientation
   private baseOrient: Orient = { ...NO_ORIENT }; // the automatic part of the orientation
+  // Where the crosshair (or the middle of the image) is on screen, and the screen pixels per
+  // millimetre, when the images of an MPR view are about to be replaced
+  private keep: { screen: Pt; pxPerMm: number } | null = null;
   private autoPending = true; // the automatic orientation is applied once per content
   private autoFit = true; // keep the image fitted until the user zooms or pans
   private firstLoad = true; // apply the file's default WL/WW only once per series
@@ -467,6 +470,7 @@ export class Viewport {
    */
   replaceSource(source: SliceSource, count?: number, index?: number): void {
     if (!this.source) return;
+    this.keep = this.holdView();
     this.source = source;
     if (count !== undefined) this.count = Math.max(1, count);
     if (index !== undefined) this.index = clamp(index, 0, this.count - 1);
@@ -535,6 +539,8 @@ export class Viewport {
 
       const dimsChanged =
         !this.current || this.current.rows !== slice.rows || this.current.cols !== slice.cols;
+      const keep = this.keep;
+      this.keep = null;
       this.current = slice;
       this.meta = m;
       this.renderer?.upload(slice);
@@ -558,7 +564,9 @@ export class Viewport {
         // Resizing clears the drawing buffer, so draw right after
         this.ui.canvas.width = slice.cols;
         this.ui.canvas.height = slice.rows;
-        if (this.autoFit) this.fitView();
+        const mm = m?.pixel_spacing?.[1];
+        if (keep && mm && mm > 0) this.continueView(keep, mm);
+        else if (this.autoFit) this.fitView();
         else this.applyTransform();
       }
       this.setStatus("");
@@ -954,6 +962,26 @@ export class Viewport {
       this.panY += hold.s.y - t.y;
     }
     this.orientChanged(false);
+  }
+
+  // The images of a reformatted view change size when its planes are turned. Instead of
+  // fitting the new image, keep the size of things on screen and the point of interest where it was.
+  private holdView(): { screen: Pt; pxPerMm: number } | null {
+    const s = this.current;
+    const mm = this.meta?.pixel_spacing?.[1];
+    if (!s || !mm || mm <= 0) return null;
+    const at = this.crosshairPoint() ?? { x: s.cols / 2, y: s.rows / 2 };
+    return { screen: this.toScreen(at), pxPerMm: this.zoom / mm };
+  }
+
+  private continueView(keep: { screen: Pt; pxPerMm: number }, mm: number): void {
+    this.zoom = clamp(keep.pxPerMm * mm, 0.05, 50);
+    const s = this.size();
+    const at = this.crosshairPoint() ?? { x: s.cols / 2, y: s.rows / 2 };
+    const t = this.toScreen(at);
+    this.panX += keep.screen.x - t.x;
+    this.panY += keep.screen.y - t.y;
+    this.applyTransform();
   }
 
   // The crosshair of an MPR view as an image position
