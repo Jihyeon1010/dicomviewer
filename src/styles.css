@@ -89,15 +89,17 @@ button:focus-visible, select:focus-visible, input:focus-visible {
   border-radius: 6px;
 }
 #toolbar .group > input[type="number"] {
-  width: 64px;
+  width: 76px;
   height: 24px;
   padding: 0 6px;
   color: var(--text);
-  background: transparent;
+  background: rgba(255, 255, 255, 0.05);
   border: 1px solid transparent;
   border-radius: 6px;
   font: inherit;
+  font-variant-numeric: tabular-nums;
 }
+#toolbar .group > input[type="number"]::placeholder { color: var(--muted); }
 #toolbar .group > input[type="number"]:hover,
 #toolbar .group > input[type="number"]:focus {
   background: rgba(255, 255, 255, 0.07);
@@ -112,6 +114,26 @@ button:focus-visible, select:focus-visible, input:focus-visible {
   background: var(--accent-soft);
   border-color: var(--accent-line);
 }
+
+/* Options of the current mode (MPR, 3D, angiography, cine) get a row of their own, so the
+   main toolbar keeps a steady shape. A group without visible controls disappears, and so
+   does the row when no group is left. */
+#context-bar {
+  flex: 0 0 100%;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  margin: 2px -12px -8px;
+  padding: 6px 12px 8px;
+  background: rgba(255, 255, 255, 0.02);
+  border-top: 1px solid var(--border);
+}
+/* Display options sit at the right edge, also when they wrap into a row of their own */
+#toolbar > .group.end { margin-left: auto; }
+
+#context-bar:not(:has(> .group:not([hidden]) > :not([hidden]))) { display: none; }
+#toolbar .group:not(:has(> :not([hidden]))) { display: none; }
 
 /* ---------- Layout ---------- */
 #body { flex: 1; display: flex; min-height: 0; }
@@ -412,7 +434,35 @@ body.dragging #viewports::after { border-color: var(--accent); }
   background: var(--panel);
   border-top: 1px solid var(--border);
 }
-#slider { flex: 1; accent-color: var(--accent); }
+#slider {
+  flex: 1;
+  height: 16px;
+  margin: 0;
+  background: transparent;
+  -webkit-appearance: none;
+  appearance: none;
+  cursor: pointer;
+}
+#slider::-webkit-slider-runnable-track {
+  height: 3px;
+  background: var(--border-strong);
+  border-radius: 2px;
+}
+#slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  margin-top: -5.5px; /* centres the thumb on the track */
+  background: #fff;
+  border: 0;
+  border-radius: 50%;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.35), 0 1px 4px rgba(0, 0, 0, 0.5);
+  transition: transform 0.1s ease-out, background-color 0.12s;
+}
+#slider:hover::-webkit-slider-thumb { background: var(--accent); }
+#slider:active::-webkit-slider-thumb { transform: scale(1.15); background: var(--accent); }
+#slider:disabled { opacity: 0.4; cursor: default; }
 
 #stage[data-slider="right"] { flex-direction: row; }
 #stage[data-slider="right"] #viewports { min-width: 0; }
@@ -654,6 +704,18 @@ body.dragging #viewports::after { border-color: var(--accent); }
 /* ---------- MPR ---------- */
 /* The hidden attribute must win over the display rules of the toolbar controls */
 #toolbar [hidden] { display: none !important; }
+
+/* Pressing answers at once; buttons give a little under the finger */
+#toolbar .group > button:active:not(:disabled) { transform: scale(0.96); }
+#toolbar .group > button { transition: background-color 0.12s, border-color 0.12s, color 0.12s, transform 0.1s ease-out; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+  }
+  #toolbar .group > button:active:not(:disabled) { transform: none; }
+}
 #viewports[data-tool="cross"] .vp { cursor: crosshair; }
 
 #orient-mode .lbl { min-width: 62px; text-align: left; }

@@ -29,6 +29,10 @@ const ICONS = {
 
   // Layout and linking
   layout: '<rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 12h18M12 3v18"/>',
+  // Three consecutive images side by side
+  tile:
+    '<rect x="2" y="5" width="6" height="14" rx="1.2"/><rect x="9" y="5" width="6" height="14" rx="1.2"/>' +
+    '<rect x="16" y="5" width="6" height="14" rx="1.2"/>',
   link:
     '<path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7"/>' +
     '<path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7"/>',

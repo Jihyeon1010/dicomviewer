@@ -41,93 +41,13 @@
     </div>
 
     <div class="group">
-      <button id="tile"><span class="ic" data-icon="list"></span><span class="lbl">Tile</span></button>
+      <button id="tile"><span class="ic" data-icon="tile"></span><span class="lbl">Tile</span></button>
       <button id="sync-scroll"><span class="ic" data-icon="link"></span><span class="lbl">Scroll</span></button>
       <button id="sync-window"><span class="ic" data-icon="link"></span><span class="lbl">W/L</span></button>
-      <div class="group" id="mpr-wrap">
-        <button id="mpr"><span class="ic" data-icon="mpr"></span><span class="lbl">MPR</span></button>
-        <button id="cross" class="tool ib" data-tool="cross" aria-label="Crosshair" hidden><span class="ic" data-icon="locate"></span></button>
-        <button id="rotate" class="tool ib" data-tool="rotate" aria-label="Rotate MPR planes" hidden><span class="ic" data-icon="orbit"></span></button>
-        <button id="mip-view" class="ib" aria-label="3D MIP view" hidden><span class="ic" data-icon="globe"></span></button>
-        <select id="view3d" aria-label="3D view" hidden>
-          <option value="max">MIP</option>
-          <option value="min">MinIP</option>
-          <option value="mean">Average</option>
-          <option value="vr">Volume</option>
-          <option value="surface">Surface</option>
-        </select>
-        <select id="vr-preset" aria-label="Volume rendering preset" hidden>
-          <option value="generic">Generic</option>
-          <option value="bone">Bone</option>
-          <option value="vessel">Vessels (CTA)</option>
-          <option value="soft">Soft tissue</option>
-        </select>
-        <select id="vr-thick" aria-label="Volume rendering thickness" hidden>
-          <option value="Infinity" selected>Full</option>
-          <option value="120">120 mm</option>
-          <option value="60">60 mm</option>
-          <option value="30">30 mm</option>
-          <option value="15">15 mm</option>
-        </select>
-        <input id="surf-thr" type="number" step="10" aria-label="Surface threshold" hidden />
-        <select id="surf-part" aria-label="Parts of the surface" hidden>
-          <option value="all">All parts</option>
-          <option value="largest" selected>Largest part</option>
-          <option value="at">Part at crosshair</option>
-        </select>
-        <select id="surf-detail" aria-label="Surface detail" hidden>
-          <option value="0" selected>Auto detail</option>
-          <option value="1">Fine</option>
-          <option value="2">Medium</option>
-          <option value="3">Coarse</option>
-        </select>
-        <button id="surf-update" aria-label="Build the surface again" hidden><span class="lbl">Update</span></button>
-        <button id="surf-stl" aria-label="Save the surface as an STL file" hidden><span class="lbl">STL</span></button>
-        <button id="reset-rot" class="ib" aria-label="Reset MPR rotation" hidden><span class="ic" data-icon="undo"></span></button>
-        <select id="slab-mode" aria-label="Slab projection" hidden>
-          <option value="none">Thin</option>
-          <option value="max">MIP</option>
-          <option value="min">MinIP</option>
-          <option value="mean">Average</option>
-        </select>
-        <select id="slab-thick" aria-label="Slab thickness" hidden>
-          <option value="3">3 mm</option>
-          <option value="5">5 mm</option>
-          <option value="10" selected>10 mm</option>
-          <option value="20">20 mm</option>
-          <option value="40">40 mm</option>
-          <option value="80">80 mm</option>
-          <option value="1000000">Full</option>
-        </select>
-      </div>
-      <div class="group" id="angio-wrap" hidden>
-      <button id="dsa"><span class="ic" data-icon="subtract"></span><span class="lbl">DSA</span></button>
-      <button id="mask-shift" class="tool ib" data-tool="maskshift" aria-label="Shift the mask" hidden><span class="ic" data-icon="move"></span></button>
-      <select id="dsa-mask" aria-label="Mask frames" hidden>
-        <option value="1">Mask: 1st frame</option>
-        <option value="3">Mask: first 3</option>
-        <option value="5">Mask: first 5</option>
-        <option value="10">Mask: first 10</option>
-        <option value="cur">Mask: this frame</option>
-      </select>
-      <select id="dsa-mode" aria-label="Subtraction mode" hidden>
-        <option value="linear">Linear</option>
-        <option value="log">Log</option>
-      </select>
-      <select id="tproj" aria-label="Projection over time">
-        <option value="off">Frames</option>
-        <option value="min">Min over time</option>
-        <option value="max">Max over time</option>
-        <option value="mean">Mean over time</option>
-      </select>
     </div>
 
-    <div class="group" id="cine-wrap" hidden>
-      <button id="loop-in" class="ib" aria-label="Loop start"><span class="ic" data-icon="mark-in"></span></button>
-      <button id="loop-out" class="ib" aria-label="Loop end"><span class="ic" data-icon="mark-out"></span></button>
-      <button id="pingpong" class="ib" aria-label="Ping-pong playback"><span class="ic" data-icon="pingpong"></span></button>
-      <button id="bookmark" class="ib" aria-label="Bookmark this frame"><span class="ic" data-icon="bookmark"></span></button>
-    </div>
+    <div class="group">
+      <button id="mpr"><span class="ic" data-icon="mpr"></span><span class="lbl">MPR</span></button>
     </div>
 
     <div class="group">
@@ -149,13 +69,102 @@
       <button id="cine" class="ib" aria-label="Play or pause cine"><span class="ic" data-icon="play"></span></button>
     </div>
 
-    <div class="group">
+    <div class="group" id="cine-wrap" hidden>
+      <button id="loop-in" class="ib" aria-label="Loop start"><span class="ic" data-icon="mark-in"></span></button>
+      <button id="loop-out" class="ib" aria-label="Loop end"><span class="ic" data-icon="mark-out"></span></button>
+      <button id="pingpong" class="ib" aria-label="Ping-pong playback"><span class="ic" data-icon="pingpong"></span></button>
+      <button id="bookmark" class="ib" aria-label="Bookmark this frame"><span class="ic" data-icon="bookmark"></span></button>
+    </div>
+
+    <div class="group end">
       <button id="info"><span class="ic" data-icon="info"></span><span class="lbl">Full</span></button>
       <button id="markers" class="ib" aria-label="Markers and scale bars"><span class="ic" data-icon="crosshair"></span></button>
       <button id="slider-pos" class="ib" aria-label="Image slider position"><span class="ic" data-icon="panel-bottom"></span></button>
       <button id="anonymize" class="ib" aria-label="Anonymize"><span class="ic" data-icon="eye-off"></span></button>
       <button id="tags-btn" class="ib" aria-label="DICOM tags"><span class="ic" data-icon="list"></span></button>
       <button id="settings-open" class="ib" aria-label="Settings"><span class="ic" data-icon="cog"></span></button>
+    </div>
+
+    <!-- Options of the current mode (MPR, 3D, angiography, cine); empty groups hide themselves -->
+    <div id="context-bar" role="toolbar" aria-label="Mode options">
+      <div class="group" id="mpr-tools">
+        <button id="cross" class="tool ib" data-tool="cross" aria-label="Crosshair" hidden><span class="ic" data-icon="locate"></span></button>
+        <button id="rotate" class="tool ib" data-tool="rotate" aria-label="Rotate MPR planes" hidden><span class="ic" data-icon="orbit"></span></button>
+        <button id="reset-rot" class="ib" aria-label="Reset MPR rotation" hidden><span class="ic" data-icon="undo"></span></button>
+        <select id="slab-mode" aria-label="Slab projection" hidden>
+          <option value="none">Thin</option>
+          <option value="max">MIP</option>
+          <option value="min">MinIP</option>
+          <option value="mean">Average</option>
+        </select>
+        <select id="slab-thick" aria-label="Slab thickness" hidden>
+          <option value="3">3 mm</option>
+          <option value="5">5 mm</option>
+          <option value="10" selected>10 mm</option>
+          <option value="20">20 mm</option>
+          <option value="40">40 mm</option>
+          <option value="80">80 mm</option>
+          <option value="1000000">Full</option>
+        </select>
+      </div>
+      <div class="group" id="view3d-tools">
+        <button id="mip-view" class="ib" aria-label="3D view" hidden><span class="ic" data-icon="globe"></span></button>
+        <select id="view3d" aria-label="3D view" hidden>
+          <option value="max">MIP</option>
+          <option value="min">MinIP</option>
+          <option value="mean">Average</option>
+          <option value="vr">Volume</option>
+          <option value="surface">Surface</option>
+        </select>
+        <select id="vr-preset" aria-label="Volume rendering preset" hidden>
+          <option value="generic">Generic</option>
+          <option value="bone">Bone</option>
+          <option value="vessel">Vessels (CTA)</option>
+          <option value="soft">Soft tissue</option>
+        </select>
+        <select id="vr-thick" aria-label="Volume rendering thickness" hidden>
+          <option value="Infinity" selected>Full</option>
+          <option value="120">120 mm</option>
+          <option value="60">60 mm</option>
+          <option value="30">30 mm</option>
+          <option value="15">15 mm</option>
+        </select>
+        <input id="surf-thr" type="number" step="10" placeholder="Threshold" aria-label="Surface threshold" hidden />
+        <select id="surf-part" aria-label="Parts of the surface" hidden>
+          <option value="all">All parts</option>
+          <option value="largest" selected>Largest part</option>
+          <option value="at">Part at crosshair</option>
+        </select>
+        <select id="surf-detail" aria-label="Surface detail" hidden>
+          <option value="0" selected>Auto detail</option>
+          <option value="1">Fine</option>
+          <option value="2">Medium</option>
+          <option value="3">Coarse</option>
+        </select>
+        <button id="surf-update" aria-label="Build the surface again" hidden><span class="lbl">Update</span></button>
+        <button id="surf-stl" aria-label="Save the surface as an STL file" hidden><span class="lbl">STL</span></button>
+      </div>
+      <div class="group" id="angio-wrap" hidden>
+        <button id="dsa"><span class="ic" data-icon="subtract"></span><span class="lbl">DSA</span></button>
+        <button id="mask-shift" class="tool ib" data-tool="maskshift" aria-label="Shift the mask" hidden><span class="ic" data-icon="move"></span></button>
+        <select id="dsa-mask" aria-label="Mask frames" hidden>
+          <option value="1">Mask: 1st frame</option>
+          <option value="3">Mask: first 3</option>
+          <option value="5">Mask: first 5</option>
+          <option value="10">Mask: first 10</option>
+          <option value="cur">Mask: this frame</option>
+        </select>
+        <select id="dsa-mode" aria-label="Subtraction mode" hidden>
+          <option value="linear">Linear</option>
+          <option value="log">Log</option>
+        </select>
+        <select id="tproj" aria-label="Projection over time">
+          <option value="off">Frames</option>
+          <option value="min">Min over time</option>
+          <option value="max">Max over time</option>
+          <option value="mean">Mean over time</option>
+        </select>
+      </div>
     </div>
   </header>
 
