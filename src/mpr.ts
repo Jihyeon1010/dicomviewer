@@ -292,6 +292,7 @@ export class Mpr {
   private surfBuilt = ""; // the request that the mesh on the GPU was built for
   private surfRev = 0; // changes with every new mesh, for the image cache
   private surfTriangles = 0;
+  private readonly lookAlong: 1 | -1;
   private mipScaleNow = MIP_FINAL;
   private gpu: VolumeGL | null = null; // the volume on the GPU, when it could be put there
   private gpuLoad: Promise<void> | null = null;
@@ -329,6 +330,7 @@ export class Mpr {
     this.p0 = p0;
     this.c = [...this.v0];
     this.vrPreset = opts.baseMeta?.modality === "CT" ? "bone" : "generic";
+    this.lookAlong = this.viewSide();
     const { value_min: lo, value_max: hi } = opts.volume;
     this.surf = {
       threshold: opts.baseMeta?.modality === "CT" ? 300 : Math.round((lo + hi) / 2),
@@ -879,6 +881,7 @@ export class Mpr {
     const suffix = vr ? " · 3D Volume" : surf ? " · 3D Surface" : ` · 3D ${name}`;
     const thick = this.vrThickMm;
     const radius = this.diag * 0.55;
+    const lookAlong = this.lookAlong;
     const key = vr
       ? `vr:${this.vrPreset}:${thick}`
       : surf
@@ -899,9 +902,9 @@ export class Mpr {
               pixelMm: sz.p,
               stepMm: sz.p,
             };
-            if (vr) slice = gpu.render({ ...view, slabMm: thick, shade: true });
+            if (vr) slice = gpu.render({ ...view, slabMm: thick, shade: true, lookAlong });
             else if (surf) {
-              slice = gpu.drawMesh({ ...view, slabMm: thick, centre: v0, radius });
+              slice = gpu.drawMesh({ ...view, slabMm: thick, centre: v0, radius, lookAlong });
             } else slice = gpu.project({ ...view, mode });
           } catch (err) {
             console.warn("GPU rendering failed, using the CPU path:", err);
@@ -934,6 +937,18 @@ export class Mpr {
     let out = add(scale(cx, v[0]), scale(cy, v[1]));
     if (z) out = add(out, scale(z, v[2]));
     return out;
+  }
+
+  // The viewport turns the first image of the 3D view into the usual coronal picture (patient's
+  // right on the left, superior on top). That picture is a true one only when the viewer looks
+  // at the patient from the front, so the side from which volume renderings and surfaces are
+  // seen follows from the patient axes: u x v must then point towards the posterior.
+  private viewSide(): 1 | -1 {
+    const base = baseMipAxes();
+    const u = this.patient(base.u);
+    const v = this.patient(base.v);
+    if (!u || !v) return -1;
+    return cross(u, v)[1] > 1e-6 ? 1 : -1;
   }
 
   private orientation(ax: Axes): SliceMeta["image_orientation"] {

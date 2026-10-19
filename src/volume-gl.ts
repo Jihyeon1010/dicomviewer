@@ -30,6 +30,8 @@ export interface RenderParams {
   /** Thickness in mm of the part of the volume that is drawn, around its middle; Infinity for all */
   slabMm: number;
   shade: boolean;
+  /** The viewer looks along this sign times u x v; -1 unless the data needs the other side */
+  lookAlong?: 1 | -1;
 }
 
 /** A lit surface mesh drawn from the same view as the other renderings. */
@@ -44,6 +46,7 @@ export interface MeshParams {
   /** Middle and radius of a sphere around the volume; the depth range of the view */
   centre: V3;
   radius: number;
+  lookAlong?: 1 | -1; // see RenderParams
 }
 
 // Most samples taken along one ray
@@ -451,13 +454,13 @@ export class VolumeGL {
 
   /**
    * Renders the volume with the current transfer function as an 8-bit RGB image. The viewer
-   * looks along -(u x v), the direction in which the 3D view of the MPR is oriented.
+   * looks along -(u x v) unless `lookAlong` says otherwise.
    */
   render(p: RenderParams): SliceData {
     const vol = this.begin(p.width, p.height);
     const gl = this.gl;
     if (!this.lutTex) throw new Error("No transfer function set");
-    const dir = scale(unit(cross(p.u, p.v)), -1);
+    const dir = scale(unit(cross(p.u, p.v)), p.lookAlong ?? -1);
     this.checkDirection(dir);
 
     gl.useProgram(this.vr.prog);
@@ -552,7 +555,7 @@ export class VolumeGL {
     if (!(p.width > 0 && p.height > 0 && p.width <= max && p.height <= max)) {
       throw new Error("Unsupported image size");
     }
-    const dir = scale(unit(cross(p.u, p.v)), -1);
+    const dir = scale(unit(cross(p.u, p.v)), p.lookAlong ?? -1);
     this.checkDirection(dir);
 
     const target = this.depthTargetOf(p.width, p.height);
