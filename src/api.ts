@@ -147,6 +147,57 @@ export async function getObliqueSlice(
   return parseMpr(buf);
 }
 
+/** The volume of a series as half floats for the GPU, possibly scaled down. */
+export interface VolumeTexture {
+  cols: number;
+  rows: number;
+  depth: number;
+  slope: number; // raw 16-bit encoding of rendered images: value = raw * slope + intercept
+  intercept: number;
+  extent: V3; // mm between the first and last voxel centre along x, y and z
+  valueMin: number;
+  defaultWl: number | null;
+  defaultWw: number | null;
+  monochrome1: boolean;
+  data: Uint16Array; // half float bits, x fastest, then y, then z
+}
+
+const TEXTURE_HEADER_BYTES = 48;
+
+export async function getVolumeTexture(
+  uid: string,
+  maxDim: number,
+  maxBytes: number,
+): Promise<VolumeTexture> {
+  const buf = await invoke<ArrayBuffer>("get_volume_texture", { uid, maxDim, maxBytes });
+  if (buf.byteLength < TEXTURE_HEADER_BYTES) {
+    throw new Error(`Volume response too short (${buf.byteLength} bytes)`);
+  }
+  const dv = new DataView(buf);
+  const cols = dv.getUint32(0, true);
+  const rows = dv.getUint32(4, true);
+  const depth = dv.getUint32(8, true);
+  const count = cols * rows * depth;
+  if (count === 0 || buf.byteLength - TEXTURE_HEADER_BYTES < count * 2) {
+    throw new Error(`Volume size mismatch: ${cols}x${rows}x${depth}, ${buf.byteLength} bytes`);
+  }
+  const wc = dv.getFloat32(36, true);
+  const ww = dv.getFloat32(40, true);
+  return {
+    cols,
+    rows,
+    depth,
+    slope: dv.getFloat32(12, true),
+    intercept: dv.getFloat32(16, true),
+    extent: [dv.getFloat32(20, true), dv.getFloat32(24, true), dv.getFloat32(28, true)],
+    valueMin: dv.getFloat32(32, true),
+    defaultWl: Number.isFinite(wc) ? wc : null,
+    defaultWw: Number.isFinite(ww) && ww > 0 ? ww : null,
+    monochrome1: dv.getUint32(44, true) === 1,
+    data: new Uint16Array(buf, TEXTURE_HEADER_BYTES, count),
+  };
+}
+
 // Response (little-endian): [width u32][height u32][channels u32][width*height*channels bytes]
 // channels is 1 (8-bit gray) or 3 (8-bit RGB)
 export async function getThumbnail(uid: string, maxPx: number): Promise<ImageData> {

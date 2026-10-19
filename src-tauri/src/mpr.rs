@@ -383,6 +383,113 @@ pub fn encode(data: &[f32], e: &Encoding) -> Vec<u8> {
     out
 }
 
+// ---------- Volume texture for GPU rendering ----------
+
+/// Half-precision floats hold CT numbers to within 1 up to 2048 and to within 2 up to
+/// 4096, which is plenty for rendering and keeps the volume small and filterable on the GPU.
+const HALF_MAX: f32 = 65504.0;
+
+/// IEEE 754 binary16 bits of `v`, rounded to nearest even and clamped to the finite range.
+pub fn f16_bits(v: f32) -> u16 {
+    let v = if v.is_nan() {
+        0.0
+    } else {
+        v.clamp(-HALF_MAX, HALF_MAX)
+    };
+    let b = v.to_bits();
+    let sign = ((b >> 16) & 0x8000) as u16;
+    let exp = ((b >> 23) & 0xff) as i32;
+    let man = b & 0x7f_ffff;
+    let e = exp - 127 + 15;
+    if e <= 0 {
+        // Subnormal in half precision (or zero)
+        if e < -10 {
+            return sign;
+        }
+        let m = man | 0x80_0000;
+        let shift = (14 - e) as u32;
+        let mut h = (m >> shift) as u16;
+        let rem = m & ((1 << shift) - 1);
+        let half = 1 << (shift - 1);
+        if rem > half || (rem == half && h & 1 == 1) {
+            h += 1;
+        }
+        return sign | h;
+    }
+    let mut h = ((e as u32) << 10 | (man >> 13)) as u16;
+    let rem = man & 0x1fff;
+    if rem > 0x1000 || (rem == 0x1000 && h & 1 == 1) {
+        h += 1; // a carry into the exponent is correct
+    }
+    sign | h
+}
+
+/// Number of voxels per axis of the texture: the native size, scaled down evenly until no
+/// side exceeds `max_dim` and the half-float data fits in `max_bytes`.
+pub fn texture_dims(g: &Geometry, max_dim: usize, max_bytes: usize) -> (usize, usize, usize) {
+    let (c, r, d) = (g.cols, g.rows, g.depth());
+    let longest = c.max(r).max(d) as f64;
+    let mut s = (max_dim.max(2) as f64 / longest).min(1.0);
+    let voxels = (c * r * d) as f64;
+    let budget = (max_bytes / 2) as f64;
+    if voxels * s * s * s > budget {
+        s = s.min((budget / voxels).cbrt());
+    }
+    let scaled = |n: usize| ((n as f64 * s).floor() as usize).clamp(2.min(n), n);
+    (scaled(c), scaled(r), scaled(d))
+}
+
+/// The volume as half floats, x fastest, then y, then z. Images are resampled onto an even
+/// grid that spans the volume, so one scale per axis maps millimetres to texture coordinates.
+pub fn build_texture(
+    slices: &[Vec<f32>],
+    g: &Geometry,
+    dims: (usize, usize, usize),
+) -> Result<Vec<u16>, String> {
+    let depth = g.depth();
+    if depth < 2 || g.cols < 2 || g.rows < 2 || slices.len() != depth {
+        return Err("Inconsistent volume".into());
+    }
+    if slices.iter().any(|s| s.len() != g.cols * g.rows) {
+        return Err("Inconsistent volume".into());
+    }
+    let (tc, tr, td) = dims;
+    if tc < 2 || tr < 2 || td < 2 {
+        return Err("Unsupported texture size".into());
+    }
+
+    let sampler = Sampler::new(slices, g);
+    if (tc, tr, td) == (g.cols, g.rows, depth) && sampler.dz.is_some() {
+        // Evenly spaced images at full size: a plain conversion
+        let planes: Vec<Vec<u16>> = slices
+            .par_iter()
+            .map(|s| s.iter().map(|&v| f16_bits(v)).collect())
+            .collect();
+        return Ok(planes.concat());
+    }
+
+    let ext_x = (g.cols - 1) as f64 * sampler.sx;
+    let ext_y = (g.rows - 1) as f64 * sampler.sy;
+    let z0 = g.z[0];
+    let ext_z = g.z[depth - 1] - z0;
+    let planes: Vec<Vec<u16>> = (0..td)
+        .into_par_iter()
+        .map(|k| {
+            let z = z0 + ext_z * k as f64 / (td - 1) as f64;
+            let mut out = Vec::with_capacity(tc * tr);
+            for j in 0..tr {
+                let y = ext_y * j as f64 / (tr - 1) as f64;
+                for i in 0..tc {
+                    let x = ext_x * i as f64 / (tc - 1) as f64;
+                    out.push(f16_bits(sampler.at(x, y, z)));
+                }
+            }
+            out
+        })
+        .collect();
+    Ok(planes.concat())
+}
+
 // ---------- Oblique planes and rays ----------
 
 /// Largest side of an oblique image in pixels, and largest number of pixels
@@ -1005,5 +1112,55 @@ mod oblique_tests {
         assert!(reformat_oblique(&v, &geo(), &Oblique { width: 0, ..ok() }, 0.0).is_err());
         assert!(reformat_oblique(&v, &geo(), &Oblique { pixel_mm: 0.0, ..ok() }, 0.0).is_err());
         assert!(reformat_oblique(&v, &geo(), &Oblique { v: X, ..ok() }, 0.0).is_err());
+    }
+
+    #[test]
+    fn half_float_bits() {
+        assert_eq!(f16_bits(0.0), 0x0000);
+        assert_eq!(f16_bits(1.0), 0x3c00);
+        assert_eq!(f16_bits(-1.0), 0xbc00);
+        assert_eq!(f16_bits(0.5), 0x3800);
+        assert_eq!(f16_bits(-1024.0), 0xe400);
+        assert_eq!(f16_bits(2048.0), 0x6800);
+        assert_eq!(f16_bits(3071.0), 0x6a00); // ties to even: 3072
+        assert_eq!(f16_bits(65504.0), 0x7bff);
+        assert_eq!(f16_bits(1.0e9), 0x7bff); // clamped, never infinite
+        assert_eq!(f16_bits(f32::NAN), 0x0000);
+        assert_eq!(f16_bits(6.1035156e-5), 0x0400); // smallest normal
+        assert_eq!(f16_bits(5.9604645e-8), 0x0001); // smallest subnormal
+    }
+
+    #[test]
+    fn texture_keeps_native_size_when_it_fits() {
+        let g = geo();
+        assert_eq!(texture_dims(&g, 2048, 1 << 30), (COLS, ROWS, DEPTH));
+        let v = linear();
+        let t = build_texture(&v, &g, (COLS, ROWS, DEPTH)).unwrap();
+        assert_eq!(t.len(), COLS * ROWS * DEPTH);
+        // Voxel (column 2, row 1, image 3) holds 312
+        assert_eq!(t[3 * COLS * ROWS + COLS + 2], f16_bits(312.0));
+    }
+
+    #[test]
+    fn texture_is_scaled_down_to_the_limits() {
+        let g = geo();
+        let (c, r, d) = texture_dims(&g, 3, 1 << 30);
+        assert!(c <= 3 && r <= 3 && d <= 3);
+        let (c, r, d) = texture_dims(&g, 2048, 2 * 20);
+        assert!(c * r * d <= 20);
+        assert!(c >= 2 && r >= 2 && d >= 2);
+    }
+
+    #[test]
+    fn resampled_texture_interpolates_between_images() {
+        // Unevenly spaced images: the texture must be resampled onto an even grid
+        let z = [0.0, 1.0, 2.0, 4.0, 8.0];
+        let v: Vec<Vec<f32>> = z.iter().map(|&zz| vec![zz as f32 * 10.0; COLS * ROWS]).collect();
+        let g = Geometry { cols: COLS, rows: ROWS, sx: 1.0, sy: 1.0, z: &z };
+        let t = build_texture(&v, &g, (COLS, ROWS, 9)).unwrap();
+        // Image k of the texture lies at z = k
+        for k in 0..9 {
+            assert_eq!(t[k * COLS * ROWS], f16_bits(k as f32 * 10.0), "image {k}");
+        }
     }
 }

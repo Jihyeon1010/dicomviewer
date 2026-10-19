@@ -1161,6 +1161,50 @@ fn get_oblique_slice(
     Ok(mpr_response(&vol, &img))
 }
 
+// The whole volume for GPU rendering. Response (little-endian): twelve 4-byte header fields
+// [cols u32][rows u32][depth u32][slope f32][intercept f32][extent_x f32][extent_y f32]
+// [extent_z f32][value_min f32][window centre f32][window width f32][mono1 u32],
+// then cols * rows * depth half floats (x fastest). The extents are the sizes in mm between
+// the first and last voxel centre. The raw 16-bit encoding of reformatted images is
+// value = raw * slope + intercept, so a renderer can produce images in that encoding.
+// The volume is scaled down evenly when it exceeds `max_dim` per side or `max_bytes`.
+#[tauri::command(async)]
+fn get_volume_texture(
+    uid: String,
+    max_dim: u32,
+    max_bytes: u64,
+    state: tauri::State<AppState>,
+) -> Result<tauri::ipc::Response, String> {
+    let vol = volume_for(&state, &uid)?;
+    let geo = geometry_of(&vol);
+    let max_bytes = usize::try_from(max_bytes).unwrap_or(usize::MAX);
+    let dims = mpr::texture_dims(&geo, max_dim as usize, max_bytes);
+    let voxels = mpr::build_texture(&vol.slices, &geo, dims)?;
+
+    let enc = mpr::encoding_for(vol.info.value_min, vol.info.value_max);
+    let (wc, ww) = vol.window.unwrap_or((f32::NAN, f32::NAN));
+    let ext = |n: usize, step: f64| ((n - 1) as f64 * step) as f32;
+    let ext_z = (vol.z[vol.z.len() - 1] - vol.z[0]) as f32;
+
+    let mut out = Vec::with_capacity(48 + voxels.len() * 2);
+    out.extend_from_slice(&(dims.0 as u32).to_le_bytes());
+    out.extend_from_slice(&(dims.1 as u32).to_le_bytes());
+    out.extend_from_slice(&(dims.2 as u32).to_le_bytes());
+    out.extend_from_slice(&(enc.slope as f32).to_le_bytes());
+    out.extend_from_slice(&(enc.intercept as f32).to_le_bytes());
+    out.extend_from_slice(&ext(geo.cols, geo.sx).to_le_bytes());
+    out.extend_from_slice(&ext(geo.rows, geo.sy).to_le_bytes());
+    out.extend_from_slice(&ext_z.to_le_bytes());
+    out.extend_from_slice(&(vol.info.value_min as f32).to_le_bytes());
+    out.extend_from_slice(&wc.to_le_bytes());
+    out.extend_from_slice(&ww.to_le_bytes());
+    out.extend_from_slice(&(vol.mono1 as u32).to_le_bytes());
+    for v in &voxels {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    Ok(tauri::ipc::Response::new(out))
+}
+
 // ---------- DICOM tag dump ----------
 
 const MAX_TAG_ENTRIES: usize = 5000;
@@ -1288,7 +1332,8 @@ pub fn run() {
             get_tags,
             save_png,
             get_mpr_slice,
-            get_oblique_slice
+            get_oblique_slice,
+            get_volume_texture
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

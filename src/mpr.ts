@@ -1,9 +1,10 @@
-import { getMprSlice, getObliqueSlice } from "./api";
+import { getMprSlice, getObliqueSlice, getVolumeTexture } from "./api";
 import type { CachedSlice, SliceSource } from "./slice-cache";
 import { matrix, type Pt } from "./transform2d";
-import type { Plane, SeriesInfo, SlabMode, SliceMeta, VolumeInfo } from "./types";
+import type { Plane, SeriesInfo, SlabMode, SliceData, SliceMeta, VolumeInfo } from "./types";
 import { add, cross, dot, rotateAbout, scale, sub, unit, type V3 } from "./vec3";
 import type { RefLine, Viewport } from "./viewport";
+import { VolumeGL, type ProjectionMode } from "./volume-gl";
 
 export const PLANES: Plane[] = ["axial", "coronal", "sagittal"];
 
@@ -22,8 +23,14 @@ const BALL_Y = 1;
 const BALL_RAD_PER_PX = 0.007;
 
 const MAX_SIDE = 1024; // longest side of an oblique image
-const MIP_FINAL = 2; // output scale of the 3D MIP view at rest and while dragging
+// Output scale of the 3D view at rest and while dragging (larger numbers mean coarser pixels).
+// The CPU path needs coarse images to stay interactive; the GPU path does not.
+const MIP_FINAL = 2;
 const MIP_PREVIEW = 4;
+const MIP_FINAL_GPU = 1;
+const MIP_PREVIEW_GPU = 2;
+// Most half-float volume data sent to the GPU; larger volumes are scaled down
+const GPU_VOLUME_BYTES = 384 * 1024 * 1024;
 
 // Colour of the reference line that marks where each plane cuts the other views
 const COLOR: Record<Plane, string> = {
@@ -258,7 +265,11 @@ export class Mpr {
   private scaleNow = 1; // output scale of the oblique views currently shown
   private mip = false;
   private mipAxes: Axes = baseMipAxes();
+  private mipMode: ProjectionMode = "max";
   private mipScaleNow = MIP_FINAL;
+  private gpu: VolumeGL | null = null; // the volume on the GPU, when it could be put there
+  private gpuLoad: Promise<void> | null = null;
+  private stopped = false;
   private twistState: {
     plane: Plane;
     vp: Viewport;
@@ -341,6 +352,9 @@ export class Mpr {
   }
 
   stop(): void {
+    this.stopped = true;
+    this.gpu?.dispose();
+    this.gpu = null;
     cancelAnimationFrame(this.raf);
     this.raf = 0;
     this.twistState = null;
@@ -361,7 +375,7 @@ export class Mpr {
     this.refreshPanes();
     if (this.mip) {
       this.mipAxes = baseMipAxes();
-      this.mipScaleNow = MIP_FINAL;
+      this.mipScaleNow = this.mipFinal;
       this.refreshMip();
     }
   }
@@ -370,12 +384,53 @@ export class Mpr {
   setMipView(on: boolean): void {
     if (on === this.mip) return;
     this.mip = on;
-    if (on) {
-      this.mipAxes = baseMipAxes();
-      this.mipScaleNow = MIP_FINAL;
-      void this.extra.setReformat(this.series, this.mipSource(), 1, 0, "coronal");
-    } else {
-      void this.extra.setSeries(this.series);
+    if (on) void this.startMip();
+    else void this.extra.setSeries(this.series);
+  }
+
+  /** Projection of the 3D view: maximum, minimum or average intensity. */
+  setMipMode(mode: ProjectionMode): void {
+    if (mode === this.mipMode) return;
+    this.mipMode = mode;
+    this.refreshMip();
+  }
+
+  private get mipFinal(): number {
+    return this.gpu ? MIP_FINAL_GPU : MIP_FINAL;
+  }
+
+  private get mipPreview(): number {
+    return this.gpu ? MIP_PREVIEW_GPU : MIP_PREVIEW;
+  }
+
+  private async startMip(): Promise<void> {
+    await this.ensureGpu();
+    if (!this.mip || this.stopped) return; // switched off while the volume was loading
+    this.mipAxes = baseMipAxes();
+    this.mipScaleNow = this.mipFinal;
+    await this.extra.setReformat(this.series, this.mipSource(), 1, 0, "coronal");
+  }
+
+  // Puts the volume on the GPU once. When that fails the 3D view is computed by the backend.
+  private ensureGpu(): Promise<void> {
+    if (!this.gpuLoad) this.gpuLoad = this.loadGpu();
+    return this.gpuLoad;
+  }
+
+  private async loadGpu(): Promise<void> {
+    const gl = VolumeGL.open();
+    if (!gl) return;
+    try {
+      const tex = await getVolumeTexture(this.series.uid, gl.maxDim, GPU_VOLUME_BYTES);
+      if (this.stopped) {
+        gl.dispose();
+        return;
+      }
+      gl.upload(tex, this.z0);
+      this.gpu = gl;
+    } catch (err) {
+      console.warn("GPU rendering of the 3D view is unavailable, using the CPU path:", err);
+      gl.dispose();
     }
   }
 
@@ -471,7 +526,7 @@ export class Mpr {
         BALL_X * di * BALL_RAD_PER_PX,
         BALL_Y * dj * BALL_RAD_PER_PX,
       );
-      this.mipScaleNow = MIP_PREVIEW;
+      this.mipScaleNow = this.mipPreview;
       this.dirty = true;
       this.schedule();
       return;
@@ -495,7 +550,7 @@ export class Mpr {
     if (this.ball) {
       this.ball = null;
       this.dirty = false;
-      this.mipScaleNow = MIP_FINAL;
+      this.mipScaleNow = this.mipFinal;
       this.refreshMip();
     } else if (this.twistState) {
       this.twistState = null;
@@ -669,14 +724,37 @@ export class Mpr {
     const ax = this.mipAxes;
     const sz = this.sizeAt(this.mipScaleNow);
     const v0 = this.v0;
-    const slab: Slab = { mode: "max", mm: FULL_MM };
+    const mode = this.mipMode;
+    const gpu = this.gpu;
+    const slab: Slab = { mode, mm: FULL_MM };
+    const suffix = ` · 3D ${mode === "max" ? "MIP" : mode === "min" ? "MinIP" : "Average"}`;
     return {
-      id: `mip:${uid}:${keyOf(ax)}:${this.mipScaleNow}`,
+      id: `${gpu ? "gmip" : "mip"}:${uid}:${mode}:${keyOf(ax)}:${this.mipScaleNow}`,
       load: async (): Promise<CachedSlice> => {
+        let slice: SliceData | null = null;
+        if (gpu?.ready) {
+          try {
+            slice = gpu.project({
+              origin: v0,
+              u: ax.u,
+              v: ax.v,
+              width: sz.w,
+              height: sz.h,
+              pixelMm: sz.p,
+              stepMm: sz.p,
+              mode,
+            });
+          } catch (err) {
+            console.warn("GPU projection failed, using the CPU path:", err);
+          }
+        }
+        if (slice) {
+          return { slice, meta: this.metaFor("coronal", ax, slab, [sz.p, sz.p], suffix) };
+        }
         const r = await getObliqueSlice(
-          uid, v0, ax.u, ax.v, sz.w, sz.h, sz.p, "max", FULL_MM, sz.p,
+          uid, v0, ax.u, ax.v, sz.w, sz.h, sz.p, mode, FULL_MM, sz.p,
         );
-        return { slice: r.slice, meta: this.metaFor("coronal", ax, slab, r.spacing, " · 3D MIP") };
+        return { slice: r.slice, meta: this.metaFor("coronal", ax, slab, r.spacing, suffix) };
       },
     };
   }
