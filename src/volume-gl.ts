@@ -1,4 +1,5 @@
 import type { VolumeTexture } from "./api";
+import type { SurfaceMesh } from "./api";
 import { LUT_SIZE, type TransferFunction } from "./transfer";
 import type { SliceData } from "./types";
 import { cross, scale, unit, type V3 } from "./vec3";
@@ -29,6 +30,20 @@ export interface RenderParams {
   /** Thickness in mm of the part of the volume that is drawn, around its middle; Infinity for all */
   slabMm: number;
   shade: boolean;
+}
+
+/** A lit surface mesh drawn from the same view as the other renderings. */
+export interface MeshParams {
+  origin: V3;
+  u: V3;
+  v: V3;
+  width: number;
+  height: number;
+  pixelMm: number;
+  slabMm: number;
+  /** Middle and radius of a sphere around the volume; the depth range of the view */
+  centre: V3;
+  radius: number;
 }
 
 // Most samples taken along one ray
@@ -203,6 +218,45 @@ void main() {
   outColor = vec4(clamp(acc, 0.0, 1.0), 1.0);
 }`;
 
+// Surface meshes: orthographic projection onto the image plane with a depth buffer. The
+// pixel mapping is the same as that of the ray shaders, so the images line up with them.
+const MESH_VERT = `#version 300 es
+in vec3 aPos;
+in vec3 aNormal;
+uniform vec3 uOrigin;
+uniform vec3 uU;
+uniform vec3 uV;
+uniform vec3 uN;
+uniform vec3 uCentre;
+uniform vec2 uHalf;
+uniform float uPixel;
+uniform float uRadius;
+out vec3 vNormal;
+out float vDepth;
+void main() {
+  vec3 q = aPos - uOrigin;
+  vec2 pix = vec2(dot(q, uU), dot(q, uV)) / uPixel + uHalf;
+  vDepth = dot(aPos - uCentre, uN);
+  vNormal = aNormal;
+  gl_Position = vec4(pix.x / uHalf.x - 1.0, pix.y / uHalf.y - 1.0, vDepth / uRadius, 1.0);
+}`;
+
+const MESH_FRAG = `#version 300 es
+precision highp float;
+uniform vec3 uN;
+uniform float uHalfSlab;
+in vec3 vNormal;
+in float vDepth;
+out vec4 outColor;
+void main() {
+  if (abs(vDepth) > uHalfSlab) discard;
+  // Lit from the viewer's side; both sides of the surface are lit alike
+  float d = abs(dot(normalize(vNormal), uN));
+  float spec = pow(d, 32.0) * 0.3;
+  vec3 col = vec3(0.86, 0.80, 0.70) * (0.25 + 0.75 * d) + vec3(spec);
+  outColor = vec4(min(col, vec3(1.0)), 1.0);
+}`;
+
 const COMMON_UNIFORMS = [
   "uVol", "uSize", "uExt", "uOrigin", "uU", "uV", "uN", "uHalf", "uPixel", "uStep",
 ] as const;
@@ -210,6 +264,10 @@ const MIP_UNIFORMS = [...COMMON_UNIFORMS, "uSlope", "uIntercept", "uBackground",
 const VR_UNIFORMS = [
   ...COMMON_UNIFORMS, "uLut", "uLutLo", "uLutInv", "uRefStep", "uGradStep", "uGradRef",
   "uCentre", "uHalfSlab", "uShade",
+] as const;
+
+const MESH_UNIFORMS = [
+  "uOrigin", "uU", "uV", "uN", "uCentre", "uHalf", "uPixel", "uRadius", "uHalfSlab",
 ] as const;
 
 interface Prog<N extends string> {
@@ -231,6 +289,19 @@ export class VolumeGL {
   private readonly gl: WebGL2RenderingContext;
   private readonly mip: Prog<(typeof MIP_UNIFORMS)[number]>;
   private readonly vr: Prog<(typeof VR_UNIFORMS)[number]>;
+  private readonly meshProg: Prog<(typeof MESH_UNIFORMS)[number]>;
+  private meshGpu: {
+    vao: WebGLVertexArrayObject;
+    buffers: WebGLBuffer[];
+    count: number;
+  } | null = null;
+  private depthTarget: {
+    tex: WebGLTexture;
+    depth: WebGLRenderbuffer;
+    fbo: WebGLFramebuffer;
+    w: number;
+    h: number;
+  } | null = null;
   private volumeTex: WebGLTexture | null = null;
   private lutTex: WebGLTexture | null = null;
   private lutRange: [number, number] = [0, 1];
@@ -244,6 +315,7 @@ export class VolumeGL {
     this.maxDim = gl.getParameter(gl.MAX_3D_TEXTURE_SIZE) as number;
     this.mip = this.link(MIP_FRAG, MIP_UNIFORMS);
     this.vr = this.link(VR_FRAG, VR_UNIFORMS);
+    this.meshProg = this.link(MESH_FRAG, MESH_UNIFORMS, MESH_VERT);
 
     gl.disable(gl.DITHER); // the output carries exact numbers
     gl.disable(gl.BLEND);
@@ -435,11 +507,109 @@ export class VolumeGL {
     };
   }
 
+  get hasMesh(): boolean {
+    return this.meshGpu !== null;
+  }
+
+  /** Puts a surface mesh on the GPU, replacing the previous one. */
+  setMesh(mesh: SurfaceMesh): void {
+    const gl = this.gl;
+    this.freeMesh();
+    const vao = gl.createVertexArray();
+    const buffers = [gl.createBuffer(), gl.createBuffer(), gl.createBuffer()];
+    if (!vao || buffers.some((b) => !b)) throw new Error("Could not create mesh buffers");
+    const [pos, nrm, idx] = buffers as WebGLBuffer[];
+    gl.bindVertexArray(vao);
+    for (const [buf, data, name] of [
+      [pos, mesh.positions, "aPos"],
+      [nrm, mesh.normals, "aNormal"],
+    ] as const) {
+      const at = gl.getAttribLocation(this.meshProg.prog, name);
+      gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+      gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+      gl.enableVertexAttribArray(at);
+      gl.vertexAttribPointer(at, 3, gl.FLOAT, false, 0, 0);
+    }
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, idx);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, mesh.indices, gl.STATIC_DRAW);
+    gl.bindVertexArray(null);
+    const err = gl.getError();
+    if (err !== gl.NO_ERROR) {
+      gl.deleteVertexArray(vao);
+      for (const b of buffers) gl.deleteBuffer(b);
+      throw new Error(`Uploading the surface failed (WebGL error ${err})`);
+    }
+    this.meshGpu = { vao, buffers: buffers as WebGLBuffer[], count: mesh.indices.length };
+  }
+
+  /** Draws the uploaded surface mesh as an 8-bit RGB image. */
+  drawMesh(p: MeshParams): SliceData {
+    const gl = this.gl;
+    const mesh = this.meshGpu;
+    if (!mesh) throw new Error("No surface on the GPU");
+    if (this.lost || gl.isContextLost()) throw new Error("The WebGL context was lost");
+    const max = gl.getParameter(gl.MAX_TEXTURE_SIZE) as number;
+    if (!(p.width > 0 && p.height > 0 && p.width <= max && p.height <= max)) {
+      throw new Error("Unsupported image size");
+    }
+    const dir = scale(unit(cross(p.u, p.v)), -1);
+    this.checkDirection(dir);
+
+    const target = this.depthTargetOf(p.width, p.height);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, target.fbo);
+    gl.viewport(0, 0, p.width, p.height);
+    gl.clearColor(0, 0, 0, 1);
+    gl.clearDepth(1);
+    gl.enable(gl.DEPTH_TEST);
+    gl.depthFunc(gl.LESS);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+    gl.useProgram(this.meshProg.prog);
+    const l = this.meshProg.loc;
+    gl.uniform3f(l.uOrigin, p.origin[0], p.origin[1], p.origin[2]);
+    gl.uniform3f(l.uU, p.u[0], p.u[1], p.u[2]);
+    gl.uniform3f(l.uV, p.v[0], p.v[1], p.v[2]);
+    gl.uniform3f(l.uN, dir[0], dir[1], dir[2]);
+    gl.uniform3f(l.uCentre, p.centre[0], p.centre[1], p.centre[2]);
+    gl.uniform2f(l.uHalf, p.width / 2, p.height / 2);
+    gl.uniform1f(l.uPixel, p.pixelMm);
+    gl.uniform1f(l.uRadius, p.radius);
+    gl.uniform1f(l.uHalfSlab, Number.isFinite(p.slabMm) ? Math.max(p.slabMm, 0) / 2 : 1e8);
+    gl.bindVertexArray(mesh.vao);
+    gl.drawElements(gl.TRIANGLES, mesh.count, gl.UNSIGNED_INT, 0);
+    gl.bindVertexArray(null);
+    gl.disable(gl.DEPTH_TEST);
+
+    const bytes = this.readBack(p.width, p.height);
+    const pixels = new Uint8Array(p.width * p.height * 3);
+    for (let i = 0, o = 0, q = 0; i < p.width * p.height; i++, o += 4, q += 3) {
+      pixels[q] = bytes[o] as number;
+      pixels[q + 1] = bytes[o + 1] as number;
+      pixels[q + 2] = bytes[o + 2] as number;
+    }
+    return {
+      rows: p.height,
+      cols: p.width,
+      bitsAllocated: 8,
+      signed: false,
+      slope: 1,
+      intercept: 0,
+      defaultWl: null,
+      defaultWw: null,
+      monochrome1: false,
+      samples: 3,
+      pixels,
+    };
+  }
+
   /** Frees everything on the GPU. The object cannot be used afterwards. */
   dispose(): void {
     if (!this.gl.isContextLost()) {
       this.freeVolume();
       this.freeTarget();
+      this.freeMesh();
+      this.freeDepthTarget();
+      this.gl.deleteProgram(this.meshProg.prog);
       if (this.lutTex) this.gl.deleteTexture(this.lutTex);
       this.lutTex = null;
       this.gl.deleteProgram(this.mip.prog);
@@ -525,15 +695,58 @@ export class VolumeGL {
     this.target = null;
   }
 
+  private depthTargetOf(w: number, h: number): { fbo: WebGLFramebuffer } {
+    const gl = this.gl;
+    const t = this.depthTarget;
+    if (t && t.w === w && t.h === h) return t;
+    this.freeDepthTarget();
+    const tex = gl.createTexture();
+    const depth = gl.createRenderbuffer();
+    const fbo = gl.createFramebuffer();
+    if (!tex || !depth || !fbo) throw new Error("Could not create a render target");
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA8, w, h);
+    gl.bindRenderbuffer(gl.RENDERBUFFER, depth);
+    gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT24, w, h);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, depth);
+    if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) {
+      gl.deleteFramebuffer(fbo);
+      gl.deleteRenderbuffer(depth);
+      gl.deleteTexture(tex);
+      throw new Error("The render target is incomplete");
+    }
+    this.depthTarget = { tex, depth, fbo, w, h };
+    return this.depthTarget;
+  }
+
+  private freeDepthTarget(): void {
+    const t = this.depthTarget;
+    if (!t) return;
+    this.gl.deleteFramebuffer(t.fbo);
+    this.gl.deleteRenderbuffer(t.depth);
+    this.gl.deleteTexture(t.tex);
+    this.depthTarget = null;
+  }
+
+  private freeMesh(): void {
+    const m = this.meshGpu;
+    if (!m) return;
+    this.gl.deleteVertexArray(m.vao);
+    for (const b of m.buffers) this.gl.deleteBuffer(b);
+    this.meshGpu = null;
+  }
+
   private freeVolume(): void {
     if (this.volumeTex) this.gl.deleteTexture(this.volumeTex);
     this.volumeTex = null;
     this.info = null;
   }
 
-  private link<N extends string>(frag: string, names: readonly N[]): Prog<N> {
+  private link<N extends string>(frag: string, names: readonly N[], vert = VERT): Prog<N> {
     const gl = this.gl;
-    const vs = this.compile(gl.VERTEX_SHADER, VERT);
+    const vs = this.compile(gl.VERTEX_SHADER, vert);
     const fs = this.compile(gl.FRAGMENT_SHADER, frag);
     const prog = gl.createProgram();
     if (!prog) throw new Error("Could not create a WebGL program");

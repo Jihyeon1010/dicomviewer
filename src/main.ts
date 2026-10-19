@@ -83,6 +83,11 @@ const resetRotBtn = byId("reset-rot", HTMLButtonElement);
 const view3dSel = byId("view3d", HTMLSelectElement);
 const vrPresetSel = byId("vr-preset", HTMLSelectElement);
 const vrThickSel = byId("vr-thick", HTMLSelectElement);
+const surfThrInput = byId("surf-thr", HTMLInputElement);
+const surfPartSel = byId("surf-part", HTMLSelectElement);
+const surfDetailSel = byId("surf-detail", HTMLSelectElement);
+const surfUpdateBtn = byId("surf-update", HTMLButtonElement);
+const surfStlBtn = byId("surf-stl", HTMLButtonElement);
 const slabModeSel = byId("slab-mode", HTMLSelectElement);
 const slabThickSel = byId("slab-thick", HTMLSelectElement);
 const slider = byId("slider", HTMLInputElement);
@@ -205,7 +210,12 @@ function refreshTooltips(): void {
   setTip(mipViewBtn, "3D view in the fourth view: drag with the rotate tool", "mpr.mipView");
   view3dSel.title = "3D view: MIP, MinIP, average or volume rendering";
   vrPresetSel.title = "Volume rendering colours and opacity";
-  vrThickSel.title = "Volume rendering thickness around the middle of the volume";
+  vrThickSel.title = "Thickness of the volume that is drawn, around its middle";
+  surfThrInput.title = "Surface threshold: the surface lies where the values reach this level";
+  surfPartSel.title = "Which connected parts of the thresholded volume get a surface";
+  surfDetailSel.title = "Detail of the surface; coarser is faster and smaller";
+  surfUpdateBtn.title = "Build the surface again (for example at a new crosshair position)";
+  surfStlBtn.title = "Save the surface as an STL file (millimetres)";
   setTip(resetRotBtn, "Reset the rotation of the MPR planes", "mpr.resetRotation");
   slabModeSel.title = "Projection through a slab: thin plane, MIP, MinIP or average";
   slabThickSel.title = "Slab thickness";
@@ -595,12 +605,21 @@ function syncControls(): void {
   setPressed(mipViewBtn, mpr?.mipOn ?? false);
   const mip3d = mpr?.mipOn ?? false;
   view3dSel.hidden = !mip3d;
-  vrPresetSel.hidden = !mip3d || mpr?.view !== "vr";
-  vrThickSel.hidden = vrPresetSel.hidden;
+  const view = mpr?.view;
+  vrPresetSel.hidden = !mip3d || view !== "vr";
+  vrThickSel.hidden = !mip3d || (view !== "vr" && view !== "surface");
+  const surface = mip3d && view === "surface";
+  for (const el of [surfThrInput, surfPartSel, surfDetailSel, surfUpdateBtn, surfStlBtn]) {
+    el.hidden = !surface;
+  }
   if (mpr) {
     view3dSel.value = mpr.view;
     vrPresetSel.value = mpr.preset;
     vrThickSel.value = String(mpr.thicknessMm);
+    const s = mpr.surfaceSettings;
+    if (document.activeElement !== surfThrInput) surfThrInput.value = String(s.threshold);
+    surfPartSel.value = s.part;
+    surfDetailSel.value = String(s.detail);
   }
   slabThickSel.disabled = slabModeSel.value === "none";
 
@@ -1035,9 +1054,48 @@ resetRotBtn.addEventListener("click", () => mpr?.resetRotation());
 
 async function chooseView3d(mode: View3d): Promise<void> {
   if (!mpr) return;
-  const ok = await mpr.setView3d(mode);
-  if (!ok) flashStatus("Volume rendering needs WebGL2 and a volume that fits on the GPU");
+  if (mode === "surface") setStatus("Building the surface…");
+  try {
+    const ok = await mpr.setView3d(mode);
+    if (!ok) flashStatus("This 3D view needs WebGL2 and a volume that fits on the GPU");
+    else if (mode === "surface") flashStatus(surfaceSummary());
+  } catch (err) {
+    showError(err);
+  }
   syncControls();
+}
+
+function surfaceSummary(): string {
+  return `Surface: ${(mpr?.surfaceTriangles ?? 0).toLocaleString()} triangles`;
+}
+
+// Changes how the surface is built and rebuilds it when it is on show
+async function changeSurface(s: Parameters<Mpr["setSurface"]>[0]): Promise<void> {
+  if (!mpr) return;
+  setStatus("Building the surface…");
+  try {
+    await mpr.setSurface(s);
+    flashStatus(surfaceSummary());
+  } catch (err) {
+    showError(err);
+  }
+  syncControls();
+}
+
+async function exportSurfaceStl(): Promise<void> {
+  if (!mpr || mpr.view !== "surface") return;
+  const path = await save({
+    defaultPath: "surface.stl",
+    filters: [{ name: "STL mesh", extensions: ["stl"] }],
+  });
+  if (typeof path !== "string") return;
+  setStatus("Writing the STL file…");
+  try {
+    const n = await mpr.exportSurface(path);
+    flashStatus(`Saved ${n.toLocaleString()} triangles to the STL file`);
+  } catch (err) {
+    showError(err);
+  }
 }
 view3dSel.addEventListener("change", () => {
   const mode = VIEWS_3D.find((m) => m === view3dSel.value);
@@ -1049,6 +1107,23 @@ vrPresetSel.addEventListener("change", () => {
   if (id) mpr?.setVrPreset(id.id);
   vrPresetSel.blur();
 });
+surfThrInput.addEventListener("change", () => {
+  const v = Number(surfThrInput.value);
+  if (surfThrInput.value.trim() !== "" && Number.isFinite(v)) void changeSurface({ threshold: v });
+  else syncControls();
+});
+surfPartSel.addEventListener("change", () => {
+  const part = surfPartSel.value;
+  if (part === "all" || part === "largest" || part === "at") void changeSurface({ part });
+  surfPartSel.blur();
+});
+surfDetailSel.addEventListener("change", () => {
+  const detail = Number(surfDetailSel.value);
+  if (Number.isInteger(detail) && detail >= 0) void changeSurface({ detail });
+  surfDetailSel.blur();
+});
+surfUpdateBtn.addEventListener("click", () => void changeSurface({}));
+surfStlBtn.addEventListener("click", () => void exportSurfaceStl());
 vrThickSel.addEventListener("change", () => {
   const mm = Number(vrThickSel.value);
   if (mm > 0) mpr?.setVrThickness(mm);

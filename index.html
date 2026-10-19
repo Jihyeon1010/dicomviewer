@@ -53,6 +53,7 @@
           <option value="min">MinIP</option>
           <option value="mean">Average</option>
           <option value="vr">Volume</option>
+          <option value="surface">Surface</option>
         </select>
         <select id="vr-preset" aria-label="Volume rendering preset" hidden>
           <option value="generic">Generic</option>
@@ -67,6 +68,20 @@
           <option value="30">30 mm</option>
           <option value="15">15 mm</option>
         </select>
+        <input id="surf-thr" type="number" step="10" aria-label="Surface threshold" hidden />
+        <select id="surf-part" aria-label="Parts of the surface" hidden>
+          <option value="all">All parts</option>
+          <option value="largest" selected>Largest part</option>
+          <option value="at">Part at crosshair</option>
+        </select>
+        <select id="surf-detail" aria-label="Surface detail" hidden>
+          <option value="0" selected>Auto detail</option>
+          <option value="1">Fine</option>
+          <option value="2">Medium</option>
+          <option value="3">Coarse</option>
+        </select>
+        <button id="surf-update" aria-label="Build the surface again" hidden><span class="lbl">Update</span></button>
+        <button id="surf-stl" aria-label="Save the surface as an STL file" hidden><span class="lbl">STL</span></button>
         <button id="reset-rot" class="ib" aria-label="Reset MPR rotation" hidden><span class="ic" data-icon="undo"></span></button>
         <select id="slab-mode" aria-label="Slab projection" hidden>
           <option value="none">Thin</option>

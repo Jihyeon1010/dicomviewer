@@ -88,6 +88,20 @@ button:focus-visible, select:focus-visible, input:focus-visible {
   border-color: transparent;
   border-radius: 6px;
 }
+#toolbar .group > input[type="number"] {
+  width: 64px;
+  height: 24px;
+  padding: 0 6px;
+  color: var(--text);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  font: inherit;
+}
+#toolbar .group > input[type="number"]:hover,
+#toolbar .group > input[type="number"]:focus {
+  background: rgba(255, 255, 255, 0.07);
+}
 #toolbar .group > button:hover:not(:disabled),
 #toolbar .group > select:hover:not(:disabled) {
   background: rgba(255, 255, 255, 0.07);

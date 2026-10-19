@@ -198,6 +198,49 @@ export async function getVolumeTexture(
   };
 }
 
+export type SurfacePart = "all" | "largest" | "at";
+
+/** Which surface to build: where the volume crosses `threshold`, and which parts of it. */
+export interface SurfaceRequest {
+  threshold: number;
+  part: SurfacePart;
+  seed: [number, number, number] | null; // column, row and image of the part to keep, for "at"
+  step: number; // sample every n-th voxel; 0 chooses automatically
+}
+
+export interface SurfaceMesh {
+  positions: Float32Array; // x, y, z per vertex in the local millimetre coordinates of the volume
+  normals: Float32Array;
+  indices: Uint32Array;
+  step: number; // sampling that was used
+}
+
+const MESH_HEADER_BYTES = 16;
+
+export async function getSurfaceMesh(uid: string, req: SurfaceRequest): Promise<SurfaceMesh> {
+  const buf = await invoke<ArrayBuffer>("get_surface_mesh", { uid, ...req });
+  if (buf.byteLength < MESH_HEADER_BYTES) {
+    throw new Error(`Surface response too short (${buf.byteLength} bytes)`);
+  }
+  const dv = new DataView(buf);
+  const nv = dv.getUint32(0, true);
+  const nt = dv.getUint32(4, true);
+  if (buf.byteLength - MESH_HEADER_BYTES < nv * 24 + nt * 12) {
+    throw new Error(`Surface size mismatch: ${nv} vertices, ${nt} triangles, ${buf.byteLength} bytes`);
+  }
+  return {
+    positions: new Float32Array(buf, MESH_HEADER_BYTES, nv * 3),
+    normals: new Float32Array(buf, MESH_HEADER_BYTES + nv * 12, nv * 3),
+    indices: new Uint32Array(buf, MESH_HEADER_BYTES + nv * 24, nt * 3),
+    step: dv.getUint32(8, true),
+  };
+}
+
+/** Writes the surface as a binary STL file (millimetres); returns the number of triangles. */
+export function exportStl(uid: string, req: SurfaceRequest, path: string): Promise<number> {
+  return invoke<number>("export_stl", { uid, ...req, path });
+}
+
 // Response (little-endian): [width u32][height u32][channels u32][width*height*channels bytes]
 // channels is 1 (8-bit gray) or 3 (8-bit RGB)
 export async function getThumbnail(uid: string, maxPx: number): Promise<ImageData> {

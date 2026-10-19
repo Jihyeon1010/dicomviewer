@@ -1,4 +1,12 @@
-import { getMprSlice, getObliqueSlice, getVolumeTexture } from "./api";
+import {
+  exportStl,
+  getMprSlice,
+  getObliqueSlice,
+  getSurfaceMesh,
+  getVolumeTexture,
+  type SurfacePart,
+  type SurfaceRequest,
+} from "./api";
 import type { CachedSlice, SliceSource } from "./slice-cache";
 import { matrix, type Pt } from "./transform2d";
 import type { Plane, SeriesInfo, SlabMode, SliceData, SliceMeta, VolumeInfo } from "./types";
@@ -9,9 +17,15 @@ import { VolumeGL, type ProjectionMode } from "./volume-gl";
 
 export const PLANES: Plane[] = ["axial", "coronal", "sagittal"];
 
-/** What the fourth view shows: a projection, or a shaded volume rendering (GPU only). */
-export type View3d = ProjectionMode | "vr";
-export const VIEWS_3D: View3d[] = ["max", "min", "mean", "vr"];
+/** What the fourth view shows: a projection, a volume rendering or a surface (GPU only). */
+export type View3d = ProjectionMode | "vr" | "surface";
+export const VIEWS_3D: View3d[] = ["max", "min", "mean", "vr", "surface"];
+
+export interface SurfaceSettings {
+  threshold: number; // in the units of the volume (CT numbers for CT)
+  part: SurfacePart;
+  detail: number; // 0 = automatic, 1 = every voxel, 2 = every second voxel, ...
+}
 
 export interface Slab {
   mode: SlabMode;
@@ -274,6 +288,10 @@ export class Mpr {
   private vrPreset: VrPresetId;
   private vrThickMm = Infinity; // thickness of the volume drawn in the rendering
   private range: ValueRange;
+  private surf: SurfaceSettings;
+  private surfBuilt = ""; // the request that the mesh on the GPU was built for
+  private surfRev = 0; // changes with every new mesh, for the image cache
+  private surfTriangles = 0;
   private mipScaleNow = MIP_FINAL;
   private gpu: VolumeGL | null = null; // the volume on the GPU, when it could be put there
   private gpuLoad: Promise<void> | null = null;
@@ -311,6 +329,12 @@ export class Mpr {
     this.p0 = p0;
     this.c = [...this.v0];
     this.vrPreset = opts.baseMeta?.modality === "CT" ? "bone" : "generic";
+    const { value_min: lo, value_max: hi } = opts.volume;
+    this.surf = {
+      threshold: opts.baseMeta?.modality === "CT" ? 300 : Math.round((lo + hi) / 2),
+      part: "largest",
+      detail: 0,
+    };
     this.range = {
       valueMin: opts.volume.value_min,
       valueMax: opts.volume.value_max,
@@ -325,6 +349,15 @@ export class Mpr {
 
   get preset(): VrPresetId {
     return this.vrPreset;
+  }
+
+  get surfaceSettings(): SurfaceSettings {
+    return { ...this.surf };
+  }
+
+  /** Triangles of the surface on show, 0 before one was built. */
+  get surfaceTriangles(): number {
+    return this.surfTriangles;
   }
 
   get thicknessMm(): number {
@@ -420,15 +453,71 @@ export class Mpr {
    * Resolves to false when the rendering is not possible (it needs WebGL2).
    */
   async setView3d(mode: View3d): Promise<boolean> {
-    if (mode === "vr") {
+    if (mode === "vr" || mode === "surface") {
       await this.ensureGpu();
       if (!this.gpu || this.stopped) return false;
-      this.applyTransfer();
+      if (mode === "vr") this.applyTransfer();
+      else await this.buildSurface(false);
+      if (this.stopped) return false;
     }
-    if (mode === this.view3d) return true;
+    if (mode === this.view3d) {
+      if (mode === "surface") this.refreshMip(); // the surface may be a new one
+      return true;
+    }
     this.view3d = mode;
     this.refreshMip();
     return true;
+  }
+
+  /**
+   * Changes how the surface is built. Rebuilds it when it is on show; a failure is thrown
+   * and the previous surface stays.
+   */
+  async setSurface(s: Partial<SurfaceSettings>): Promise<void> {
+    const before = this.surf;
+    this.surf = { ...before, ...s };
+    try {
+      if (this.view3d === "surface") await this.updateSurface();
+    } catch (err) {
+      this.surf = before; // the surface on show still has the old settings
+      throw err;
+    }
+  }
+
+  /** Builds the surface again, for example at a new position of the crosshair. */
+  async updateSurface(): Promise<void> {
+    await this.buildSurface(true);
+    if (this.view3d === "surface" && !this.stopped) this.refreshMip();
+  }
+
+  /** Writes the surface as a binary STL file; resolves to the number of triangles. */
+  exportSurface(path: string): Promise<number> {
+    return exportStl(this.series.uid, this.surfaceRequest(), path);
+  }
+
+  private surfaceRequest(): SurfaceRequest {
+    const p = this.pos;
+    return {
+      threshold: this.surf.threshold,
+      part: this.surf.part,
+      seed: this.surf.part === "at" ? [p.i, p.r, p.k] : null,
+      step: this.surf.detail,
+    };
+  }
+
+  private async buildSurface(force: boolean): Promise<void> {
+    await this.ensureGpu();
+    const gpu = this.gpu;
+    if (!gpu || this.stopped) throw new Error("The surface view needs WebGL2");
+    const req = this.surfaceRequest();
+    const key = JSON.stringify(req);
+    if (!force && gpu.hasMesh && key === this.surfBuilt) return;
+    const mesh = await getSurfaceMesh(this.series.uid, req);
+    if (this.stopped) return;
+    gpu.setMesh(mesh);
+    this.surfBuilt = key;
+    this.surfRev++;
+    this.surfTriangles = mesh.indices.length / 3;
   }
 
   setVrPreset(id: VrPresetId): void {
@@ -442,7 +531,7 @@ export class Mpr {
   setVrThickness(mm: number): void {
     if (mm === this.vrThickMm) return;
     this.vrThickMm = mm;
-    if (this.view3d === "vr") this.refreshMip();
+    if (this.view3d === "vr" || this.view3d === "surface") this.refreshMip();
   }
 
   private applyTransfer(): void {
@@ -781,15 +870,20 @@ export class Mpr {
     const v0 = this.v0;
     const gpu = this.gpu;
     const vr = this.view3d === "vr" && gpu !== null;
+    const surf = this.view3d === "surface" && gpu !== null && gpu.hasMesh;
     // Without the GPU a rendering falls back to the maximum projection
-    const mode: ProjectionMode = this.view3d === "vr" ? "max" : this.view3d;
-    const slab: Slab = vr ? { mode: "none", mm: 0 } : { mode, mm: FULL_MM };
+    const mode: ProjectionMode =
+      this.view3d === "vr" || this.view3d === "surface" ? "max" : this.view3d;
+    const slab: Slab = vr || surf ? { mode: "none", mm: 0 } : { mode, mm: FULL_MM };
     const name = mode === "max" ? "MIP" : mode === "min" ? "MinIP" : "Average";
-    const suffix = vr ? " · 3D Volume" : ` · 3D ${name}`;
+    const suffix = vr ? " · 3D Volume" : surf ? " · 3D Surface" : ` · 3D ${name}`;
     const thick = this.vrThickMm;
+    const radius = this.diag * 0.55;
     const key = vr
       ? `vr:${this.vrPreset}:${thick}`
-      : `${gpu ? "gmip" : "mip"}:${mode}`;
+      : surf
+        ? `surf:${this.surfRev}:${thick}`
+        : `${gpu ? "gmip" : "mip"}:${mode}`;
     return {
       id: `${key}:${uid}:${keyOf(ax)}:${this.mipScaleNow}`,
       load: async (): Promise<CachedSlice> => {
@@ -805,9 +899,10 @@ export class Mpr {
               pixelMm: sz.p,
               stepMm: sz.p,
             };
-            slice = vr
-              ? gpu.render({ ...view, slabMm: thick, shade: true })
-              : gpu.project({ ...view, mode });
+            if (vr) slice = gpu.render({ ...view, slabMm: thick, shade: true });
+            else if (surf) {
+              slice = gpu.drawMesh({ ...view, slabMm: thick, centre: v0, radius });
+            } else slice = gpu.project({ ...view, mode });
           } catch (err) {
             console.warn("GPU rendering failed, using the CPU path:", err);
           }

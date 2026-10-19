@@ -17,6 +17,7 @@ use std::{
 use walkdir::WalkDir;
 
 mod mpr;
+mod surface;
 
 type Vec3 = [f64; 3];
 
@@ -1205,6 +1206,116 @@ fn get_volume_texture(
     Ok(tauri::ipc::Response::new(out))
 }
 
+// ---------- Surface meshes ----------
+
+// Triangles of a mesh that is drawn, and of one that is written to a file
+const MAX_DISPLAY_TRIANGLES: usize = 6_000_000;
+const MAX_EXPORT_TRIANGLES: usize = 30_000_000;
+
+fn surface_of(
+    vol: &Volume,
+    threshold: f64,
+    part: &str,
+    seed: Option<[u32; 3]>,
+    step: u32,
+    max_triangles: usize,
+) -> Result<surface::Mesh, String> {
+    let geo = geometry_of(vol);
+    let part = match (part, seed) {
+        ("all", _) => surface::Part::All,
+        ("largest", _) => surface::Part::Largest,
+        ("at", Some([i, j, k])) => surface::Part::At {
+            i: i as usize,
+            j: j as usize,
+            k: k as usize,
+        },
+        ("at", None) => return Err("A position is needed to pick a part".into()),
+        (other, _) => return Err(format!("Unknown surface part: {other}")),
+    };
+    let step = if step == 0 {
+        surface::auto_step(&geo, surface::MAX_VOXELS)
+    } else {
+        step as usize
+    };
+    surface::extract(
+        &vol.slices,
+        &geo,
+        &surface::Params {
+            threshold: threshold as f32,
+            part,
+            step,
+            max_triangles,
+        },
+    )
+}
+
+// The surface where the volume crosses `threshold`, in the local millimetre coordinates of
+// the volume. `part` is "all", "largest" or "at" (the connected part at the voxel `seed`
+// = [column, row, image]); `step` 0 chooses the sampling automatically.
+// Response (little-endian): [vertices u32][triangles u32][step u32][0 u32], then the
+// positions (3 f32 per vertex), the normals (3 f32 per vertex) and the indices (3 u32 per triangle).
+#[tauri::command(async)]
+fn get_surface_mesh(
+    uid: String,
+    threshold: f64,
+    part: String,
+    seed: Option<[u32; 3]>,
+    step: u32,
+    state: tauri::State<AppState>,
+) -> Result<tauri::ipc::Response, String> {
+    let vol = volume_for(&state, &uid)?;
+    let mesh = surface_of(&vol, threshold, &part, seed, step, MAX_DISPLAY_TRIANGLES)?;
+    let mut out = Vec::with_capacity(16 + mesh.positions.len() * 8 + mesh.indices.len() * 4);
+    out.extend_from_slice(&(mesh.vertex_count() as u32).to_le_bytes());
+    out.extend_from_slice(&(mesh.triangle_count() as u32).to_le_bytes());
+    out.extend_from_slice(&step.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    for v in mesh.positions.iter().chain(&mesh.normals) {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    for i in &mesh.indices {
+        out.extend_from_slice(&i.to_le_bytes());
+    }
+    Ok(tauri::ipc::Response::new(out))
+}
+
+// Writes the surface as a binary STL file in millimetres and returns the number of triangles.
+// The axes follow the patient (x towards the patient's left, y towards posterior, z towards
+// superior) when the series has an orientation; otherwise the axes of the volume are kept.
+#[tauri::command(async)]
+fn export_stl(
+    uid: String,
+    threshold: f64,
+    part: String,
+    seed: Option<[u32; 3]>,
+    step: u32,
+    path: String,
+    state: tauri::State<AppState>,
+) -> Result<u32, String> {
+    if !path.to_ascii_lowercase().ends_with(".stl") {
+        return Err("Only .stl files can be written".into());
+    }
+    let vol = volume_for(&state, &uid)?;
+    let mesh = surface_of(&vol, threshold, &part, seed, step, MAX_EXPORT_TRIANGLES)?;
+    let axes = match (vol.info.orientation, vol.info.z_dir) {
+        (Some(o), Some(n)) => Some(([o[0], o[1], o[2]], [o[3], o[4], o[5]], n)),
+        _ => None,
+    };
+    let bytes = surface::stl_bytes(&mesh, |p| match axes {
+        Some((r, c, n)) => {
+            let (x, y, z) = (f64::from(p[0]), f64::from(p[1]), f64::from(p[2]));
+            [
+                (x * r[0] + y * c[0] + z * n[0]) as f32,
+                (x * r[1] + y * c[1] + z * n[1]) as f32,
+                (x * r[2] + y * c[2] + z * n[2]) as f32,
+            ]
+        }
+        None => p,
+    });
+    std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
+    Ok(mesh.triangle_count() as u32)
+}
+
 // ---------- DICOM tag dump ----------
 
 const MAX_TAG_ENTRIES: usize = 5000;
@@ -1333,7 +1444,9 @@ pub fn run() {
             save_png,
             get_mpr_slice,
             get_oblique_slice,
-            get_volume_texture
+            get_volume_texture,
+            get_surface_mesh,
+            export_stl
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
