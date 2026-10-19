@@ -25,6 +25,7 @@ import {
   NO_ORIENT,
   orientedLabels,
   orientText,
+  panForOrient,
   screenToImage,
   type Orient,
   type Pt,
@@ -920,15 +921,33 @@ export class Viewport {
     // On a mirrored image a clockwise turn on screen is a counterclockwise turn of the stored rotation
     const mirrored = this.orient.flipH !== this.orient.flipV;
     const step = mirrored ? -dir : dir;
-    this.orient = { ...this.orient, rot: (this.orient.rot + step + 4) % 4 };
-    this.orientChanged();
+    this.reorient({ ...this.orient, rot: (this.orient.rot + step + 4) % 4 });
   }
 
   flip(axis: "h" | "v"): void {
-    this.orient =
+    this.reorient(
       axis === "h"
         ? { ...this.orient, flipH: !this.orient.flipH }
-        : { ...this.orient, flipV: !this.orient.flipV };
+        : { ...this.orient, flipV: !this.orient.flipV },
+    );
+  }
+
+  // Turns or mirrors the image about the middle of the view, so that a zoomed or panned view
+  // keeps showing what the user is looking at. A fitted view is fitted again.
+  private reorient(next: Orient): void {
+    const r = this.el.getBoundingClientRect();
+    if (!this.autoFit && this.current && r.width > 0 && r.height > 0) {
+      const pan = panForOrient(
+        this.size(),
+        this.viewParams(),
+        this.orient,
+        next,
+        { x: r.width / 2, y: r.height / 2 },
+      );
+      this.panX = pan.panX;
+      this.panY = pan.panY;
+    }
+    this.orient = next;
     this.orientChanged();
   }
 
@@ -949,8 +968,7 @@ export class Viewport {
   }
 
   resetOrientation(): void {
-    this.orient = { ...this.baseOrient };
-    this.orientChanged();
+    this.reorient({ ...this.baseOrient });
   }
 
   private orientChanged(): void {
