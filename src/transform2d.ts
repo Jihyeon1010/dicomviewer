@@ -65,23 +65,6 @@ export function screenToImage(s: Pt, size: Size, v: ViewParams, o: Orient): Pt {
   return { x: cx + m.a * qx + m.c * qy, y: cy + m.b * qx + m.d * qy };
 }
 
-/**
- * The pan that keeps the image point shown at `anchor` (a screen position) where it is when
- * the orientation changes from `from` to `to`. Without it a turn or mirror happens about the
- * center of the image, which carries a zoomed or panned view away from what is being looked at.
- */
-export function panForOrient(
-  size: Size,
-  v: ViewParams,
-  from: Orient,
-  to: Orient,
-  anchor: Pt,
-): { panX: number; panY: number } {
-  const p = screenToImage(anchor, size, v, from);
-  const s = imageToScreen(p, size, v, to);
-  return { panX: v.panX + anchor.x - s.x, panY: v.panY + anchor.y - s.y };
-}
-
 // The same transform as a CSS value for the canvas (transform-origin must be 0 0)
 export function cssTransform(size: Size, v: ViewParams, o: Orient): string {
   const cx = size.cols / 2;

@@ -25,7 +25,6 @@ import {
   NO_ORIENT,
   orientedLabels,
   orientText,
-  panForOrient,
   screenToImage,
   type Orient,
   type Pt,
@@ -932,23 +931,37 @@ export class Viewport {
     );
   }
 
-  // Turns or mirrors the image about the middle of the view, so that a zoomed or panned view
-  // keeps showing what the user is looking at. A fitted view is fitted again.
+  // Turns or mirrors the image about a point that stays where it is on screen: the crosshair
+  // of an MPR view, otherwise the middle of a zoomed or panned view. A fitted view is fitted
+  // again; the point is then put back, so the zoom may fit the new orientation but nothing orbits.
   private reorient(next: Orient): void {
     const r = this.el.getBoundingClientRect();
-    if (!this.autoFit && this.current && r.width > 0 && r.height > 0) {
-      const pan = panForOrient(
-        this.size(),
-        this.viewParams(),
-        this.orient,
-        next,
-        { x: r.width / 2, y: r.height / 2 },
-      );
-      this.panX = pan.panX;
-      this.panY = pan.panY;
+    let hold: { p: Pt; s: Pt } | null = null;
+    if (this.current && r.width > 0 && r.height > 0) {
+      const cross = this.crosshairPoint();
+      if (cross) {
+        hold = { p: cross, s: this.toScreen(cross) };
+      } else if (!this.autoFit) {
+        const s = { x: r.width / 2, y: r.height / 2 };
+        hold = { p: this.toImage(s.x, s.y), s };
+      }
     }
     this.orient = next;
-    this.orientChanged();
+    if (this.autoFit && this.current) this.fitView();
+    if (hold) {
+      const t = this.toScreen(hold.p);
+      this.panX += hold.s.x - t.x;
+      this.panY += hold.s.y - t.y;
+    }
+    this.orientChanged(false);
+  }
+
+  // The crosshair of an MPR view as an image position
+  private crosshairPoint(): Pt | null {
+    if (!this.isReformat) return null;
+    const x = this.refLines.find((l) => l.axis === "x");
+    const y = this.refLines.find((l) => l.axis === "y");
+    return x && y ? { x: x.pos, y: y.pos } : null;
   }
 
   // The orientation that the current mode asks for; the images of a series all share it
@@ -971,8 +984,8 @@ export class Viewport {
     this.reorient({ ...this.baseOrient });
   }
 
-  private orientChanged(): void {
-    if (this.autoFit && this.current) this.fitView();
+  private orientChanged(refit = true): void {
+    if (refit && this.autoFit && this.current) this.fitView();
     else this.applyTransform();
     this.refreshOverlay();
     this.host.stateChanged(this);
