@@ -33,6 +33,7 @@ All shortcuts can be changed in **Settings** (`Mac os` = `Cmd+`, `Windos and Lin
 | Slider position / DICOM tags / settings | `B` / `T` / `,` or `?` |
 | Layouts 1x1, 2x1, 1x2, 2x2, 3x2, 3x3, 4x3 | `Alt+1` to `Alt+7` |
 | Sync scroll / sync window | `L` / `Shift+L` |
+| Enlarge / restore the active view (also a double click with several views) | `Alt+Z` |
 | Play or pause cine | `Space` |
 | Cine faster / slower | `]` / `[` |
 | Loop start / end / clear | `Alt+I` / `Alt+O` / `Alt+L` |

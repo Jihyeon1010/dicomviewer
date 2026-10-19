@@ -71,6 +71,9 @@ export interface ViewportHost {
   stateChanged(vp: Viewport): void;  // anything the toolbar shows
   pick(vp: Viewport, p: Pt): void;   // the crosshair tool was used at an image position
   orientMode(): OrientMode;
+  // A view can fill the whole area while the others are hidden; a double click toggles that
+  canMaximize(): boolean;
+  toggleMaximize(vp: Viewport): void;
   // The user measured a known length with the calibration tool. The host asks for the real
   // length and calls setCalibration() with the answer.
   calibrate(vp: Viewport, pixels: number): void;
@@ -1713,7 +1716,10 @@ export class Viewport {
         tool !== "rotate" &&
         tool !== "maskshift"
       ) {
-        this.fit();
+        // With several views a double click enlarges this one (and restores the layout);
+        // with a single view it fits the image
+        if (this.host.canMaximize()) this.host.toggleMaximize(this);
+        else this.fit();
       }
     });
   }

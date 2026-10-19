@@ -276,6 +276,8 @@ const host: ViewportHost = {
     if (vp === active) syncControls();
   },
   pick: (vp, p) => mpr?.pick(vp, p),
+  canMaximize: () => maximized !== null || cellCount() > 1,
+  toggleMaximize: (vp) => toggleMaximize(vp),
   orientMode: () => orientMode,
   calibrate: (vp, pixels) => askCalibration(vp, pixels),
   rotate: (vp, phase, x, y) => {
@@ -361,7 +363,26 @@ function toggleSyncWindow(): void {
 }
 
 // ---------- Layout ----------
+// The view that fills the whole area while the others are hidden
+let maximized: Viewport | null = null;
+
+function toggleMaximize(vp: Viewport): void {
+  if (maximized) {
+    applyLayout(layout, false, false); // restores the layout
+    return;
+  }
+  if (cellCount() < 2) return;
+  maximized = vp;
+  viewportsEl.style.gridTemplateColumns = "minmax(0, 1fr)";
+  viewportsEl.style.gridTemplateRows = "minmax(0, 1fr)";
+  viewportsEl.classList.remove("multi");
+  viewports.forEach((v) => v.setVisible(v === vp));
+  activate(vp);
+  syncControls();
+}
+
 function applyLayout(next: Layout, persist = true, fill = true): void {
+  maximized = null;
   layout = { cols: next.cols, rows: next.rows };
   if (persist) update({ layout });
 
@@ -1281,6 +1302,7 @@ const handlers: Record<string, () => void> = {
     mpr.setMipView(!mpr.mipOn);
     afterAssignment();
   },
+  "layout.maximize": () => toggleMaximize(active),
   "sync.scroll": toggleSyncScroll,
   "sync.window": toggleSyncWindow,
   "export.save": () => void exportImage(false),

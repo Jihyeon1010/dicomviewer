@@ -106,6 +106,7 @@ export const ACTIONS: ActionDef[] = [
     group: "Layout",
     defaults: [`Alt+Digit${i + 1}`],
   })),
+  { id: "layout.maximize", label: "Enlarge / restore the active view", group: "Layout", defaults: ["Alt+KeyZ"] },
   { id: "sync.scroll", label: "Toggle scroll sync", group: "Layout", defaults: ["KeyL"] },
   { id: "sync.window", label: "Toggle window sync", group: "Layout", defaults: ["Shift+KeyL"] },
 
