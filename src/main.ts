@@ -16,7 +16,7 @@ import {
 } from "./keymap";
 import { LAYOUT_PRESETS, MAX_COLS, MAX_ROWS, type Layout } from "./layout";
 import { installMenu, type AppMenu } from "./menu";
-import { Mpr, type Slab } from "./mpr";
+import { Mpr, VIEWS_3D, type Slab, type View3d } from "./mpr";
 import { createSettingsDialog } from "./settings-dialog";
 import {
   loadSettings,
@@ -28,6 +28,7 @@ import {
 } from "./settings";
 import { seriesSource, sliceCache } from "./slice-cache";
 import { createTagsDialog } from "./tags-dialog";
+import { VR_PRESETS } from "./transfer";
 import type { SeriesInfo, SlabMode, VolumeInfo } from "./types";
 import { syncedIndex, Viewport, type ToolId, type ViewportHost } from "./viewport";
 import { ORIENT_MODES, type OrientMode } from "./orient-auto";
@@ -79,6 +80,9 @@ const pingBtn = byId("pingpong", HTMLButtonElement);
 const bookBtn = byId("bookmark", HTMLButtonElement);
 const mipViewBtn = byId("mip-view", HTMLButtonElement);
 const resetRotBtn = byId("reset-rot", HTMLButtonElement);
+const view3dSel = byId("view3d", HTMLSelectElement);
+const vrPresetSel = byId("vr-preset", HTMLSelectElement);
+const vrThickSel = byId("vr-thick", HTMLSelectElement);
 const slabModeSel = byId("slab-mode", HTMLSelectElement);
 const slabThickSel = byId("slab-thick", HTMLSelectElement);
 const slider = byId("slider", HTMLInputElement);
@@ -198,7 +202,10 @@ function refreshTooltips(): void {
   setTip(pingBtn, "Ping-pong playback", "cine.pingpong");
   setTip(bookBtn, "Bookmark this frame (next: Alt+., previous: Alt+,)", "bookmark.toggle");
   tprojSel.title = "Projection over time: Min keeps the darkest value, Max the brightest";
-  setTip(mipViewBtn, "3D MIP in the fourth view: drag with the rotate tool", "mpr.mipView");
+  setTip(mipViewBtn, "3D view in the fourth view: drag with the rotate tool", "mpr.mipView");
+  view3dSel.title = "3D view: MIP, MinIP, average or volume rendering";
+  vrPresetSel.title = "Volume rendering colours and opacity";
+  vrThickSel.title = "Volume rendering thickness around the middle of the volume";
   setTip(resetRotBtn, "Reset the rotation of the MPR planes", "mpr.resetRotation");
   slabModeSel.title = "Projection through a slab: thin plane, MIP, MinIP or average";
   slabThickSel.title = "Slab thickness";
@@ -586,6 +593,15 @@ function syncControls(): void {
   setPressed(pingBtn, vp.pingPongOn);
   setPressed(bookBtn, vp.bookmarked);
   setPressed(mipViewBtn, mpr?.mipOn ?? false);
+  const mip3d = mpr?.mipOn ?? false;
+  view3dSel.hidden = !mip3d;
+  vrPresetSel.hidden = !mip3d || mpr?.view !== "vr";
+  vrThickSel.hidden = vrPresetSel.hidden;
+  if (mpr) {
+    view3dSel.value = mpr.view;
+    vrPresetSel.value = mpr.preset;
+    vrThickSel.value = String(mpr.thicknessMm);
+  }
   slabThickSel.disabled = slabModeSel.value === "none";
 
   setPressed(invertBtn, vp.invert);
@@ -1017,6 +1033,28 @@ bookBtn.addEventListener("click", () => active.toggleBookmark());
 mipViewBtn.addEventListener("click", () => handlers["mpr.mipView"]?.());
 resetRotBtn.addEventListener("click", () => mpr?.resetRotation());
 
+async function chooseView3d(mode: View3d): Promise<void> {
+  if (!mpr) return;
+  const ok = await mpr.setView3d(mode);
+  if (!ok) flashStatus("Volume rendering needs WebGL2 and a volume that fits on the GPU");
+  syncControls();
+}
+view3dSel.addEventListener("change", () => {
+  const mode = VIEWS_3D.find((m) => m === view3dSel.value);
+  if (mode) void chooseView3d(mode);
+  view3dSel.blur();
+});
+vrPresetSel.addEventListener("change", () => {
+  const id = VR_PRESETS.find((p) => p.id === vrPresetSel.value);
+  if (id) mpr?.setVrPreset(id.id);
+  vrPresetSel.blur();
+});
+vrThickSel.addEventListener("change", () => {
+  const mm = Number(vrThickSel.value);
+  if (mm > 0) mpr?.setVrThickness(mm);
+  vrThickSel.blur();
+});
+
 slabModeSel.addEventListener("change", () => {
   applySlab();
   slabModeSel.blur();
@@ -1152,9 +1190,17 @@ const handlers: Record<string, () => void> = {
   "volume.build": () => void runBuildVolume(),
   "mpr.toggle": () => void toggleMpr(),
   "mpr.resetRotation": () => mpr?.resetRotation(),
+  "mpr.view3dCycle": () => {
+    if (!mpr?.mipOn) {
+      flashStatus("Turn on the 3D view first (Shift+V)");
+      return;
+    }
+    const next = VIEWS_3D[(VIEWS_3D.indexOf(mpr.view) + 1) % VIEWS_3D.length];
+    if (next) void chooseView3d(next);
+  },
   "mpr.mipView": () => {
     if (!mpr) {
-      flashStatus("The 3D MIP view works while an MPR is shown");
+      flashStatus("The 3D view works while an MPR is shown");
       return;
     }
     mpr.setMipView(!mpr.mipOn);

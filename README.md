@@ -41,7 +41,8 @@ All shortcuts can be changed in **Settings** (`Mac os` = `Cmd+`, `Windos and Lin
 | Build volume | `V` |
 | MPR on or off | `Shift+M` |
 | Crosshair / rotate tool (MPR) | `K` / `Q` |
-| Reset MPR rotation / 3D MIP view | `Shift+Q` / `Shift+V` |
+| Reset MPR rotation / 3D view | `Shift+Q` / `Shift+V` |
+| Next 3D view mode (MIP, MinIP, average, volume) | `Alt+V` |
 | DSA on or off | `Shift+D` |
 | Mask shift tool / use this frame as mask | `U` / `Shift+U` |
 | Shift the mask | `Alt+←` `→` `↑` `↓`, reset with `Alt+0` |

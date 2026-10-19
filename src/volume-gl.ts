@@ -1,6 +1,7 @@
 import type { VolumeTexture } from "./api";
+import { LUT_SIZE, type TransferFunction } from "./transfer";
 import type { SliceData } from "./types";
-import { cross, unit, type V3 } from "./vec3";
+import { cross, scale, unit, type V3 } from "./vec3";
 
 export type ProjectionMode = "max" | "min" | "mean";
 
@@ -16,8 +17,24 @@ export interface ProjectionParams {
   mode: ProjectionMode;
 }
 
+/** A shaded volume rendering (colour and opacity from a transfer function). */
+export interface RenderParams {
+  origin: V3;
+  u: V3;
+  v: V3;
+  width: number;
+  height: number;
+  pixelMm: number;
+  stepMm: number;
+  /** Thickness in mm of the part of the volume that is drawn, around its middle; Infinity for all */
+  slabMm: number;
+  shade: boolean;
+}
+
 // Most samples taken along one ray
 const MAX_STEPS = 4096;
+// Opacities of the transfer function are for this much material
+const REF_STEP_MM = 1;
 
 const VERT = `#version 300 es
 void main() {
@@ -26,27 +43,22 @@ void main() {
   gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
 }`;
 
-// Mirrors reformat_oblique in src-tauri/src/mpr.rs: one ray per pixel, perpendicular to the
-// image, through the whole volume. The result is the 16-bit encoding that the backend uses
-// for reformatted images (value = raw * slope + intercept), packed into two 8-bit channels
-// so that it can be read back from any WebGL2 implementation.
-const FRAG = `#version 300 es
+// Parts shared by both shaders: the volume, the image plane and the ray through a pixel.
+// Mirrors reformat_oblique in src-tauri/src/mpr.rs.
+const COMMON = `#version 300 es
 precision highp float;
 precision highp sampler3D;
+precision highp sampler2D;
 uniform sampler3D uVol;
 uniform vec3 uSize;   // texels per axis
 uniform vec3 uExt;    // millimetres between the first and last texel centre
 uniform vec3 uOrigin;
 uniform vec3 uU;
 uniform vec3 uV;
-uniform vec3 uN;
+uniform vec3 uN;      // direction of the rays
 uniform vec2 uHalf;   // half the image size in pixels
 uniform float uPixel;
 uniform float uStep;
-uniform float uSlope;
-uniform float uIntercept;
-uniform float uBackground; // value of rays that miss the volume
-uniform int uMode;    // 0 max, 1 min, 2 mean
 out vec4 outColor;
 
 float fetch(vec3 p) {
@@ -82,12 +94,26 @@ bool clipRay(vec3 pt, vec3 n, out float t0, out float t1) {
   return false;
 }
 
-void main() {
+// Point of the volume that the ray of this pixel passes through
+vec3 rayPoint() {
   // Row 0 of the result is the bottom row of the framebuffer, which readPixels returns first
   float a = (gl_FragCoord.x - uHalf.x) * uPixel;
   float b = (gl_FragCoord.y - uHalf.y) * uPixel;
-  vec3 pt = uOrigin + a * uU + b * uV;
+  return uOrigin + a * uU + b * uV;
+}
+`;
 
+// Projection: the result is the 16-bit encoding that the backend uses for reformatted
+// images (value = raw * slope + intercept), packed into two 8-bit channels so that it can
+// be read back from any WebGL2 implementation.
+const MIP_FRAG = COMMON + `
+uniform float uSlope;
+uniform float uIntercept;
+uniform float uBackground; // value of rays that miss the volume
+uniform int uMode;    // 0 max, 1 min, 2 mean
+
+void main() {
+  vec3 pt = rayPoint();
   float value = uBackground;
   float t0;
   float t1;
@@ -110,28 +136,104 @@ void main() {
   outColor = vec4(mod(raw, 256.0) / 255.0, floor(raw / 256.0) / 255.0, 0.0, 1.0);
 }`;
 
-const UNIFORMS = [
+// Volume rendering: samples are looked up in the transfer function and composited front to
+// back, with early termination. Surfaces are lit from the viewer's side with a light that
+// follows the view; the gradient of the volume gives the surface normal.
+const VR_FRAG = COMMON + `
+uniform sampler2D uLut;
+uniform float uLutLo;
+uniform float uLutInv;     // 1 / (hi - lo)
+uniform float uRefStep;
+uniform float uGradStep;   // mm between the samples of the gradient
+uniform float uGradRef;    // value change across the gradient step that counts as a full surface
+uniform vec3 uCentre;
+uniform float uHalfSlab;
+uniform bool uShade;
+
+vec4 classify(float v) {
+  float x = clamp((v - uLutLo) * uLutInv, 0.0, 1.0);
+  return texture(uLut, vec2((x * ${LUT_SIZE - 1}.0 + 0.5) / ${LUT_SIZE}.0, 0.5));
+}
+
+void main() {
+  vec3 pt = rayPoint();
+  vec3 acc = vec3(0.0);
+  float alpha = 0.0;
+  float t0;
+  float t1;
+  if (clipRay(pt, uN, t0, t1)) {
+    // Keep only the slab around the middle of the volume
+    float off = dot(pt - uCentre, uN);
+    t0 = max(t0, -uHalfSlab - off);
+    t1 = min(t1, uHalfSlab - off);
+    if (t1 >= t0) {
+      float len = t1 - t0;
+      float step = max(max(uStep, len / ${MAX_STEPS}.0), 1.0e-3);
+      int count = int(floor(len / step + 1.0e-6)) + 1;
+      float corr = step / uRefStep;
+      vec3 light = -uN;
+      for (int m = 0; m < ${MAX_STEPS + 4}; m++) {
+        if (m >= count) break;
+        vec3 p = pt + (t0 + float(m) * step) * uN;
+        vec4 c = classify(fetch(p));
+        float a = 1.0 - pow(1.0 - min(c.a, 0.999), corr);
+        if (a < 0.002) continue;
+        vec3 col = c.rgb;
+        if (uShade) {
+          float h = uGradStep;
+          vec3 g = vec3(
+            fetch(p + vec3(h, 0.0, 0.0)) - fetch(p - vec3(h, 0.0, 0.0)),
+            fetch(p + vec3(0.0, h, 0.0)) - fetch(p - vec3(0.0, h, 0.0)),
+            fetch(p + vec3(0.0, 0.0, h)) - fetch(p - vec3(0.0, 0.0, h)));
+          float gl = length(g);
+          float w = clamp(gl / uGradRef, 0.0, 1.0);
+          if (w > 0.0) {
+            vec3 nrm = -g / gl; // points out of the denser material
+            float d = abs(dot(nrm, light));
+            float spec = pow(d, 24.0) * 0.25;
+            col = mix(col, col * (0.3 + 0.8 * d) + vec3(spec), w);
+          }
+        }
+        acc += (1.0 - alpha) * a * col;
+        alpha += (1.0 - alpha) * a;
+        if (alpha > 0.97) break;
+      }
+    }
+  }
+  outColor = vec4(clamp(acc, 0.0, 1.0), 1.0);
+}`;
+
+const COMMON_UNIFORMS = [
   "uVol", "uSize", "uExt", "uOrigin", "uU", "uV", "uN", "uHalf", "uPixel", "uStep",
-  "uSlope", "uIntercept", "uBackground", "uMode",
+] as const;
+const MIP_UNIFORMS = [...COMMON_UNIFORMS, "uSlope", "uIntercept", "uBackground", "uMode"] as const;
+const VR_UNIFORMS = [
+  ...COMMON_UNIFORMS, "uLut", "uLutLo", "uLutInv", "uRefStep", "uGradStep", "uGradRef",
+  "uCentre", "uHalfSlab", "uShade",
 ] as const;
 
-type UniformName = (typeof UNIFORMS)[number];
+interface Prog<N extends string> {
+  prog: WebGLProgram;
+  loc: Record<N, WebGLUniformLocation>;
+}
 
 const MODE_CODE: Record<ProjectionMode, number> = { max: 0, min: 1, mean: 2 };
 
 /**
- * Renders projections (MIP, MinIP, average) of a volume on the GPU, in a WebGL2 context of
- * its own. The images come back as ordinary 16-bit slices, so the viewports can window,
- * zoom and measure them like any other image.
+ * Renders projections (MIP, MinIP, average) and shaded volume renderings of a volume on the
+ * GPU, in a WebGL2 context of its own. Projections come back as ordinary 16-bit slices and
+ * renderings as RGB slices, so the viewports can zoom and measure them like any other image.
  */
 export class VolumeGL {
   /** Largest side of the volume texture this GPU accepts */
   readonly maxDim: number;
 
   private readonly gl: WebGL2RenderingContext;
-  private readonly prog: WebGLProgram;
-  private readonly loc: Record<UniformName, WebGLUniformLocation>;
+  private readonly mip: Prog<(typeof MIP_UNIFORMS)[number]>;
+  private readonly vr: Prog<(typeof VR_UNIFORMS)[number]>;
   private volumeTex: WebGLTexture | null = null;
+  private lutTex: WebGLTexture | null = null;
+  private lutRange: [number, number] = [0, 1];
   private target: { tex: WebGLTexture; fbo: WebGLFramebuffer; w: number; h: number } | null = null;
   private info: VolumeTexture | null = null;
   private z0 = 0;
@@ -140,28 +242,8 @@ export class VolumeGL {
   private constructor(gl: WebGL2RenderingContext, canvas: HTMLCanvasElement) {
     this.gl = gl;
     this.maxDim = gl.getParameter(gl.MAX_3D_TEXTURE_SIZE) as number;
-
-    const vs = this.compile(gl.VERTEX_SHADER, VERT);
-    const fs = this.compile(gl.FRAGMENT_SHADER, FRAG);
-    const prog = gl.createProgram();
-    if (!prog) throw new Error("Could not create a WebGL program");
-    gl.attachShader(prog, vs);
-    gl.attachShader(prog, fs);
-    gl.linkProgram(prog);
-    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
-      throw new Error(`Shader link failed: ${gl.getProgramInfoLog(prog)}`);
-    }
-    gl.deleteShader(vs);
-    gl.deleteShader(fs);
-    this.prog = prog;
-
-    const loc = {} as Record<UniformName, WebGLUniformLocation>;
-    for (const name of UNIFORMS) {
-      const l = gl.getUniformLocation(prog, name);
-      if (!l) throw new Error(`Missing shader uniform: ${name}`);
-      loc[name] = l;
-    }
-    this.loc = loc;
+    this.mip = this.link(MIP_FRAG, MIP_UNIFORMS);
+    this.vr = this.link(VR_FRAG, VR_UNIFORMS);
 
     gl.disable(gl.DITHER); // the output carries exact numbers
     gl.disable(gl.BLEND);
@@ -239,55 +321,50 @@ export class VolumeGL {
     this.z0 = z0;
   }
 
+  /** Sets the colours and opacities that `render` uses. */
+  setTransferFunction(tf: TransferFunction): void {
+    const gl = this.gl;
+    if (tf.lut.length !== LUT_SIZE * 4) throw new Error("Unexpected transfer function size");
+    if (!this.lutTex) {
+      const tex = gl.createTexture();
+      if (!tex) throw new Error("Could not create a texture");
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA8, LUT_SIZE, 1);
+      this.lutTex = tex;
+    }
+    gl.bindTexture(gl.TEXTURE_2D, this.lutTex);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, LUT_SIZE, 1, gl.RGBA, gl.UNSIGNED_BYTE, tf.lut);
+    this.lutRange = [tf.lo, Math.max(tf.hi, tf.lo + 1e-6)];
+  }
+
   /** Renders one projection image in the 16-bit format of reformatted images. */
   project(p: ProjectionParams): SliceData {
+    const vol = this.begin(p.width, p.height);
     const gl = this.gl;
-    const vol = this.info;
-    if (!vol || !this.volumeTex) throw new Error("No volume on the GPU");
-    if (this.lost || gl.isContextLost()) throw new Error("The WebGL context was lost");
-    const { width: w, height: h } = p;
-    if (!(w > 0 && h > 0 && w <= gl.getParameter(gl.MAX_TEXTURE_SIZE))) {
-      throw new Error("Unsupported image size");
-    }
-    const n = unit(cross(p.u, p.v));
-    if (!n.every(Number.isFinite) || Math.hypot(n[0], n[1], n[2]) < 1e-6) {
-      throw new Error("Invalid plane");
-    }
+    const dir = unit(cross(p.u, p.v));
+    this.checkDirection(dir);
 
-    const target = this.targetOf(w, h);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, target.fbo);
-    gl.viewport(0, 0, w, h);
-    gl.useProgram(this.prog);
-    gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_3D, this.volumeTex);
-
-    const l = this.loc;
-    gl.uniform1i(l.uVol, 0);
-    gl.uniform3f(l.uSize, vol.cols, vol.rows, vol.depth);
-    gl.uniform3f(l.uExt, vol.extent[0], vol.extent[1], vol.extent[2]);
-    gl.uniform3f(l.uOrigin, p.origin[0], p.origin[1], p.origin[2] - this.z0);
-    gl.uniform3f(l.uU, p.u[0], p.u[1], p.u[2]);
-    gl.uniform3f(l.uV, p.v[0], p.v[1], p.v[2]);
-    gl.uniform3f(l.uN, n[0], n[1], n[2]);
-    gl.uniform2f(l.uHalf, w / 2, h / 2);
-    gl.uniform1f(l.uPixel, p.pixelMm);
-    gl.uniform1f(l.uStep, p.stepMm);
+    gl.useProgram(this.mip.prog);
+    const l = this.mip.loc;
+    this.setCommon(l, vol, p, dir);
     gl.uniform1f(l.uSlope, vol.slope);
     gl.uniform1f(l.uIntercept, vol.intercept);
     gl.uniform1f(l.uBackground, vol.valueMin);
     gl.uniform1i(l.uMode, MODE_CODE[p.mode]);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
 
-    const bytes = new Uint8Array(w * h * 4);
-    gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, bytes);
-    const pixels = new Uint16Array(w * h);
+    const bytes = this.readBack(p.width, p.height);
+    const pixels = new Uint16Array(p.width * p.height);
     for (let i = 0, o = 0; i < pixels.length; i++, o += 4) {
       pixels[i] = (bytes[o] as number) | ((bytes[o + 1] as number) << 8);
     }
-
     return {
-      rows: h,
-      cols: w,
+      rows: p.height,
+      cols: p.width,
       bitsAllocated: 16,
       signed: false,
       slope: vol.slope || 1,
@@ -300,14 +377,123 @@ export class VolumeGL {
     };
   }
 
+  /**
+   * Renders the volume with the current transfer function as an 8-bit RGB image. The viewer
+   * looks along -(u x v), the direction in which the 3D view of the MPR is oriented.
+   */
+  render(p: RenderParams): SliceData {
+    const vol = this.begin(p.width, p.height);
+    const gl = this.gl;
+    if (!this.lutTex) throw new Error("No transfer function set");
+    const dir = scale(unit(cross(p.u, p.v)), -1);
+    this.checkDirection(dir);
+
+    gl.useProgram(this.vr.prog);
+    const l = this.vr.loc;
+    this.setCommon(l, vol, p, dir);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, this.lutTex);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.uniform1i(l.uLut, 1);
+    const [lo, hi] = this.lutRange;
+    gl.uniform1f(l.uLutLo, lo);
+    gl.uniform1f(l.uLutInv, 1 / (hi - lo));
+    gl.uniform1f(l.uRefStep, REF_STEP_MM);
+    // Gradient over one voxel of the finest axis; a surface is a change of about 5% of the
+    // value range across it
+    const voxel = Math.min(
+      vol.extent[0] / Math.max(1, vol.cols - 1),
+      vol.extent[1] / Math.max(1, vol.rows - 1),
+      vol.extent[2] / Math.max(1, vol.depth - 1),
+    );
+    gl.uniform1f(l.uGradStep, Math.max(voxel, 1e-3));
+    gl.uniform1f(l.uGradRef, Math.max(1e-6, 0.05 * (hi - lo)));
+    gl.uniform3f(l.uCentre, vol.extent[0] / 2, vol.extent[1] / 2, vol.extent[2] / 2);
+    gl.uniform1f(l.uHalfSlab, Number.isFinite(p.slabMm) ? Math.max(p.slabMm, 0) / 2 : 1e8);
+    gl.uniform1i(l.uShade, p.shade ? 1 : 0);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+    const bytes = this.readBack(p.width, p.height);
+    const pixels = new Uint8Array(p.width * p.height * 3);
+    for (let i = 0, o = 0, q = 0; i < p.width * p.height; i++, o += 4, q += 3) {
+      pixels[q] = bytes[o] as number;
+      pixels[q + 1] = bytes[o + 1] as number;
+      pixels[q + 2] = bytes[o + 2] as number;
+    }
+    return {
+      rows: p.height,
+      cols: p.width,
+      bitsAllocated: 8,
+      signed: false,
+      slope: 1,
+      intercept: 0,
+      defaultWl: null,
+      defaultWw: null,
+      monochrome1: false,
+      samples: 3,
+      pixels,
+    };
+  }
+
   /** Frees everything on the GPU. The object cannot be used afterwards. */
   dispose(): void {
     if (!this.gl.isContextLost()) {
       this.freeVolume();
       this.freeTarget();
-      this.gl.deleteProgram(this.prog);
+      if (this.lutTex) this.gl.deleteTexture(this.lutTex);
+      this.lutTex = null;
+      this.gl.deleteProgram(this.mip.prog);
+      this.gl.deleteProgram(this.vr.prog);
     }
     this.lost = true;
+  }
+
+  // Binds the render target and the volume; returns the description of the volume
+  private begin(w: number, h: number): VolumeTexture {
+    const gl = this.gl;
+    const vol = this.info;
+    if (!vol || !this.volumeTex) throw new Error("No volume on the GPU");
+    if (this.lost || gl.isContextLost()) throw new Error("The WebGL context was lost");
+    if (!(w > 0 && h > 0 && w <= gl.getParameter(gl.MAX_TEXTURE_SIZE) && h <= gl.getParameter(gl.MAX_TEXTURE_SIZE))) {
+      throw new Error("Unsupported image size");
+    }
+    const target = this.targetOf(w, h);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, target.fbo);
+    gl.viewport(0, 0, w, h);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_3D, this.volumeTex);
+    return vol;
+  }
+
+  private checkDirection(d: V3): void {
+    if (!d.every(Number.isFinite) || Math.hypot(d[0], d[1], d[2]) < 1e-6) {
+      throw new Error("Invalid plane");
+    }
+  }
+
+  private setCommon(
+    l: Record<(typeof COMMON_UNIFORMS)[number], WebGLUniformLocation>,
+    vol: VolumeTexture,
+    p: { origin: V3; u: V3; v: V3; width: number; height: number; pixelMm: number; stepMm: number },
+    dir: V3,
+  ): void {
+    const gl = this.gl;
+    gl.uniform1i(l.uVol, 0);
+    gl.uniform3f(l.uSize, vol.cols, vol.rows, vol.depth);
+    gl.uniform3f(l.uExt, vol.extent[0], vol.extent[1], vol.extent[2]);
+    gl.uniform3f(l.uOrigin, p.origin[0], p.origin[1], p.origin[2] - this.z0);
+    gl.uniform3f(l.uU, p.u[0], p.u[1], p.u[2]);
+    gl.uniform3f(l.uV, p.v[0], p.v[1], p.v[2]);
+    gl.uniform3f(l.uN, dir[0], dir[1], dir[2]);
+    gl.uniform2f(l.uHalf, p.width / 2, p.height / 2);
+    gl.uniform1f(l.uPixel, p.pixelMm);
+    gl.uniform1f(l.uStep, p.stepMm);
+  }
+
+  private readBack(w: number, h: number): Uint8Array {
+    const bytes = new Uint8Array(w * h * 4);
+    this.gl.readPixels(0, 0, w, h, this.gl.RGBA, this.gl.UNSIGNED_BYTE, bytes);
+    return bytes;
   }
 
   private targetOf(w: number, h: number): { tex: WebGLTexture; fbo: WebGLFramebuffer } {
@@ -343,6 +529,30 @@ export class VolumeGL {
     if (this.volumeTex) this.gl.deleteTexture(this.volumeTex);
     this.volumeTex = null;
     this.info = null;
+  }
+
+  private link<N extends string>(frag: string, names: readonly N[]): Prog<N> {
+    const gl = this.gl;
+    const vs = this.compile(gl.VERTEX_SHADER, VERT);
+    const fs = this.compile(gl.FRAGMENT_SHADER, frag);
+    const prog = gl.createProgram();
+    if (!prog) throw new Error("Could not create a WebGL program");
+    gl.attachShader(prog, vs);
+    gl.attachShader(prog, fs);
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+      throw new Error(`Shader link failed: ${gl.getProgramInfoLog(prog)}`);
+    }
+    gl.deleteShader(vs);
+    gl.deleteShader(fs);
+
+    const loc = {} as Record<N, WebGLUniformLocation>;
+    for (const name of names) {
+      const l = gl.getUniformLocation(prog, name);
+      if (!l) throw new Error(`Missing shader uniform: ${name}`);
+      loc[name] = l;
+    }
+    return { prog, loc };
   }
 
   private compile(type: number, src: string): WebGLShader {

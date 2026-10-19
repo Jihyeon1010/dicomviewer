@@ -4,9 +4,14 @@ import { matrix, type Pt } from "./transform2d";
 import type { Plane, SeriesInfo, SlabMode, SliceData, SliceMeta, VolumeInfo } from "./types";
 import { add, cross, dot, rotateAbout, scale, sub, unit, type V3 } from "./vec3";
 import type { RefLine, Viewport } from "./viewport";
+import { transferFor, type ValueRange, type VrPresetId } from "./transfer";
 import { VolumeGL, type ProjectionMode } from "./volume-gl";
 
 export const PLANES: Plane[] = ["axial", "coronal", "sagittal"];
+
+/** What the fourth view shows: a projection, or a shaded volume rendering (GPU only). */
+export type View3d = ProjectionMode | "vr";
+export const VIEWS_3D: View3d[] = ["max", "min", "mean", "vr"];
 
 export interface Slab {
   mode: SlabMode;
@@ -265,7 +270,10 @@ export class Mpr {
   private scaleNow = 1; // output scale of the oblique views currently shown
   private mip = false;
   private mipAxes: Axes = baseMipAxes();
-  private mipMode: ProjectionMode = "max";
+  private view3d: View3d = "max";
+  private vrPreset: VrPresetId;
+  private vrThickMm = Infinity; // thickness of the volume drawn in the rendering
+  private range: ValueRange;
   private mipScaleNow = MIP_FINAL;
   private gpu: VolumeGL | null = null; // the volume on the GPU, when it could be put there
   private gpuLoad: Promise<void> | null = null;
@@ -302,6 +310,25 @@ export class Mpr {
     if (Math.ceil(this.diag / p0) + 2 > MAX_SIDE) p0 = this.diag / (MAX_SIDE - 2);
     this.p0 = p0;
     this.c = [...this.v0];
+    this.vrPreset = opts.baseMeta?.modality === "CT" ? "bone" : "generic";
+    this.range = {
+      valueMin: opts.volume.value_min,
+      valueMax: opts.volume.value_max,
+      wl: null,
+      ww: null,
+    };
+  }
+
+  get view(): View3d {
+    return this.view3d;
+  }
+
+  get preset(): VrPresetId {
+    return this.vrPreset;
+  }
+
+  get thicknessMm(): number {
+    return this.vrThickMm;
   }
 
   get mipOn(): boolean {
@@ -388,11 +415,38 @@ export class Mpr {
     else void this.extra.setSeries(this.series);
   }
 
-  /** Projection of the 3D view: maximum, minimum or average intensity. */
-  setMipMode(mode: ProjectionMode): void {
-    if (mode === this.mipMode) return;
-    this.mipMode = mode;
+  /**
+   * Projection of the 3D view: maximum, minimum or average intensity, or a volume rendering.
+   * Resolves to false when the rendering is not possible (it needs WebGL2).
+   */
+  async setView3d(mode: View3d): Promise<boolean> {
+    if (mode === "vr") {
+      await this.ensureGpu();
+      if (!this.gpu || this.stopped) return false;
+      this.applyTransfer();
+    }
+    if (mode === this.view3d) return true;
+    this.view3d = mode;
     this.refreshMip();
+    return true;
+  }
+
+  setVrPreset(id: VrPresetId): void {
+    if (id === this.vrPreset) return;
+    this.vrPreset = id;
+    this.applyTransfer();
+    if (this.view3d === "vr") this.refreshMip();
+  }
+
+  /** Thickness in mm of the part of the volume that the rendering draws; Infinity for all. */
+  setVrThickness(mm: number): void {
+    if (mm === this.vrThickMm) return;
+    this.vrThickMm = mm;
+    if (this.view3d === "vr") this.refreshMip();
+  }
+
+  private applyTransfer(): void {
+    this.gpu?.setTransferFunction(transferFor(this.vrPreset, this.range));
   }
 
   private get mipFinal(): number {
@@ -427,6 +481,7 @@ export class Mpr {
         return;
       }
       gl.upload(tex, this.z0);
+      this.range = { ...this.range, wl: tex.defaultWl, ww: tex.defaultWw };
       this.gpu = gl;
     } catch (err) {
       console.warn("GPU rendering of the 3D view is unavailable, using the CPU path:", err);
@@ -724,17 +779,24 @@ export class Mpr {
     const ax = this.mipAxes;
     const sz = this.sizeAt(this.mipScaleNow);
     const v0 = this.v0;
-    const mode = this.mipMode;
     const gpu = this.gpu;
-    const slab: Slab = { mode, mm: FULL_MM };
-    const suffix = ` · 3D ${mode === "max" ? "MIP" : mode === "min" ? "MinIP" : "Average"}`;
+    const vr = this.view3d === "vr" && gpu !== null;
+    // Without the GPU a rendering falls back to the maximum projection
+    const mode: ProjectionMode = this.view3d === "vr" ? "max" : this.view3d;
+    const slab: Slab = vr ? { mode: "none", mm: 0 } : { mode, mm: FULL_MM };
+    const name = mode === "max" ? "MIP" : mode === "min" ? "MinIP" : "Average";
+    const suffix = vr ? " · 3D Volume" : ` · 3D ${name}`;
+    const thick = this.vrThickMm;
+    const key = vr
+      ? `vr:${this.vrPreset}:${thick}`
+      : `${gpu ? "gmip" : "mip"}:${mode}`;
     return {
-      id: `${gpu ? "gmip" : "mip"}:${uid}:${mode}:${keyOf(ax)}:${this.mipScaleNow}`,
+      id: `${key}:${uid}:${keyOf(ax)}:${this.mipScaleNow}`,
       load: async (): Promise<CachedSlice> => {
         let slice: SliceData | null = null;
         if (gpu?.ready) {
           try {
-            slice = gpu.project({
+            const view = {
               origin: v0,
               u: ax.u,
               v: ax.v,
@@ -742,10 +804,12 @@ export class Mpr {
               height: sz.h,
               pixelMm: sz.p,
               stepMm: sz.p,
-              mode,
-            });
+            };
+            slice = vr
+              ? gpu.render({ ...view, slabMm: thick, shade: true })
+              : gpu.project({ ...view, mode });
           } catch (err) {
-            console.warn("GPU projection failed, using the CPU path:", err);
+            console.warn("GPU rendering failed, using the CPU path:", err);
           }
         }
         if (slice) {
@@ -754,7 +818,10 @@ export class Mpr {
         const r = await getObliqueSlice(
           uid, v0, ax.u, ax.v, sz.w, sz.h, sz.p, mode, FULL_MM, sz.p,
         );
-        return { slice: r.slice, meta: this.metaFor("coronal", ax, slab, r.spacing, suffix) };
+        return {
+          slice: r.slice,
+          meta: this.metaFor("coronal", ax, { mode, mm: FULL_MM }, r.spacing, ` · 3D ${name}`),
+        };
       },
     };
   }

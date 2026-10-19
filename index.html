@@ -48,6 +48,25 @@
         <button id="cross" class="tool ib" data-tool="cross" aria-label="Crosshair" hidden><span class="ic" data-icon="locate"></span></button>
         <button id="rotate" class="tool ib" data-tool="rotate" aria-label="Rotate MPR planes" hidden><span class="ic" data-icon="orbit"></span></button>
         <button id="mip-view" class="ib" aria-label="3D MIP view" hidden><span class="ic" data-icon="globe"></span></button>
+        <select id="view3d" aria-label="3D view" hidden>
+          <option value="max">MIP</option>
+          <option value="min">MinIP</option>
+          <option value="mean">Average</option>
+          <option value="vr">Volume</option>
+        </select>
+        <select id="vr-preset" aria-label="Volume rendering preset" hidden>
+          <option value="generic">Generic</option>
+          <option value="bone">Bone</option>
+          <option value="vessel">Vessels (CTA)</option>
+          <option value="soft">Soft tissue</option>
+        </select>
+        <select id="vr-thick" aria-label="Volume rendering thickness" hidden>
+          <option value="Infinity" selected>Full</option>
+          <option value="120">120 mm</option>
+          <option value="60">60 mm</option>
+          <option value="30">30 mm</option>
+          <option value="15">15 mm</option>
+        </select>
         <button id="reset-rot" class="ib" aria-label="Reset MPR rotation" hidden><span class="ic" data-icon="undo"></span></button>
         <select id="slab-mode" aria-label="Slab projection" hidden>
           <option value="none">Thin</option>
