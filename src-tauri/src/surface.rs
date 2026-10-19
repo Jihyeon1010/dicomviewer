@@ -39,6 +39,13 @@ pub enum Part {
 
 pub struct Params {
     pub threshold: f32,
+    /// Voxels above this value are left out as well (bone next to contrast-filled vessels)
+    pub max: Option<f32>,
+    /// Voxels this close to the ones above `max` are left out too, which cuts the shell of
+    /// in-between values that surrounds a bright structure
+    pub margin: usize,
+    /// Rounds of smoothing of the mesh (0 for none)
+    pub smooth: usize,
     pub part: Part,
     /// Take every n-th voxel along each axis (1 for all of them)
     pub step: usize,
@@ -152,8 +159,11 @@ pub fn extract(slices: &[Vec<f32>], g: &Geometry, p: &Params) -> Result<Mesh, St
     if slices.iter().any(|s| s.len() != g.cols * g.rows) {
         return Err("Inconsistent volume".into());
     }
-    if !p.threshold.is_finite() {
+    if !p.threshold.is_finite() || p.max.is_some_and(|m| !m.is_finite()) {
         return Err("Invalid threshold".into());
+    }
+    if p.max.is_some_and(|m| m <= p.threshold) {
+        return Err("The maximum must be above the threshold".into());
     }
     let step = p.step.max(1);
     let (nx, ny, nz) = grid_dims(g, step);
@@ -164,21 +174,41 @@ pub fn extract(slices: &[Vec<f32>], g: &Geometry, p: &Params) -> Result<Mesh, St
     let thr = p.threshold;
     let n = nx * ny * nz;
 
-    // Foreground: voxels at or above the threshold
+    // Foreground: voxels at or above the threshold (and not above the maximum)
+    let top = p.max.unwrap_or(f32::INFINITY);
     let mut fg = vec![0u8; n];
+    let mut bright = vec![0u8; if p.max.is_some() && p.margin > 0 { n } else { 0 }];
     fg.par_chunks_mut(nx * ny).enumerate().for_each(|(k, plane)| {
         let s = &slices[(k * step).min(depth - 1)];
         for j in 0..ny {
             for i in 0..nx {
-                plane[j * nx + i] = u8::from(s[j * step * cols + i * step] >= thr);
+                let v = s[j * step * cols + i * step];
+                plane[j * nx + i] = u8::from(v >= thr && v <= top);
             }
         }
     });
+    let dims = (nx, ny, nz);
+    if !bright.is_empty() {
+        bright.par_chunks_mut(nx * ny).enumerate().for_each(|(k, plane)| {
+            let s = &slices[(k * step).min(depth - 1)];
+            for j in 0..ny {
+                for i in 0..nx {
+                    plane[j * nx + i] = u8::from(s[j * step * cols + i * step] > top);
+                }
+            }
+        });
+        dilate(&mut bright, dims, p.margin);
+        fg.par_iter_mut().zip(bright.par_iter()).for_each(|(f, &b)| {
+            if b != 0 {
+                *f = 0;
+            }
+        });
+        drop(bright);
+    }
     if !fg.iter().any(|&f| f != 0) {
         return Err("No voxel reaches the threshold".into());
     }
 
-    let dims = (nx, ny, nz);
     let keep: Vec<u8> = match p.part {
         Part::All => fg,
         Part::Largest => {
@@ -201,7 +231,14 @@ pub fn extract(slices: &[Vec<f32>], g: &Geometry, p: &Params) -> Result<Mesh, St
             let start = nearest_foreground(&fg, dims, at)
                 .ok_or("Nothing reaches the threshold at the crosshair")?;
             let mut seen = vec![0u8; n];
-            flood(&fg, &mut seen, start, dims);
+            let size = flood(&fg, &mut seen, start, dims);
+            // A region that fills much of the volume has leaked into something else
+            if size * 5 > n * 2 {
+                return Err(
+                    "The region grows into more than 40% of the volume: raise the threshold or set a maximum"
+                        .into(),
+                );
+            }
             seen
         }
     };
@@ -241,6 +278,12 @@ pub fn extract(slices: &[Vec<f32>], g: &Geometry, p: &Params) -> Result<Mesh, St
             f64::from(value(a[0], a[1], a[2])),
             f64::from(value(b[0], b[1], b[2])),
         );
+        // A voxel left out for being too bright or too close to one is not a crossing of
+        // the threshold: put the surface half way
+        let t_in = f64::from(thr);
+        if (va >= t_in) == (vb >= t_in) {
+            return 0.5;
+        }
         let t = (f64::from(thr) - va) / (vb - va);
         if t.is_finite() {
             t.clamp(0.01, 0.99)
@@ -348,12 +391,108 @@ pub fn extract(slices: &[Vec<f32>], g: &Geometry, p: &Params) -> Result<Mesh, St
         std::mem::swap(&mut prev, &mut cur);
     }
 
+    if p.smooth > 0 {
+        smooth_mesh(&mut positions, &indices, p.smooth);
+    }
     let normals = vertex_normals(&positions, &indices);
     Ok(Mesh {
         positions,
         normals,
         indices,
     })
+}
+
+// Grows a mask by `times` voxels in every direction (a 3 x 3 x 3 box, one axis at a time)
+fn dilate(mask: &mut [u8], dims: (usize, usize, usize), times: usize) {
+    let (nx, ny, nz) = dims;
+    let plane = nx * ny;
+    let mut tmp = vec![0u8; mask.len()];
+    for _ in 0..times {
+        // x
+        tmp.par_chunks_mut(plane).zip(mask.par_chunks(plane)).for_each(|(d, s)| {
+            for j in 0..ny {
+                let row = &s[j * nx..(j + 1) * nx];
+                for i in 0..nx {
+                    let lo = row[i.saturating_sub(1)];
+                    let hi = row[(i + 1).min(nx - 1)];
+                    d[j * nx + i] = row[i] | lo | hi;
+                }
+            }
+        });
+        // y
+        mask.par_chunks_mut(plane).zip(tmp.par_chunks(plane)).for_each(|(d, s)| {
+            for j in 0..ny {
+                let (a, b) = (j.saturating_sub(1), (j + 1).min(ny - 1));
+                for i in 0..nx {
+                    d[j * nx + i] = s[j * nx + i] | s[a * nx + i] | s[b * nx + i];
+                }
+            }
+        });
+        // z
+        let src: &[u8] = &*mask;
+        tmp.par_chunks_mut(plane).enumerate().for_each(|(k, d)| {
+            let (a, b) = (k.saturating_sub(1), (k + 1).min(nz - 1));
+            for i in 0..plane {
+                d[i] = src[k * plane + i] | src[a * plane + i] | src[b * plane + i];
+            }
+        });
+        mask.copy_from_slice(&tmp);
+    }
+}
+
+// Taubin smoothing: a step towards the mean of the neighbours, then a slightly longer step
+// back, so the surface loses its roughness without shrinking.
+fn smooth_mesh(positions: &mut [f32], indices: &[u32], rounds: usize) {
+    let nv = positions.len() / 3;
+    let mut offsets = vec![0u32; nv + 1];
+    for t in indices.chunks_exact(3) {
+        for &v in t {
+            offsets[v as usize + 1] += 2; // two neighbours per corner
+        }
+    }
+    for v in 0..nv {
+        offsets[v + 1] += offsets[v];
+    }
+    let mut fill = offsets.clone();
+    let mut adj = vec![0u32; offsets[nv] as usize];
+    for t in indices.chunks_exact(3) {
+        for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+            adj[fill[a as usize] as usize] = b;
+            fill[a as usize] += 1;
+            adj[fill[b as usize] as usize] = a;
+            fill[b as usize] += 1;
+        }
+    }
+    drop(fill);
+
+    // Each edge belongs to two triangles, so every neighbour is listed twice; the mean is not
+    // affected by that
+    let step = |src: &[f32], dst: &mut [f32], factor: f32| {
+        dst.par_chunks_mut(3).enumerate().for_each(|(v, out)| {
+            let (a, b) = (offsets[v] as usize, offsets[v + 1] as usize);
+            let p = [src[v * 3], src[v * 3 + 1], src[v * 3 + 2]];
+            if a == b {
+                out.copy_from_slice(&p);
+                return;
+            }
+            let mut sum = [0.0f32; 3];
+            for &w in &adj[a..b] {
+                let o = w as usize * 3;
+                sum[0] += src[o];
+                sum[1] += src[o + 1];
+                sum[2] += src[o + 2];
+            }
+            let k = 1.0 / (b - a) as f32;
+            for c in 0..3 {
+                out[c] = p[c] + factor * (sum[c] * k - p[c]);
+            }
+        });
+    };
+    let mut tmp = positions.to_vec();
+    for _ in 0..rounds {
+        step(positions, &mut tmp, 0.5);
+        step(&tmp, positions, -0.53);
+    }
 }
 
 // Area-weighted average of the normals of the triangles around each vertex
@@ -461,7 +600,7 @@ mod tests {
     }
 
     fn params(part: Part, step: usize) -> Params {
-        Params { threshold: 0.5, part, step, max_triangles: 10_000_000 }
+        Params { threshold: 0.5, max: None, margin: 0, smooth: 0, part, step, max_triangles: 10_000_000 }
     }
 
     fn zs(depth: usize, step: f64) -> Vec<f64> {
@@ -603,5 +742,105 @@ mod tests {
         let a = m.indices[0] as usize * 3;
         let x = f32::from_le_bytes([stl[96], stl[97], stl[98], stl[99]]);
         assert!((x - m.positions[a] * 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn smoothing_rounds_the_surface_without_shrinking_it() {
+        let z = zs(40, 1.0);
+        let v = balls(40, 40, 1.0, &[([19.5, 19.5, 19.5], 12.0)]);
+        let g = geo(40, 40, &z);
+        let rough = extract(&v, &g, &params(Part::All, 1)).unwrap();
+        let smooth = extract(&v, &g, &Params { smooth: 20, ..params(Part::All, 1) }).unwrap();
+        assert_eq!(rough.indices, smooth.indices); // same connectivity
+        assert_closed(&smooth);
+        let spread = |m: &Mesh| {
+            let r: Vec<f64> = m
+                .positions
+                .chunks_exact(3)
+                .map(|p| {
+                    ((p[0] as f64 - 19.5).powi(2)
+                        + (p[1] as f64 - 19.5).powi(2)
+                        + (p[2] as f64 - 19.5).powi(2))
+                    .sqrt()
+                })
+                .collect();
+            let mean = r.iter().sum::<f64>() / r.len() as f64;
+            (r.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / r.len() as f64).sqrt()
+        };
+        assert!(spread(&smooth) < spread(&rough) * 0.6, "{} vs {}", spread(&smooth), spread(&rough));
+        let (v0, v1) = (signed_volume(&rough), signed_volume(&smooth));
+        assert!((v1 - v0).abs() / v0 < 0.05, "volume {v0} -> {v1}");
+        // Normals still point outwards
+        let outward = (0..smooth.vertex_count())
+            .filter(|&i| {
+                let o = i * 3;
+                let d = [smooth.positions[o] - 19.5, smooth.positions[o + 1] - 19.5, smooth.positions[o + 2] - 19.5];
+                d[0] * smooth.normals[o] + d[1] * smooth.normals[o + 1] + d[2] * smooth.normals[o + 2] > 0.0
+            })
+            .count();
+        assert_eq!(outward, smooth.vertex_count());
+    }
+
+    // A vessel (300) that runs into a block of bone (1000) wrapped in a shell of in-between
+    // values (450), the way partial volume makes it look in a CT
+    fn vessel_and_bone() -> Vec<Vec<f32>> {
+        (0..40)
+            .map(|k| {
+                let mut s = vec![0f32; 40 * 40];
+                for j in 0..40 {
+                    for i in 0..40 {
+                        let in_bone = (26..=34).contains(&i) && (6..=14).contains(&j) && (6..=14).contains(&k);
+                        let in_shell = (25..=35).contains(&i) && (5..=15).contains(&j) && (5..=15).contains(&k);
+                        let in_tube = i <= 25 && ((j as f32 - 10.0).powi(2) + (k as f32 - 10.0).powi(2)).sqrt() <= 1.6;
+                        s[j * 40 + i] = if in_bone { 1000.0 } else if in_shell { 450.0 } else if in_tube { 300.0 } else { 0.0 };
+                    }
+                }
+                s
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_maximum_and_a_margin_keep_bone_out_of_the_vessel() {
+        let z = zs(40, 1.0);
+        let v = vessel_and_bone();
+        let g = geo(40, 40, &z);
+        let at = Part::At { i: 5, j: 10, k: 10 };
+        let reach = |m: &Mesh| m.positions.chunks_exact(3).map(|p| p[0]).fold(f32::MIN, f32::max);
+        let thr = |max: Option<f32>, margin: usize| Params { threshold: 200.0, max, margin, smooth: 0, part: at, step: 1, max_triangles: 10_000_000 };
+
+        // Growing from the vessel with a lower limit only runs into the bone as well
+        let all = extract(&v, &g, &thr(None, 0)).unwrap();
+        assert!(reach(&all) > 34.0, "{}", reach(&all));
+        // A maximum removes the bone, but its shell still joins the vessel
+        let shell = extract(&v, &g, &thr(Some(600.0), 0)).unwrap();
+        assert!(reach(&shell) > 34.0, "{}", reach(&shell));
+        // A margin around what is too bright cuts the shell away
+        let cut = extract(&v, &g, &thr(Some(600.0), 1)).unwrap();
+        assert!(reach(&cut) < 26.0, "{}", reach(&cut));
+        assert_closed(&cut);
+        assert!(extract(&v, &g, &thr(Some(100.0), 1)).is_err()); // maximum below the threshold
+    }
+
+    #[test]
+    fn a_leaking_region_is_reported() {
+        let z = zs(10, 1.0);
+        let v = vec![vec![500.0f32; 100]; 10];
+        let g = geo(10, 10, &z);
+        let p = Params { threshold: 200.0, max: None, margin: 0, smooth: 0, part: Part::At { i: 5, j: 5, k: 5 }, step: 1, max_triangles: 10_000_000 };
+        let err = extract(&v, &g, &p).err().unwrap();
+        assert!(err.contains("40%"), "{err}");
+    }
+
+    #[test]
+    fn dilation_grows_a_mask_by_one_voxel_per_round() {
+        let dims = (7, 7, 7);
+        let mut m = vec![0u8; 343];
+        m[(3 * 7 + 3) * 7 + 3] = 1;
+        dilate(&mut m, dims, 2);
+        let count = m.iter().filter(|&&x| x != 0).count();
+        assert_eq!(count, 5 * 5 * 5); // a 5 x 5 x 5 box around the voxel
+        assert_eq!(m[0], 0);
+        assert_ne!(m[(1 * 7 + 1) * 7 + 1], 0);
     }
 }

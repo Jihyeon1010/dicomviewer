@@ -85,6 +85,8 @@ const view3dSel = byId("view3d", HTMLSelectElement);
 const vrPresetSel = byId("vr-preset", HTMLSelectElement);
 const vrThickSel = byId("vr-thick", HTMLSelectElement);
 const surfThrInput = byId("surf-thr", HTMLInputElement);
+const surfMaxInput = byId("surf-max", HTMLInputElement);
+const surfSmoothSel = byId("surf-smooth", HTMLSelectElement);
 const surfPartSel = byId("surf-part", HTMLSelectElement);
 const surfDetailSel = byId("surf-detail", HTMLSelectElement);
 const surfUpdateBtn = byId("surf-update", HTMLButtonElement);
@@ -212,8 +214,12 @@ function refreshTooltips(): void {
   view3dSel.title = "3D view: MIP, MinIP, average or volume rendering";
   vrPresetSel.title = "Volume rendering colours and opacity";
   vrThickSel.title = "Thickness of the volume that is drawn, around its middle";
-  surfThrInput.title = "Surface threshold: the surface lies where the values reach this level";
-  surfPartSel.title = "Which connected parts of the thresholded volume get a surface";
+  surfThrInput.title = "Lowest value that belongs to the surface (the surface lies where the values reach it)";
+  surfMaxInput.title =
+    "Highest value that belongs to it. Leave empty for no limit; set it to leave out bone next to contrast-filled vessels";
+  surfPartSel.title =
+    "Which parts get a surface. Grow from crosshair follows the connected structure under the crosshair, such as one vessel tree";
+  surfSmoothSel.title = "Smoothing of the surface; it also applies to the STL file";
   surfDetailSel.title = "Detail of the surface; coarser is faster and smaller";
   surfUpdateBtn.title = "Build the surface again (for example at a new crosshair position)";
   surfStlBtn.title = "Save the surface as an STL file (millimetres)";
@@ -692,7 +698,9 @@ function syncControls(): void {
   vrPresetSel.hidden = !mip3d || view !== "vr";
   vrThickSel.hidden = !mip3d || (view !== "vr" && view !== "surface");
   const surface = mip3d && view === "surface";
-  for (const el of [surfThrInput, surfPartSel, surfDetailSel, surfUpdateBtn, surfStlBtn]) {
+  for (const el of [
+    surfThrInput, surfMaxInput, surfPartSel, surfSmoothSel, surfDetailSel, surfUpdateBtn, surfStlBtn,
+  ]) {
     el.hidden = !surface;
   }
   if (mpr) {
@@ -701,7 +709,11 @@ function syncControls(): void {
     vrThickSel.value = String(mpr.thicknessMm);
     const s = mpr.surfaceSettings;
     if (document.activeElement !== surfThrInput) surfThrInput.value = String(s.threshold);
+    if (document.activeElement !== surfMaxInput) {
+      surfMaxInput.value = s.maxThreshold === null ? "" : String(s.maxThreshold);
+    }
     surfPartSel.value = s.part;
+    surfSmoothSel.value = String(s.smooth);
     surfDetailSel.value = String(s.detail);
   }
   slabThickSel.disabled = slabModeSel.value === "none";
@@ -1199,6 +1211,18 @@ surfThrInput.addEventListener("change", () => {
   const v = Number(surfThrInput.value);
   if (surfThrInput.value.trim() !== "" && Number.isFinite(v)) void changeSurface({ threshold: v });
   else syncControls();
+});
+surfMaxInput.addEventListener("change", () => {
+  const text = surfMaxInput.value.trim();
+  const v = Number(text);
+  if (text === "") void changeSurface({ maxThreshold: null });
+  else if (Number.isFinite(v)) void changeSurface({ maxThreshold: v });
+  else syncControls();
+});
+surfSmoothSel.addEventListener("change", () => {
+  const smooth = Number(surfSmoothSel.value);
+  if (Number.isInteger(smooth) && smooth >= 0) void changeSurface({ smooth });
+  surfSmoothSel.blur();
 });
 surfPartSel.addEventListener("change", () => {
   const part = surfPartSel.value;

@@ -203,8 +203,10 @@ export type SurfacePart = "all" | "largest" | "at";
 /** Which surface to build: where the volume crosses `threshold`, and which parts of it. */
 export interface SurfaceRequest {
   threshold: number;
+  maxThreshold: number | null; // voxels above this (bone) are left out, with a voxel around them
+  smooth: number; // rounds of smoothing of the mesh, 0 for none
   part: SurfacePart;
-  seed: [number, number, number] | null; // column, row and image of the part to keep, for "at"
+  seed: [number, number, number] | null; // column, row and image to grow the part from, for "at"
   step: number; // sample every n-th voxel; 0 chooses automatically
 }
 

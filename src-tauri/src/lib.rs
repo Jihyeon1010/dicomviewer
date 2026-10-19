@@ -1212,9 +1212,18 @@ fn get_volume_texture(
 const MAX_DISPLAY_TRIANGLES: usize = 6_000_000;
 const MAX_EXPORT_TRIANGLES: usize = 30_000_000;
 
+// What makes the surface: where `threshold` is crossed, an optional `max_threshold` above which
+// voxels (bone next to contrast) are left out together with a voxel around them, and the
+// number of rounds of `smooth`ing
+struct SurfaceQuery {
+    threshold: f64,
+    max_threshold: Option<f64>,
+    smooth: u32,
+}
+
 fn surface_of(
     vol: &Volume,
-    threshold: f64,
+    q: &SurfaceQuery,
     part: &str,
     seed: Option<[u32; 3]>,
     step: u32,
@@ -1241,7 +1250,10 @@ fn surface_of(
         &vol.slices,
         &geo,
         &surface::Params {
-            threshold: threshold as f32,
+            threshold: q.threshold as f32,
+            max: q.max_threshold.map(|m| m as f32),
+            margin: usize::from(q.max_threshold.is_some()),
+            smooth: q.smooth.min(200) as usize,
             part,
             step,
             max_triangles,
@@ -1250,7 +1262,7 @@ fn surface_of(
 }
 
 // The surface where the volume crosses `threshold`, in the local millimetre coordinates of
-// the volume. `part` is "all", "largest" or "at" (the connected part at the voxel `seed`
+// the volume. `part` is "all", "largest" or "at" (the part grown from the voxel `seed`
 // = [column, row, image]); `step` 0 chooses the sampling automatically.
 // Response (little-endian): [vertices u32][triangles u32][step u32][0 u32], then the
 // positions (3 f32 per vertex), the normals (3 f32 per vertex) and the indices (3 u32 per triangle).
@@ -1258,13 +1270,16 @@ fn surface_of(
 fn get_surface_mesh(
     uid: String,
     threshold: f64,
+    max_threshold: Option<f64>,
+    smooth: u32,
     part: String,
     seed: Option<[u32; 3]>,
     step: u32,
     state: tauri::State<AppState>,
 ) -> Result<tauri::ipc::Response, String> {
     let vol = volume_for(&state, &uid)?;
-    let mesh = surface_of(&vol, threshold, &part, seed, step, MAX_DISPLAY_TRIANGLES)?;
+    let q = SurfaceQuery { threshold, max_threshold, smooth };
+    let mesh = surface_of(&vol, &q, &part, seed, step, MAX_DISPLAY_TRIANGLES)?;
     let mut out = Vec::with_capacity(16 + mesh.positions.len() * 8 + mesh.indices.len() * 4);
     out.extend_from_slice(&(mesh.vertex_count() as u32).to_le_bytes());
     out.extend_from_slice(&(mesh.triangle_count() as u32).to_le_bytes());
@@ -1286,6 +1301,8 @@ fn get_surface_mesh(
 fn export_stl(
     uid: String,
     threshold: f64,
+    max_threshold: Option<f64>,
+    smooth: u32,
     part: String,
     seed: Option<[u32; 3]>,
     step: u32,
@@ -1296,7 +1313,8 @@ fn export_stl(
         return Err("Only .stl files can be written".into());
     }
     let vol = volume_for(&state, &uid)?;
-    let mesh = surface_of(&vol, threshold, &part, seed, step, MAX_EXPORT_TRIANGLES)?;
+    let q = SurfaceQuery { threshold, max_threshold, smooth };
+    let mesh = surface_of(&vol, &q, &part, seed, step, MAX_EXPORT_TRIANGLES)?;
     let axes = match (vol.info.orientation, vol.info.z_dir) {
         (Some(o), Some(n)) => Some(([o[0], o[1], o[2]], [o[3], o[4], o[5]], n)),
         _ => None,

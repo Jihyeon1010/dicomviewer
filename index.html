@@ -129,11 +129,18 @@
           <option value="30">30 mm</option>
           <option value="15">15 mm</option>
         </select>
-        <input id="surf-thr" type="number" step="10" placeholder="Threshold" aria-label="Surface threshold" hidden />
+        <input id="surf-thr" type="number" step="10" placeholder="Min" aria-label="Surface threshold" hidden />
+        <input id="surf-max" type="number" step="10" placeholder="Max" aria-label="Surface maximum" hidden />
         <select id="surf-part" aria-label="Parts of the surface" hidden>
           <option value="all">All parts</option>
           <option value="largest" selected>Largest part</option>
-          <option value="at">Part at crosshair</option>
+          <option value="at">Grow from crosshair</option>
+        </select>
+        <select id="surf-smooth" aria-label="Smoothing of the surface" hidden>
+          <option value="0">No smoothing</option>
+          <option value="10" selected>Light smoothing</option>
+          <option value="25">Medium smoothing</option>
+          <option value="50">Strong smoothing</option>
         </select>
         <select id="surf-detail" aria-label="Surface detail" hidden>
           <option value="0" selected>Auto detail</option>

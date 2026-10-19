@@ -23,6 +23,8 @@ export const VIEWS_3D: View3d[] = ["max", "min", "mean", "vr", "surface"];
 
 export interface SurfaceSettings {
   threshold: number; // in the units of the volume (CT numbers for CT)
+  maxThreshold: number | null; // voxels above this, such as bone, are left out; null for no limit
+  smooth: number; // rounds of smoothing of the mesh
   part: SurfacePart;
   detail: number; // 0 = automatic, 1 = every voxel, 2 = every second voxel, ...
 }
@@ -340,6 +342,8 @@ export class Mpr {
     const { value_min: lo, value_max: hi } = opts.volume;
     this.surf = {
       threshold: opts.baseMeta?.modality === "CT" ? 300 : Math.round((lo + hi) / 2),
+      maxThreshold: null,
+      smooth: 10,
       part: "largest",
       detail: 0,
     };
@@ -510,6 +514,8 @@ export class Mpr {
     const p = this.pos;
     return {
       threshold: this.surf.threshold,
+      maxThreshold: this.surf.maxThreshold,
+      smooth: this.surf.smooth,
       part: this.surf.part,
       seed: this.surf.part === "at" ? [p.i, p.r, p.k] : null,
       step: this.surf.detail,
