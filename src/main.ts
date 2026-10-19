@@ -54,6 +54,7 @@ const markersBtn = byId("markers", HTMLButtonElement);
 const anonBtn = byId("anonymize", HTMLButtonElement);
 const tagsBtn = byId("tags-btn", HTMLButtonElement);
 const settingsBtn = byId("settings-open", HTMLButtonElement);
+const tileBtn = byId("tile", HTMLButtonElement);
 const syncScrollBtn = byId("sync-scroll", HTMLButtonElement);
 const syncWindowBtn = byId("sync-window", HTMLButtonElement);
 const mprBtn = byId("mpr", HTMLButtonElement);
@@ -219,6 +220,7 @@ function refreshTooltips(): void {
   setTip(resetRotBtn, "Reset the rotation of the MPR planes", "mpr.resetRotation");
   slabModeSel.title = "Projection through a slab: thin plane, MIP, MinIP or average";
   slabThickSel.title = "Slab thickness";
+  setTip(tileBtn, "Tile view: show consecutive images of the series, one per view", "layout.tile");
   setTip(syncScrollBtn, "Scroll linked views together", "sync.scroll");
   setTip(syncWindowBtn, "Share window / level between views", "sync.window");
   setTip(invertBtn, "Invert", "view.invert");
@@ -331,6 +333,17 @@ function syncSlices(src: Viewport): void {
     mpr.scrolled(src);
     return;
   }
+  if (tile) {
+    const k = visible().indexOf(src);
+    if (k >= 0) {
+      tile.base = Math.max(0, src.index - k);
+      visible().forEach((vp, j) => {
+        if (vp !== src) vp.goto((tile?.base ?? 0) + j, false, true);
+      });
+      src.goto(tile.base + k, false, true);
+    }
+    return;
+  }
   if (!syncScroll) return;
   for (const vp of visible()) {
     if (vp === src || mpr?.owns(vp)) continue;
@@ -363,6 +376,50 @@ function toggleSyncWindow(): void {
 }
 
 // ---------- Layout ----------
+// ---------- Tile view ----------
+// Consecutive images of one series, one per view; scrolling any view moves all of them.
+// `saved` is what the views showed before, for turning the tile view off again.
+let tile: { series: SeriesInfo; base: number; saved: (SeriesInfo | null)[] } | null = null;
+
+function tileAssign(): void {
+  const t = tile;
+  if (!t) return;
+  visible().forEach((vp, j) => {
+    const at = t.base + j;
+    if (vp.series?.uid === t.series.uid) {
+      vp.goto(at, false, true);
+    } else {
+      void vp.setSeries(t.series).then(() => vp.goto(at, false, true));
+    }
+  });
+}
+
+function toggleTile(): void {
+  if (tile) {
+    const t = tile;
+    tile = null;
+    visible().forEach((vp, j) => void vp.setSeries(t.saved[j] ?? null));
+    afterAssignment();
+    return;
+  }
+  if (mpr) {
+    flashStatus("The tile view is not available in the MPR");
+    return;
+  }
+  const series = active.series;
+  if (!series || series.slice_count < 2) {
+    flashStatus("Open a series with several images first");
+    return;
+  }
+  if (cellCount() < 2) {
+    flashStatus("Split the screen first to use the tile view");
+    return;
+  }
+  tile = { series, base: active.index, saved: visible().map((vp) => vp.series) };
+  tileAssign();
+  afterAssignment();
+}
+
 // The view that fills the whole area while the others are hidden
 let maximized: Viewport | null = null;
 
@@ -393,9 +450,13 @@ function applyLayout(next: Layout, persist = true, fill = true): void {
   viewportsEl.classList.toggle("multi", n > 1);
   viewports.forEach((vp, i) => vp.setVisible(i < n));
 
+  if (tile) {
+    if (n < 2) tile = null;
+    else tileAssign(); // the new views join the tile view
+  }
   const shown = visible();
   if (!shown.includes(active)) activate(shown[0] ?? first);
-  if (fill) void Promise.all(fillEmptyViewports());
+  if (fill && !tile) void Promise.all(fillEmptyViewports());
   syncControls();
 }
 
@@ -417,6 +478,7 @@ function fillEmptyViewports(): Promise<void>[] {
 }
 
 function showInActive(s: SeriesInfo): void {
+  tile = null; // the views no longer show one series
   // Replacing a view of the MPR would break it; leave the MPR first
   if (mpr) exitMpr(true);
   void active.setSeries(s);
@@ -650,6 +712,8 @@ function syncControls(): void {
   setPressed(flipVBtn, vp.orientation.flipV);
   setPressed(markersBtn, markersOn);
   setPressed(anonBtn, anonymize);
+  setPressed(tileBtn, tile !== null);
+  tileBtn.disabled = mpr !== null || (tile === null && cellCount() < 2);
   setPressed(syncScrollBtn, syncScroll);
   setPressed(syncWindowBtn, syncWindow);
   setLabel(layoutBtn, `${layout.cols} × ${layout.rows}`);
@@ -885,6 +949,7 @@ async function enterMpr(series: SeriesInfo, info: VolumeInfo): Promise<void> {
   );
   if (volume?.uid !== series.uid) return; // other files were opened meanwhile
 
+  tile = null;
   mprSaved = {
     layout: { ...layout },
     tool,
@@ -987,6 +1052,7 @@ async function exportImage(copy: boolean): Promise<void> {
 
 // ---------- Loading ----------
 async function showSeries(list: SeriesInfo[]): Promise<void> {
+  tile = null;
   exitMpr(false); // its volume and images belong to the old files
   thumbRun++; // cancels thumbnail loading for the previous selection
   thumbs.clear();
@@ -1048,6 +1114,7 @@ infoBtn.addEventListener("click", cycleOverlay);
 markersBtn.addEventListener("click", toggleMarkers);
 anonBtn.addEventListener("click", toggleAnonymize);
 sliderPosBtn.addEventListener("click", toggleSliderPos);
+tileBtn.addEventListener("click", toggleTile);
 syncScrollBtn.addEventListener("click", toggleSyncScroll);
 syncWindowBtn.addEventListener("click", toggleSyncWindow);
 mprBtn.addEventListener("click", () => void toggleMpr());
@@ -1303,6 +1370,7 @@ const handlers: Record<string, () => void> = {
     afterAssignment();
   },
   "layout.maximize": () => toggleMaximize(active),
+  "layout.tile": toggleTile,
   "sync.scroll": toggleSyncScroll,
   "sync.window": toggleSyncWindow,
   "export.save": () => void exportImage(false),

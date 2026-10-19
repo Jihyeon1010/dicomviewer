@@ -222,6 +222,7 @@ export async function installMenu(deps: MenuDeps): Promise<AppMenu> {
       await check("ui.anonymize", "Anonymize", () => deps.run("ui.anonymize")),
       await key("Move Image Slider (Bottom / Right)", "ui.slider"),
       await key("Enlarge / Restore Active View", "layout.maximize"),
+      await key("Tile View (Consecutive Images)", "layout.tile"),
       await std("Separator"),
       await key("Multiplanar View (MPR)", "mpr.toggle"),
       await key("Reset MPR Rotation", "mpr.resetRotation"),
