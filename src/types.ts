@@ -63,10 +63,13 @@ export interface VolumeInfo {
   tilt_deg: number;                       // gantry tilt
   value_min: number;
   value_max: number;
+  value_low: number;                      // 2nd percentile of the values
+  value_high: number;                     // 98th percentile
   megabytes: number;
   z_positions: number[];                  // mm along the stack direction, one per image
   orientation: [number, number, number, number, number, number] | null; // row and column cosines
   z_dir: [number, number, number] | null; // direction in which the image index increases
+  origin: [number, number, number] | null; // patient position of the first voxel
 }
 
 export type Plane = "axial" | "coronal" | "sagittal";

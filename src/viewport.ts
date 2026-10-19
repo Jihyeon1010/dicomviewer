@@ -55,6 +55,13 @@ export interface RefLine {
   color: string;
 }
 
+/** An outline drawn over a view; the points are millimetres from the middle of the image. */
+export interface RefPolygon {
+  pts: Pt[];
+  color: string;
+  dashed?: boolean;
+}
+
 export interface OverlayOptions {
   mode: OverlayMode;
   anonymize: boolean;
@@ -343,6 +350,7 @@ export class Viewport {
   private bookmarks = new Set<number>();
   private aneurysmPts: Pt[] = []; // clicks collected so far for the aneurysm template
   private refLines: RefLine[] = [];
+  private refPolys: RefPolygon[] = [];
   private crossing = false; // mouse button held with the crosshair tool
   private crossRaf = 0;
   private crossPt: { x: number; y: number } | null = null;
@@ -431,6 +439,7 @@ export class Viewport {
     this.cineDir = 1;
     this.bookmarks.clear();
     this.refLines = [];
+    this.refPolys = [];
     if (series === null) this.measurements.clear();
     this.ui.readout.textContent = "";
     this.setStatus("");
@@ -483,6 +492,12 @@ export class Viewport {
   /** Reference lines of other planes, drawn across the image. */
   setRefLines(lines: RefLine[]): void {
     this.refLines = lines;
+    this.updateMeasurements();
+  }
+
+  /** Outlines in millimetres from the middle of the image, for example planes seen in 3D. */
+  setRefPolygons(polys: RefPolygon[]): void {
+    this.refPolys = polys;
     this.updateMeasurements();
   }
 
@@ -1549,6 +1564,36 @@ export class Viewport {
 
   // Lines that mark where other planes cut this view, across the whole image
   private refNodes(): SVGElement[] {
+    const s = this.current;
+    if (!s) return [];
+    const polys = this.polygonNodes(s.cols, s.rows);
+    return [...polys, ...this.lineNodes()];
+  }
+
+  private polygonNodes(cols: number, rows: number): SVGElement[] {
+    const mm = this.meta?.pixel_spacing?.[1];
+    if (!mm || mm <= 0) return [];
+    return this.refPolys
+      .filter((p) => p.pts.length >= 3)
+      .map((poly) => {
+        const points = poly.pts
+          .map((q) => {
+            const s = this.toScreen({ x: cols / 2 + q.x / mm, y: rows / 2 + q.y / mm });
+            return `${s.x},${s.y}`;
+          })
+          .join(" ");
+        return svgEl("polygon", {
+          points,
+          fill: "none",
+          stroke: poly.color,
+          "stroke-width": poly.dashed ? 1 : 1.5,
+          "stroke-opacity": poly.dashed ? 0.7 : 0.9,
+          ...(poly.dashed ? { "stroke-dasharray": "5 4" } : {}),
+        });
+      });
+  }
+
+  private lineNodes(): SVGElement[] {
     const s = this.current;
     if (!s) return [];
     return this.refLines.map((l) => {

@@ -238,9 +238,20 @@ export async function getSurfaceMesh(uid: string, req: SurfaceRequest): Promise<
   };
 }
 
-/** Writes the surface as a binary STL file (millimetres); returns the number of triangles. */
-export function exportStl(uid: string, req: SurfaceRequest, path: string): Promise<number> {
-  return invoke<number>("export_stl", { uid, ...req, path });
+export type MeshCoords = "lps" | "ras" | "volume";
+
+/**
+ * Writes the surface as a file in millimetres; the extension of `path` (.stl, .obj, .ply)
+ * chooses the format. "lps" and "ras" are patient coordinates (DICOM and 3D Slicer), "volume"
+ * the axes of the volume. Returns the number of triangles.
+ */
+export function exportMesh(
+  uid: string,
+  req: SurfaceRequest,
+  path: string,
+  coords: MeshCoords,
+): Promise<number> {
+  return invoke<number>("export_mesh", { uid, ...req, path, coords });
 }
 
 // Response (little-endian): [width u32][height u32][channels u32][width*height*channels bytes]

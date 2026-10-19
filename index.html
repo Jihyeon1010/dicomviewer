@@ -109,6 +109,7 @@
       </div>
       <div class="group" id="view3d-tools">
         <button id="mip-view" class="ib" aria-label="3D view" hidden><span class="ic" data-icon="globe"></span></button>
+        <button id="planes3d" aria-label="Show the MPR planes in the 3D view" hidden><span class="lbl">Planes</span></button>
         <select id="view3d" aria-label="3D view" hidden>
           <option value="max">MIP</option>
           <option value="min">MinIP</option>
@@ -118,9 +119,19 @@
         </select>
         <select id="vr-preset" aria-label="Volume rendering preset" hidden>
           <option value="generic">Generic</option>
-          <option value="bone">Bone</option>
-          <option value="vessel">Vessels (CTA)</option>
-          <option value="soft">Soft tissue</option>
+          <optgroup label="CT">
+            <option value="bone">Bone</option>
+            <option value="vessel">Vessels (CTA)</option>
+            <option value="soft">Soft tissue</option>
+          </optgroup>
+          <optgroup label="MR">
+            <option value="mr">Tissue</option>
+            <option value="mra">Bright vessels (MRA)</option>
+          </optgroup>
+          <optgroup label="X-ray">
+            <option value="angio">Bright vessels</option>
+            <option value="angio-dark">Dark vessels</option>
+          </optgroup>
         </select>
         <select id="vr-thick" aria-label="Volume rendering thickness" hidden>
           <option value="Infinity" selected>Full</option>
@@ -149,7 +160,12 @@
           <option value="3">Coarse</option>
         </select>
         <button id="surf-update" aria-label="Build the surface again" hidden><span class="lbl">Update</span></button>
-        <button id="surf-stl" aria-label="Save the surface as an STL file" hidden><span class="lbl">STL</span></button>
+        <select id="surf-coords" aria-label="Coordinates of the exported file" hidden>
+          <option value="lps" selected>LPS (DICOM)</option>
+          <option value="ras">RAS (Slicer)</option>
+          <option value="volume">Volume axes</option>
+        </select>
+        <button id="surf-stl" aria-label="Save the surface as a file" hidden><span class="lbl">Export</span></button>
       </div>
       <div class="group" id="angio-wrap" hidden>
         <button id="dsa"><span class="ic" data-icon="subtract"></span><span class="lbl">DSA</span></button>

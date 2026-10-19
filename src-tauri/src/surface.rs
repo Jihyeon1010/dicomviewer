@@ -531,6 +531,127 @@ fn vertex_normals(positions: &[f32], indices: &[u32]) -> Vec<f32> {
     acc
 }
 
+/// The coordinate system of an exported mesh.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Coords {
+    /// The axes and millimetres of the volume (x along the rows, y along the columns, z along the stack)
+    Volume,
+    /// DICOM patient coordinates: x towards the patient's left, y towards posterior, z towards superior
+    Lps,
+    /// x towards the patient's right, y towards anterior, z towards superior (3D Slicer, NIfTI)
+    Ras,
+}
+
+impl Coords {
+    pub fn parse(s: &str) -> Result<Coords, String> {
+        match s {
+            "volume" => Ok(Coords::Volume),
+            "lps" => Ok(Coords::Lps),
+            "ras" => Ok(Coords::Ras),
+            other => Err(format!("Unknown coordinate system: {other}")),
+        }
+    }
+}
+
+/// Where the volume lies in the patient: the directions of its axes and the position of its
+/// first voxel. Without it a mesh can only be written in the coordinates of the volume.
+#[derive(Clone, Copy, Debug)]
+pub struct Frame {
+    pub x: [f64; 3], // direction of the rows (along the columns of the image)
+    pub y: [f64; 3], // direction of the columns
+    pub z: [f64; 3], // direction in which the image index grows
+    pub origin: Option<[f64; 3]>,
+}
+
+pub struct Placement {
+    pub frame: Option<Frame>,
+    pub coords: Coords,
+}
+
+impl Placement {
+    fn lps(&self, p: [f64; 3], with_origin: bool) -> [f64; 3] {
+        let Some(f) = &self.frame else { return p };
+        let o = if with_origin { f.origin.unwrap_or([0.0; 3]) } else { [0.0; 3] };
+        [
+            o[0] + p[0] * f.x[0] + p[1] * f.y[0] + p[2] * f.z[0],
+            o[1] + p[0] * f.x[1] + p[1] * f.y[1] + p[2] * f.z[1],
+            o[2] + p[0] * f.x[2] + p[1] * f.y[2] + p[2] * f.z[2],
+        ]
+    }
+
+    fn place(&self, p: [f32; 3], with_origin: bool) -> [f32; 3] {
+        let p = [f64::from(p[0]), f64::from(p[1]), f64::from(p[2])];
+        let q = match (self.coords, &self.frame) {
+            (Coords::Volume, _) | (_, None) => p,
+            (Coords::Lps, _) => self.lps(p, with_origin),
+            (Coords::Ras, _) => {
+                // Turning half way about z, so nothing is mirrored
+                let l = self.lps(p, with_origin);
+                [-l[0], -l[1], l[2]]
+            }
+        };
+        [q[0] as f32, q[1] as f32, q[2] as f32]
+    }
+
+    pub fn point(&self, p: [f32; 3]) -> [f32; 3] {
+        self.place(p, true)
+    }
+
+    /// A direction (a normal): turned like the points, but not moved
+    pub fn direction(&self, d: [f32; 3]) -> [f32; 3] {
+        self.place(d, false)
+    }
+}
+
+/// Wavefront OBJ with a normal for every vertex.
+pub fn obj_bytes(mesh: &Mesh, place: &Placement) -> Vec<u8> {
+    use std::io::Write;
+    let mut out = Vec::with_capacity(mesh.positions.len() * 24 + mesh.indices.len() * 20);
+    let _ = writeln!(out, "# Surface exported by DICOM Viewer, millimetres");
+    for p in mesh.positions.chunks_exact(3) {
+        let q = place.point([p[0], p[1], p[2]]);
+        let _ = writeln!(out, "v {} {} {}", q[0], q[1], q[2]);
+    }
+    for n in mesh.normals.chunks_exact(3) {
+        let q = place.direction([n[0], n[1], n[2]]);
+        let _ = writeln!(out, "vn {} {} {}", q[0], q[1], q[2]);
+    }
+    for t in mesh.indices.chunks_exact(3) {
+        let (a, b, c) = (t[0] + 1, t[1] + 1, t[2] + 1); // OBJ counts from 1
+        let _ = writeln!(out, "f {a}//{a} {b}//{b} {c}//{c}");
+    }
+    out
+}
+
+/// Binary little-endian PLY with a normal for every vertex.
+pub fn ply_bytes(mesh: &Mesh, place: &Placement) -> Vec<u8> {
+    let mut out = Vec::new();
+    let header = format!(
+        "ply\nformat binary_little_endian 1.0\ncomment Surface exported by DICOM Viewer, millimetres\n\
+         element vertex {}\nproperty float x\nproperty float y\nproperty float z\n\
+         property float nx\nproperty float ny\nproperty float nz\n\
+         element face {}\nproperty list uchar int vertex_indices\nend_header\n",
+        mesh.vertex_count(),
+        mesh.triangle_count()
+    );
+    out.extend_from_slice(header.as_bytes());
+    out.reserve(mesh.vertex_count() * 24 + mesh.triangle_count() * 13);
+    for (p, n) in mesh.positions.chunks_exact(3).zip(mesh.normals.chunks_exact(3)) {
+        let q = place.point([p[0], p[1], p[2]]);
+        let d = place.direction([n[0], n[1], n[2]]);
+        for f in q.iter().chain(&d) {
+            out.extend_from_slice(&f.to_le_bytes());
+        }
+    }
+    for t in mesh.indices.chunks_exact(3) {
+        out.push(3);
+        for &i in t {
+            out.extend_from_slice(&(i as i32).to_le_bytes());
+        }
+    }
+    out
+}
+
 /// Binary STL of the mesh. `transform` maps every vertex first (rotation into patient axes).
 pub fn stl_bytes(mesh: &Mesh, transform: impl Fn([f32; 3]) -> [f32; 3]) -> Vec<u8> {
     let tris = mesh.triangle_count();
@@ -842,5 +963,88 @@ mod tests {
         assert_eq!(count, 5 * 5 * 5); // a 5 x 5 x 5 box around the voxel
         assert_eq!(m[0], 0);
         assert_ne!(m[(1 * 7 + 1) * 7 + 1], 0);
+    }
+
+    fn tiny_mesh() -> Mesh {
+        let z = zs(24, 1.0);
+        let v = balls(24, 24, 1.0, &[([11.5, 11.5, 11.5], 5.0)]);
+        extract(&v, &geo(24, 24, &z), &params(Part::All, 1)).unwrap()
+    }
+
+    // Rows run towards the patient's left, columns towards posterior, the stack towards superior
+    fn lps_frame() -> Frame {
+        Frame { x: [1.0, 0.0, 0.0], y: [0.0, 1.0, 0.0], z: [0.0, 0.0, 1.0], origin: Some([-100.0, -50.0, 30.0]) }
+    }
+
+    #[test]
+    fn placement_moves_points_and_only_turns_directions() {
+        let p = Placement { frame: Some(lps_frame()), coords: Coords::Lps };
+        assert_eq!(p.point([1.0, 2.0, 3.0]), [-99.0, -48.0, 33.0]);
+        assert_eq!(p.direction([1.0, 2.0, 3.0]), [1.0, 2.0, 3.0]);
+        // RAS is a half turn about z of LPS: no mirroring
+        let r = Placement { frame: Some(lps_frame()), coords: Coords::Ras };
+        assert_eq!(r.point([1.0, 2.0, 3.0]), [99.0, 48.0, 33.0]);
+        assert_eq!(r.direction([1.0, 2.0, 3.0]), [-1.0, -2.0, 3.0]);
+        // A tilted frame: rows towards anterior, columns towards the left, stack towards inferior
+        let tilted = Frame { x: [0.0, -1.0, 0.0], y: [1.0, 0.0, 0.0], z: [0.0, 0.0, -1.0], origin: None };
+        let t = Placement { frame: Some(tilted), coords: Coords::Lps };
+        assert_eq!(t.point([1.0, 2.0, 3.0]), [2.0, -1.0, -3.0]);
+        // Volume coordinates and unknown placement leave everything alone
+        let v = Placement { frame: Some(lps_frame()), coords: Coords::Volume };
+        assert_eq!(v.point([1.0, 2.0, 3.0]), [1.0, 2.0, 3.0]);
+        let none = Placement { frame: None, coords: Coords::Ras };
+        assert_eq!(none.point([1.0, 2.0, 3.0]), [1.0, 2.0, 3.0]);
+        assert!(Coords::parse("xyz").is_err());
+    }
+
+    #[test]
+    fn a_placed_mesh_keeps_its_winding() {
+        // Neither the half turn of RAS nor a proper rotation turns the surface inside out
+        let m = tiny_mesh();
+        let before = signed_volume(&m);
+        for coords in [Coords::Lps, Coords::Ras] {
+            let place = Placement { frame: Some(lps_frame()), coords };
+            let moved = Mesh {
+                positions: m.positions.chunks_exact(3).flat_map(|p| place.point([p[0], p[1], p[2]])).collect(),
+                normals: m.normals.clone(),
+                indices: m.indices.clone(),
+            };
+            let after = signed_volume(&moved);
+            assert!((after - before).abs() / before < 1e-3, "{coords:?}: {before} -> {after}");
+        }
+    }
+
+    #[test]
+    fn obj_lists_vertices_normals_and_faces() {
+        let m = tiny_mesh();
+        let place = Placement { frame: Some(lps_frame()), coords: Coords::Ras };
+        let text = String::from_utf8(obj_bytes(&m, &place)).unwrap();
+        let count = |prefix: &str| text.lines().filter(|l| l.starts_with(prefix)).count();
+        assert_eq!(count("v "), m.vertex_count());
+        assert_eq!(count("vn "), m.vertex_count());
+        assert_eq!(count("f "), m.triangle_count());
+        let first_face: Vec<&str> = text.lines().find(|l| l.starts_with("f ")).unwrap().split(' ').collect();
+        let a = m.indices[0] + 1;
+        assert_eq!(first_face[1], format!("{a}//{a}"));
+        // The first vertex is the placed first vertex of the mesh
+        let q = place.point([m.positions[0], m.positions[1], m.positions[2]]);
+        assert_eq!(text.lines().find(|l| l.starts_with("v ")).unwrap(), format!("v {} {} {}", q[0], q[1], q[2]));
+    }
+
+    #[test]
+    fn ply_has_a_header_and_binary_data_of_the_right_size() {
+        let m = tiny_mesh();
+        let place = Placement { frame: None, coords: Coords::Volume };
+        let bytes = ply_bytes(&m, &place);
+        let end = bytes.windows(11).position(|w| w == b"end_header\n").unwrap() + 11;
+        let header = String::from_utf8(bytes[..end].to_vec()).unwrap();
+        assert!(header.starts_with("ply\nformat binary_little_endian 1.0\n"));
+        assert!(header.contains(&format!("element vertex {}", m.vertex_count())));
+        assert!(header.contains(&format!("element face {}", m.triangle_count())));
+        assert_eq!(bytes.len() - end, m.vertex_count() * 24 + m.triangle_count() * 13);
+        // First face: the count 3, then the three indices
+        let f = end + m.vertex_count() * 24;
+        assert_eq!(bytes[f], 3);
+        assert_eq!(i32::from_le_bytes([bytes[f + 1], bytes[f + 2], bytes[f + 3], bytes[f + 4]]) as u32, m.indices[0]);
     }
 }

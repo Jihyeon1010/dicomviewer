@@ -82,6 +82,7 @@ const bookBtn = byId("bookmark", HTMLButtonElement);
 const mipViewBtn = byId("mip-view", HTMLButtonElement);
 const resetRotBtn = byId("reset-rot", HTMLButtonElement);
 const view3dSel = byId("view3d", HTMLSelectElement);
+const planes3dBtn = byId("planes3d", HTMLButtonElement);
 const vrPresetSel = byId("vr-preset", HTMLSelectElement);
 const vrThickSel = byId("vr-thick", HTMLSelectElement);
 const surfThrInput = byId("surf-thr", HTMLInputElement);
@@ -91,6 +92,7 @@ const surfPartSel = byId("surf-part", HTMLSelectElement);
 const surfDetailSel = byId("surf-detail", HTMLSelectElement);
 const surfUpdateBtn = byId("surf-update", HTMLButtonElement);
 const surfStlBtn = byId("surf-stl", HTMLButtonElement);
+const surfCoordsSel = byId("surf-coords", HTMLSelectElement);
 const slabModeSel = byId("slab-mode", HTMLSelectElement);
 const slabThickSel = byId("slab-thick", HTMLSelectElement);
 const slider = byId("slider", HTMLInputElement);
@@ -211,7 +213,9 @@ function refreshTooltips(): void {
   setTip(bookBtn, "Bookmark this frame (next: Alt+., previous: Alt+,)", "bookmark.toggle");
   tprojSel.title = "Projection over time: Min keeps the darkest value, Max the brightest";
   setTip(mipViewBtn, "3D view in the fourth view: drag with the rotate tool", "mpr.mipView");
-  view3dSel.title = "3D view: MIP, MinIP, average or volume rendering";
+  view3dSel.title = "3D view: MIP, MinIP, average, volume rendering or surface";
+  planes3dBtn.title =
+    "Outline the axial, coronal and sagittal planes in the 3D view; a slab is shown by dashed outlines at its two sides";
   vrPresetSel.title = "Volume rendering colours and opacity";
   vrThickSel.title = "Thickness of the volume that is drawn, around its middle";
   surfThrInput.title = "Lowest value that belongs to the surface (the surface lies where the values reach it)";
@@ -222,7 +226,9 @@ function refreshTooltips(): void {
   surfSmoothSel.title = "Smoothing of the surface; it also applies to the STL file";
   surfDetailSel.title = "Detail of the surface; coarser is faster and smaller";
   surfUpdateBtn.title = "Build the surface again (for example at a new crosshair position)";
-  surfStlBtn.title = "Save the surface as an STL file (millimetres)";
+  surfStlBtn.title = "Save the surface as an STL, OBJ or PLY file (millimetres)";
+  surfCoordsSel.title =
+    "Coordinates of the file: patient coordinates as DICOM (LPS) or 3D Slicer (RAS) use them, or the axes of the volume";
   setTip(resetRotBtn, "Reset the rotation of the MPR planes", "mpr.resetRotation");
   slabModeSel.title = "Projection through a slab: thin plane, MIP, MinIP or average";
   slabThickSel.title = "Slab thickness";
@@ -694,12 +700,15 @@ function syncControls(): void {
   setPressed(mipViewBtn, mpr?.mipOn ?? false);
   const mip3d = mpr?.mipOn ?? false;
   view3dSel.hidden = !mip3d;
+  planes3dBtn.hidden = !mip3d;
+  setPressed(planes3dBtn, mpr?.showPlanes ?? false);
   const view = mpr?.view;
   vrPresetSel.hidden = !mip3d || view !== "vr";
   vrThickSel.hidden = !mip3d || (view !== "vr" && view !== "surface");
   const surface = mip3d && view === "surface";
   for (const el of [
-    surfThrInput, surfMaxInput, surfPartSel, surfSmoothSel, surfDetailSel, surfUpdateBtn, surfStlBtn,
+    surfThrInput, surfMaxInput, surfPartSel, surfSmoothSel, surfDetailSel, surfUpdateBtn,
+    surfCoordsSel, surfStlBtn,
   ]) {
     el.hidden = !surface;
   }
@@ -1182,17 +1191,23 @@ async function changeSurface(s: Parameters<Mpr["setSurface"]>[0]): Promise<void>
   syncControls();
 }
 
-async function exportSurfaceStl(): Promise<void> {
+async function exportSurfaceMesh(): Promise<void> {
   if (!mpr || mpr.view !== "surface") return;
-  const path = await save({
+  let path = await save({
     defaultPath: "surface.stl",
-    filters: [{ name: "STL mesh", extensions: ["stl"] }],
+    filters: [
+      { name: "STL mesh", extensions: ["stl"] },
+      { name: "OBJ mesh", extensions: ["obj"] },
+      { name: "PLY mesh", extensions: ["ply"] },
+    ],
   });
   if (typeof path !== "string") return;
-  setStatus("Writing the STL file…");
+  if (!/\.(stl|obj|ply)$/i.test(path)) path += ".stl";
+  const coords = (["lps", "ras", "volume"] as const).find((c) => c === surfCoordsSel.value) ?? "lps";
+  setStatus("Writing the file…");
   try {
-    const n = await mpr.exportSurface(path);
-    flashStatus(`Saved ${n.toLocaleString()} triangles to the STL file`);
+    const n = await mpr.exportSurface(path, coords);
+    flashStatus(`Saved ${n.toLocaleString()} triangles`);
   } catch (err) {
     showError(err);
   }
@@ -1206,6 +1221,11 @@ vrPresetSel.addEventListener("change", () => {
   const id = VR_PRESETS.find((p) => p.id === vrPresetSel.value);
   if (id) mpr?.setVrPreset(id.id);
   vrPresetSel.blur();
+});
+planes3dBtn.addEventListener("click", () => {
+  if (!mpr) return;
+  mpr.setShowPlanes(!mpr.showPlanes);
+  syncControls();
 });
 surfThrInput.addEventListener("change", () => {
   const v = Number(surfThrInput.value);
@@ -1235,7 +1255,7 @@ surfDetailSel.addEventListener("change", () => {
   surfDetailSel.blur();
 });
 surfUpdateBtn.addEventListener("click", () => void changeSurface({}));
-surfStlBtn.addEventListener("click", () => void exportSurfaceStl());
+surfStlBtn.addEventListener("click", () => void exportSurfaceMesh());
 vrThickSel.addEventListener("change", () => {
   const mm = Number(vrThickSel.value);
   if (mm > 0) mpr?.setVrThickness(mm);

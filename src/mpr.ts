@@ -1,9 +1,10 @@
 import {
-  exportStl,
+  exportMesh,
   getMprSlice,
   getObliqueSlice,
   getSurfaceMesh,
   getVolumeTexture,
+  type MeshCoords,
   type SurfacePart,
   type SurfaceRequest,
 } from "./api";
@@ -11,8 +12,8 @@ import type { CachedSlice, SliceSource } from "./slice-cache";
 import { matrix, type Pt } from "./transform2d";
 import type { Plane, SeriesInfo, SlabMode, SliceData, SliceMeta, VolumeInfo } from "./types";
 import { add, cross, dot, rotateAbout, scale, sub, unit, type V3 } from "./vec3";
-import type { RefLine, Viewport } from "./viewport";
-import { transferFor, type ValueRange, type VrPresetId } from "./transfer";
+import type { RefLine, RefPolygon, Viewport } from "./viewport";
+import { presetForModality, transferFor, type ValueRange, type VrPresetId } from "./transfer";
 import { VolumeGL, type ProjectionMode } from "./volume-gl";
 
 export const PLANES: Plane[] = ["axial", "coronal", "sagittal"];
@@ -291,6 +292,7 @@ export class Mpr {
   private off: V3 = [0, 0, 0];
   private pivot3d: V3; // the point the 3D view is centred on and turns about
   private mipPending = false;
+  private planesOn = true; // the planes of the MPR are outlined in the 3D view
   private view3d: View3d = "max";
   private vrPreset: VrPresetId;
   private vrThickMm = Infinity; // thickness of the volume drawn in the rendering
@@ -337,9 +339,9 @@ export class Mpr {
     this.p0 = p0;
     this.c = [...this.v0];
     this.pivot3d = [...this.v0];
-    this.vrPreset = opts.baseMeta?.modality === "CT" ? "bone" : "generic";
+    this.vrPreset = presetForModality(opts.baseMeta?.modality ?? "");
     this.lookAlong = this.viewSide();
-    const { value_min: lo, value_max: hi } = opts.volume;
+    const { value_low: lo, value_high: hi } = opts.volume;
     this.surf = {
       threshold: opts.baseMeta?.modality === "CT" ? 300 : Math.round((lo + hi) / 2),
       maxThreshold: null,
@@ -350,6 +352,8 @@ export class Mpr {
     this.range = {
       valueMin: opts.volume.value_min,
       valueMax: opts.volume.value_max,
+      low: opts.volume.value_low,
+      high: opts.volume.value_high,
       wl: null,
       ww: null,
     };
@@ -427,6 +431,7 @@ export class Mpr {
 
   stop(): void {
     this.stopped = true;
+    this.extra.setRefPolygons([]);
     this.gpu?.dispose();
     this.gpu = null;
     cancelAnimationFrame(this.raf);
@@ -460,7 +465,10 @@ export class Mpr {
     if (on === this.mip) return;
     this.mip = on;
     if (on) void this.startMip();
-    else void this.extra.setSeries(this.series);
+    else {
+      void this.extra.setSeries(this.series);
+      this.extra.setRefPolygons([]);
+    }
   }
 
   /**
@@ -505,9 +513,9 @@ export class Mpr {
     if (this.view3d === "surface" && !this.stopped) this.refreshMip();
   }
 
-  /** Writes the surface as a binary STL file; resolves to the number of triangles. */
-  exportSurface(path: string): Promise<number> {
-    return exportStl(this.series.uid, this.surfaceRequest(), path);
+  /** Writes the surface as an STL, OBJ or PLY file; resolves to the number of triangles. */
+  exportSurface(path: string, coords: MeshCoords): Promise<number> {
+    return exportMesh(this.series.uid, this.surfaceRequest(), path, coords);
   }
 
   private surfaceRequest(): SurfaceRequest {
@@ -570,6 +578,7 @@ export class Mpr {
     this.mipAxes = baseMipAxes();
     this.mipScaleNow = this.mipFinal;
     await this.extra.setReformat(this.series, this.mipSource(), 1, 0, "coronal");
+    this.updateOutlines();
   }
 
   // Puts the volume on the GPU once. When that fails the 3D view is computed by the backend.
@@ -868,7 +877,85 @@ export class Mpr {
     return { x: dot(d, ax.u) / sz.p + sz.w / 2, y: dot(d, ax.v) / sz.p + sz.h / 2 };
   }
 
+  get showPlanes(): boolean {
+    return this.planesOn;
+  }
+
+  setShowPlanes(on: boolean): void {
+    this.planesOn = on;
+    this.updateOutlines();
+  }
+
+  // The planes of the MPR (and the extent of a slab) as outlines in the 3D view. They are
+  // given in millimetres from the middle of the image, which is the point the view turns about,
+  // so they stay right whatever the resolution of the image that is on show.
+  private updateOutlines(): void {
+    if (!this.mip || !this.planesOn) {
+      this.extra.setRefPolygons([]);
+      return;
+    }
+    const ax = this.mipAxes;
+    const pivot = this.pivot3d;
+    const half = this.slab.mode !== "none" && this.slab.mm < FULL_MM / 10 ? this.slab.mm / 2 : 0;
+    const polys: RefPolygon[] = [];
+    for (const plane of PLANES) {
+      const n = axesOf(this.frame, plane).n;
+      for (const offset of half > 0 ? [-half, 0, half] : [0]) {
+        const section = this.boxSection(add(this.c, scale(n, offset)), n);
+        if (section.length < 3) continue;
+        polys.push({
+          pts: section.map((q) => {
+            const d = sub(q, pivot);
+            return { x: dot(d, ax.u), y: dot(d, ax.v) };
+          }),
+          color: COLOR[plane],
+          dashed: offset !== 0,
+        });
+      }
+    }
+    this.extra.setRefPolygons(polys);
+  }
+
+  // The polygon in which the plane through `point` with normal `n` cuts the volume
+  private boxSection(point: V3, n: V3): V3[] {
+    const lo: V3 = [0, 0, this.z0];
+    const hi: V3 = [(this.g.cols - 1) * this.g.sx, (this.g.rows - 1) * this.g.sy, this.zl];
+    const corner = (i: number): V3 => [
+      i & 1 ? hi[0] : lo[0],
+      i & 2 ? hi[1] : lo[1],
+      i & 4 ? hi[2] : lo[2],
+    ];
+    const pts: V3[] = [];
+    for (let i = 0; i < 8; i++) {
+      for (let bit = 0; bit < 3; bit++) {
+        if (i & (1 << bit)) continue;
+        const a = corner(i);
+        const b = corner(i | (1 << bit));
+        const edge = sub(b, a);
+        const den = dot(n, edge);
+        if (Math.abs(den) < 1e-12) continue;
+        const t = dot(n, sub(point, a)) / den;
+        if (t < -1e-9 || t > 1 + 1e-9) continue;
+        const q = add(a, scale(edge, clamp(t, 0, 1)));
+        if (!pts.some((o) => Math.hypot(o[0] - q[0], o[1] - q[1], o[2] - q[2]) < 1e-6)) pts.push(q);
+      }
+    }
+    if (pts.length < 3) return [];
+    // Order the corners around the middle, seen along the normal
+    const mid: V3 = [0, 0, 0];
+    for (const q of pts) {
+      mid[0] += q[0] / pts.length;
+      mid[1] += q[1] / pts.length;
+      mid[2] += q[2] / pts.length;
+    }
+    const e1 = unit(cross(n, Math.abs(n[0]) < 0.9 ? [1, 0, 0] : [0, 1, 0]));
+    const e2 = cross(n, e1);
+    const angle = (q: V3): number => Math.atan2(dot(sub(q, mid), e2), dot(sub(q, mid), e1));
+    return pts.sort((p, q) => angle(p) - angle(q));
+  }
+
   private updateRefLines(): void {
+    this.updateOutlines();
     PLANES.forEach((plane, n) => {
       const pos = this.crossPos(plane);
       const [a, b] = AXIS_NAMES[plane];
@@ -893,6 +980,7 @@ export class Mpr {
 
   private refreshMip(): void {
     if (this.mip) this.extra.replaceSource(this.mipSource(), 1, 0);
+    this.updateOutlines();
   }
 
   // ---------- Image sources ----------

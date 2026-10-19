@@ -104,10 +104,13 @@ struct VolumeInfo {
     tilt_deg: f64,                   // angle between the stack axis and the slice normal
     value_min: f64,
     value_max: f64,
+    value_low: f64,                  // 2nd percentile of the values
+    value_high: f64,                 // 98th percentile
     megabytes: f64,
     z_positions: Vec<f64>,           // mm along the stack direction, one per image, ascending
     orientation: Option<[f64; 6]>,   // row and column direction cosines of the images
     z_dir: Option<Vec3>,             // direction in which the image index increases
+    origin: Option<Vec3>,            // patient position of the first voxel, when the stack is placed
 }
 
 struct Volume {
@@ -1026,6 +1029,8 @@ fn build_volume(uid: String, state: tauri::State<AppState>) -> Result<VolumeInfo
     };
     let mono1 = text_of(&head, tags::PHOTOMETRIC_INTERPRETATION) == "MONOCHROME1";
 
+    let (value_low, value_high) = mpr::percentiles(&data, vmin, vmax, 0.02, 0.98);
+
     let info = VolumeInfo {
         cols: cols as u32,
         rows: rows as u32,
@@ -1036,10 +1041,13 @@ fn build_volume(uid: String, state: tauri::State<AppState>) -> Result<VolumeInfo
         tilt_deg,
         value_min: vmin as f64,
         value_max: vmax as f64,
+        value_low: f64::from(value_low),
+        value_high: f64::from(value_high),
         megabytes: bytes as f64 / (1024.0 * 1024.0),
         z_positions: z.clone(),
         orientation: slices.iter().find_map(|s| s.iop),
         z_dir: if z_real { normal } else { None },
+        origin: if z_real { ipps.first().copied().flatten() } else { None },
     };
 
     if state.volume_gen.load(Ordering::SeqCst) != gen {
@@ -1294,11 +1302,13 @@ fn get_surface_mesh(
     Ok(tauri::ipc::Response::new(out))
 }
 
-// Writes the surface as a binary STL file in millimetres and returns the number of triangles.
-// The axes follow the patient (x towards the patient's left, y towards posterior, z towards
-// superior) when the series has an orientation; otherwise the axes of the volume are kept.
+// Writes the surface to a file: binary STL, OBJ or binary PLY, chosen by the extension of
+// `path`, in millimetres. `coords` is "lps" or "ras" (patient coordinates, which need the
+// orientation and position of the series) or "volume" (the axes of the volume). Returns the
+// number of triangles.
 #[tauri::command(async)]
-fn export_stl(
+#[allow(clippy::too_many_arguments)]
+fn export_mesh(
     uid: String,
     threshold: f64,
     max_threshold: Option<f64>,
@@ -1307,29 +1317,36 @@ fn export_stl(
     seed: Option<[u32; 3]>,
     step: u32,
     path: String,
+    coords: String,
     state: tauri::State<AppState>,
 ) -> Result<u32, String> {
-    if !path.to_ascii_lowercase().ends_with(".stl") {
-        return Err("Only .stl files can be written".into());
-    }
+    let lower = path.to_ascii_lowercase();
+    let format = ["stl", "obj", "ply"]
+        .into_iter()
+        .find(|e| lower.ends_with(&format!(".{e}")))
+        .ok_or("Only .stl, .obj and .ply files can be written")?;
+    let coords = surface::Coords::parse(&coords)?;
     let vol = volume_for(&state, &uid)?;
     let q = SurfaceQuery { threshold, max_threshold, smooth };
     let mesh = surface_of(&vol, &q, &part, seed, step, MAX_EXPORT_TRIANGLES)?;
-    let axes = match (vol.info.orientation, vol.info.z_dir) {
-        (Some(o), Some(n)) => Some(([o[0], o[1], o[2]], [o[3], o[4], o[5]], n)),
+    let frame = match (vol.info.orientation, vol.info.z_dir) {
+        (Some(o), Some(n)) => Some(surface::Frame {
+            x: [o[0], o[1], o[2]],
+            y: [o[3], o[4], o[5]],
+            z: n,
+            origin: vol.info.origin,
+        }),
         _ => None,
     };
-    let bytes = surface::stl_bytes(&mesh, |p| match axes {
-        Some((r, c, n)) => {
-            let (x, y, z) = (f64::from(p[0]), f64::from(p[1]), f64::from(p[2]));
-            [
-                (x * r[0] + y * c[0] + z * n[0]) as f32,
-                (x * r[1] + y * c[1] + z * n[1]) as f32,
-                (x * r[2] + y * c[2] + z * n[2]) as f32,
-            ]
-        }
-        None => p,
-    });
+    if frame.is_none() && coords != surface::Coords::Volume {
+        return Err("This series has no patient orientation; save in the volume coordinates".into());
+    }
+    let place = surface::Placement { frame, coords };
+    let bytes = match format {
+        "obj" => surface::obj_bytes(&mesh, &place),
+        "ply" => surface::ply_bytes(&mesh, &place),
+        _ => surface::stl_bytes(&mesh, |p| place.point(p)),
+    };
     std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
     Ok(mesh.triangle_count() as u32)
 }
@@ -1464,7 +1481,7 @@ pub fn run() {
             get_oblique_slice,
             get_volume_texture,
             get_surface_mesh,
-            export_stl
+            export_mesh
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

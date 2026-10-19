@@ -383,6 +383,46 @@ pub fn encode(data: &[f32], e: &Encoding) -> Vec<u8> {
     out
 }
 
+/// The values below which `low` and `high` (fractions, e.g. 0.02 and 0.98) of all voxels lie.
+/// Presets for modalities without calibrated numbers (MR, angiography) are placed with them,
+/// since a few extreme voxels would make the range between minimum and maximum useless.
+pub fn percentiles(slices: &[Vec<f32>], vmin: f32, vmax: f32, low: f64, high: f64) -> (f32, f32) {
+    const BINS: usize = 8192;
+    let span = (vmax - vmin).max(1e-6);
+    let hist = slices
+        .par_iter()
+        .map(|s| {
+            let mut h = vec![0u64; BINS];
+            for &v in s {
+                let b = (((v - vmin) / span) * (BINS as f32 - 1.0)).round();
+                h[(b.max(0.0) as usize).min(BINS - 1)] += 1;
+            }
+            h
+        })
+        .reduce(
+            || vec![0u64; BINS],
+            |mut a, b| {
+                for (x, y) in a.iter_mut().zip(&b) {
+                    *x += *y;
+                }
+                a
+            },
+        );
+    let total: u64 = hist.iter().sum();
+    let at = |fraction: f64| -> f32 {
+        let goal = (fraction * total as f64).ceil() as u64;
+        let mut acc = 0u64;
+        for (i, &c) in hist.iter().enumerate() {
+            acc += c;
+            if acc >= goal.max(1) {
+                return vmin + span * i as f32 / (BINS as f32 - 1.0);
+            }
+        }
+        vmax
+    };
+    (at(low), at(high))
+}
+
 // ---------- Volume texture for GPU rendering ----------
 
 /// Half-precision floats hold CT numbers to within 1 up to 2048 and to within 2 up to
@@ -1162,5 +1202,18 @@ mod oblique_tests {
         for k in 0..9 {
             assert_eq!(t[k * COLS * ROWS], f16_bits(k as f32 * 10.0), "image {k}");
         }
+    }
+
+    #[test]
+    fn percentiles_ignore_a_few_extreme_voxels() {
+        // 1000 voxels from 0 to 99 and one spike at 5000
+        let mut a: Vec<f32> = (0..1000).map(|i| (i % 100) as f32).collect();
+        a.push(5000.0);
+        let (lo, hi) = percentiles(&[a], 0.0, 5000.0, 0.02, 0.98);
+        assert!((lo - 2.0).abs() < 1.5, "lo {lo}");
+        assert!((hi - 97.0).abs() < 2.5, "hi {hi}");
+        // A flat volume gives one value
+        let (a, b) = percentiles(&[vec![7.0; 50]], 7.0, 7.0, 0.02, 0.98);
+        assert!((a - 7.0).abs() < 1e-3 && (b - 7.0).abs() < 1e-3);
     }
 }
