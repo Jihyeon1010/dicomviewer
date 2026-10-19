@@ -30,6 +30,8 @@ export interface RenderParams {
   /** Thickness in mm of the part of the volume that is drawn, around its middle; Infinity for all */
   slabMm: number;
   shade: boolean;
+  /** The slab is centred on this point (stored z positions); the middle of the volume if absent */
+  centre?: V3;
   /** The viewer looks along this sign times u x v; -1 unless the data needs the other side */
   lookAlong?: 1 | -1;
 }
@@ -483,7 +485,9 @@ export class VolumeGL {
     );
     gl.uniform1f(l.uGradStep, Math.max(voxel, 1e-3));
     gl.uniform1f(l.uGradRef, Math.max(1e-6, 0.05 * (hi - lo)));
-    gl.uniform3f(l.uCentre, vol.extent[0] / 2, vol.extent[1] / 2, vol.extent[2] / 2);
+    const c = p.centre;
+    if (c) gl.uniform3f(l.uCentre, c[0], c[1], c[2] - this.z0);
+    else gl.uniform3f(l.uCentre, vol.extent[0] / 2, vol.extent[1] / 2, vol.extent[2] / 2);
     gl.uniform1f(l.uHalfSlab, Number.isFinite(p.slabMm) ? Math.max(p.slabMm, 0) / 2 : 1e8);
     gl.uniform1i(l.uShade, p.shade ? 1 : 0);
     gl.drawArrays(gl.TRIANGLES, 0, 3);

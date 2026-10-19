@@ -284,6 +284,11 @@ export class Mpr {
   private scaleNow = 1; // output scale of the oblique views currently shown
   private mip = false;
   private mipAxes: Axes = baseMipAxes();
+  // Crosshair minus the centre of the oblique images, in the coordinates of the frame. The
+  // centre turns with the frame about the crosshair, so the crosshair keeps its place on screen.
+  private off: V3 = [0, 0, 0];
+  private pivot3d: V3; // the point the 3D view is centred on and turns about
+  private mipPending = false;
   private view3d: View3d = "max";
   private vrPreset: VrPresetId;
   private vrThickMm = Infinity; // thickness of the volume drawn in the rendering
@@ -329,6 +334,7 @@ export class Mpr {
     if (Math.ceil(this.diag / p0) + 2 > MAX_SIDE) p0 = this.diag / (MAX_SIDE - 2);
     this.p0 = p0;
     this.c = [...this.v0];
+    this.pivot3d = [...this.v0];
     this.vrPreset = opts.baseMeta?.modality === "CT" ? "bone" : "generic";
     this.lookAlong = this.viewSide();
     const { value_min: lo, value_max: hi } = opts.volume;
@@ -396,6 +402,8 @@ export class Mpr {
   /** Shows the three views with the crosshair in the middle of the volume. */
   async start(): Promise<void> {
     this.c = [...this.v0];
+    this.pivot3d = [...this.v0];
+    this.off = [0, 0, 0];
     this.frame = identityFrame();
     this.scaleNow = 1;
     const loads = PLANES.map((plane, n) => {
@@ -433,6 +441,7 @@ export class Mpr {
 
   resetRotation(): void {
     this.frame = identityFrame();
+    this.off = sub(this.c, this.v0);
     this.scaleNow = 1;
     this.refreshPanes();
     if (this.mip) {
@@ -551,6 +560,7 @@ export class Mpr {
   private async startMip(): Promise<void> {
     await this.ensureGpu();
     if (!this.mip || this.stopped) return; // switched off while the volume was loading
+    this.pivot3d = [...this.c];
     this.mipAxes = baseMipAxes();
     this.mipScaleNow = this.mipFinal;
     await this.extra.setReformat(this.series, this.mipSource(), 1, 0, "coronal");
@@ -587,17 +597,20 @@ export class Mpr {
     const plane = this.planeOf(vp);
     if (!plane) return;
     const g = this.g;
+    const c = this.c;
+    let next: V3;
     if (this.rotated) {
       const n = axesOf(this.frame, plane).n;
       const t = this.tOf(n, vp.index);
-      this.c = add(this.c, scale(n, t - dot(sub(this.c, this.v0), n)));
+      next = add(c, scale(n, t - dot(sub(c, this.v0), n)));
     } else if (plane === "axial") {
-      this.c = [this.c[0], this.c[1], g.z[vp.index] ?? this.c[2]];
+      next = [c[0], c[1], g.z[vp.index] ?? c[2]];
     } else if (plane === "coronal") {
-      this.c = [this.c[0], vp.index * g.sy, this.c[2]];
+      next = [c[0], vp.index * g.sy, c[2]];
     } else {
-      this.c = [vp.index * g.sx, this.c[1], this.c[2]];
+      next = [vp.index * g.sx, c[1], c[2]];
     }
+    this.moveCrosshair(next);
     this.updateRefLines();
   }
 
@@ -607,11 +620,12 @@ export class Mpr {
     if (!plane) return;
     const g = this.g;
 
+    let next: V3;
     if (this.rotated) {
       const ax = axesOf(this.frame, plane);
       const cp = this.crossPos(plane);
       const px = this.sizeAt(this.scaleNow).p;
-      this.c = add(
+      next = add(
         this.c,
         add(scale(ax.u, (p.x - cp.x) * px), scale(ax.v, (p.y - cp.y) * px)),
       );
@@ -622,20 +636,23 @@ export class Mpr {
       const image = (y: number): number =>
         nearestZ(g.z, this.z0 + (y - 0.5) * zStep(plane, g));
       const c = this.c;
-      if (plane === "axial") this.c = [col(p.x) * g.sx, row(p.y) * g.sy, c[2]];
-      else if (plane === "coronal") this.c = [col(p.x) * g.sx, c[1], g.z[image(p.y)] ?? c[2]];
-      else this.c = [c[0], row(p.x) * g.sy, g.z[image(p.y)] ?? c[2]];
+      if (plane === "axial") next = [col(p.x) * g.sx, row(p.y) * g.sy, c[2]];
+      else if (plane === "coronal") next = [col(p.x) * g.sx, c[1], g.z[image(p.y)] ?? c[2]];
+      else next = [c[0], row(p.x) * g.sy, g.z[image(p.y)] ?? c[2]];
     }
 
-    this.c = [
-      clamp(this.c[0], 0, (g.cols - 1) * g.sx),
-      clamp(this.c[1], 0, (g.rows - 1) * g.sy),
-      clamp(this.c[2], this.z0, this.zl),
-    ];
+    this.moveCrosshair([
+      clamp(next[0], 0, (g.cols - 1) * g.sx),
+      clamp(next[1], 0, (g.rows - 1) * g.sy),
+      clamp(next[2], this.z0, this.zl),
+    ]);
     PLANES.forEach((other, n) => {
       if (other !== plane) this.panes[n]?.goto(this.paneIndex(other), false, true);
     });
     this.updateRefLines();
+    // The 3D view centres on the picked point and turns about it
+    this.pivot3d = [...this.c];
+    if (this.mip) this.queueMip();
   }
 
   // ---------- Rotation ----------
@@ -718,7 +735,10 @@ export class Mpr {
       }
       this.dirty = false;
       if (this.twistState) this.refreshPanes();
-      if (this.ball) this.refreshMip();
+      if (this.ball || this.mipPending) {
+        this.mipPending = false;
+        this.refreshMip();
+      }
     });
   }
 
@@ -771,10 +791,57 @@ export class Mpr {
     return clamp(Math.round(this.c[0] / g.sx), 0, g.cols - 1);
   }
 
-  private sizeAt(scaleFactor: number): { w: number; h: number; p: number } {
-    const p = this.p0 * scaleFactor;
-    const s = Math.min(MAX_SIDE, Math.ceil(this.diag / p) + 2);
+  // Images are square and must reach the whole volume from their centre, which can lie off
+  // the middle of the volume; `slack` is how far. A coarser pixel keeps them within MAX_SIDE.
+  private sizeAt(
+    scaleFactor: number,
+    slack = this.planeSlack(),
+  ): { w: number; h: number; p: number } {
+    const cover = this.diag + 2 * slack;
+    const p = Math.max(this.p0 * scaleFactor, cover / (MAX_SIDE - 2));
+    const s = Math.min(MAX_SIDE, Math.ceil(cover / p) + 2);
     return { w: s, h: s, p };
+  }
+
+  // Rounded up in steps, so that the size of the images changes rarely
+  private quantized(mm: number): number {
+    const q = this.diag / 8;
+    return Math.ceil(mm / q - 1e-9) * q;
+  }
+
+  private planeSlack(): number {
+    if (!this.rotated) return 0;
+    return this.quantized(Math.hypot(...sub(this.c, this.v0)) + Math.hypot(...this.off));
+  }
+
+  private toFrame(w: V3): V3 {
+    const f = this.frame;
+    return [dot(w, f.x), dot(w, f.y), dot(w, f.z)];
+  }
+
+  // The point on which the oblique images are centred (each projected onto its plane)
+  private viewCentre(): V3 {
+    const f = this.frame;
+    const o = this.off;
+    return sub(this.c, add(add(scale(f.x, o[0]), scale(f.y, o[1])), scale(f.z, o[2])));
+  }
+
+  // Moves the crosshair and leaves the centre of the images where it is
+  private moveCrosshair(next: V3): void {
+    const centre = this.rotated ? this.viewCentre() : this.v0;
+    this.c = next;
+    this.off = this.toFrame(sub(next, centre));
+  }
+
+  private planeCentre(ax: Axes, index: number): V3 {
+    const p0 = this.viewCentre();
+    return add(p0, scale(ax.n, this.tOf(ax.n, index) - dot(sub(p0, this.v0), ax.n)));
+  }
+
+  private queueMip(): void {
+    this.mipPending = true;
+    this.dirty = true;
+    this.schedule();
   }
 
   // Position of the crosshair in the image of a view, in pixels (centres at +0.5)
@@ -790,7 +857,7 @@ export class Mpr {
     }
     const ax = axesOf(this.frame, plane);
     const sz = this.sizeAt(this.scaleNow);
-    const centre = add(this.v0, scale(ax.n, this.tOf(ax.n, this.paneIndex(plane))));
+    const centre = this.planeCentre(ax, this.paneIndex(plane));
     const d = sub(c, centre);
     return { x: dot(d, ax.u) / sz.p + sz.w / 2, y: dot(d, ax.v) / sz.p + sz.h / 2 };
   }
@@ -853,10 +920,12 @@ export class Mpr {
     const ext = this.ext(ax.n);
     const step = this.stepMm;
     const v0 = this.v0;
+    const p0 = this.viewCentre();
+    const centreKey = p0.map((x) => x.toFixed(2)).join(",");
     return {
-      id: `obl:${uid}:${plane}:${keyOf(ax)}:${slab.mode}:${slab.mode === "none" ? 0 : slab.mm}:${this.scaleNow}`,
+      id: `obl:${uid}:${plane}:${keyOf(ax)}:${centreKey}:${slab.mode}:${slab.mode === "none" ? 0 : slab.mm}:${this.scaleNow}`,
       load: async (index): Promise<CachedSlice> => {
-        const origin = add(v0, scale(ax.n, -ext + index * step));
+        const origin = add(p0, scale(ax.n, -ext + index * step - dot(sub(p0, v0), ax.n)));
         const r = await getObliqueSlice(
           uid, origin, ax.u, ax.v, sz.w, sz.h, sz.p, slab.mode, slab.mm, sz.p,
         );
@@ -868,8 +937,9 @@ export class Mpr {
   private mipSource(): SliceSource {
     const uid = this.series.uid;
     const ax = this.mipAxes;
-    const sz = this.sizeAt(this.mipScaleNow);
-    const v0 = this.v0;
+    const pivot = this.pivot3d;
+    const off = Math.hypot(...sub(pivot, this.v0));
+    const sz = this.sizeAt(this.mipScaleNow, this.quantized(off));
     const gpu = this.gpu;
     const vr = this.view3d === "vr" && gpu !== null;
     const surf = this.view3d === "surface" && gpu !== null && gpu.hasMesh;
@@ -880,21 +950,22 @@ export class Mpr {
     const name = mode === "max" ? "MIP" : mode === "min" ? "MinIP" : "Average";
     const suffix = vr ? " · 3D Volume" : surf ? " · 3D Surface" : ` · 3D ${name}`;
     const thick = this.vrThickMm;
-    const radius = this.diag * 0.55;
+    const radius = this.diag * 0.55 + off;
     const lookAlong = this.lookAlong;
     const key = vr
       ? `vr:${this.vrPreset}:${thick}`
       : surf
         ? `surf:${this.surfRev}:${thick}`
         : `${gpu ? "gmip" : "mip"}:${mode}`;
+    const pivotKey = pivot.map((x) => x.toFixed(1)).join(",");
     return {
-      id: `${key}:${uid}:${keyOf(ax)}:${this.mipScaleNow}`,
+      id: `${key}:${uid}:${keyOf(ax)}:${pivotKey}:${sz.w}:${this.mipScaleNow}`,
       load: async (): Promise<CachedSlice> => {
         let slice: SliceData | null = null;
         if (gpu?.ready) {
           try {
             const view = {
-              origin: v0,
+              origin: pivot,
               u: ax.u,
               v: ax.v,
               width: sz.w,
@@ -902,9 +973,10 @@ export class Mpr {
               pixelMm: sz.p,
               stepMm: sz.p,
             };
-            if (vr) slice = gpu.render({ ...view, slabMm: thick, shade: true, lookAlong });
-            else if (surf) {
-              slice = gpu.drawMesh({ ...view, slabMm: thick, centre: v0, radius, lookAlong });
+            if (vr) {
+              slice = gpu.render({ ...view, slabMm: thick, shade: true, centre: pivot, lookAlong });
+            } else if (surf) {
+              slice = gpu.drawMesh({ ...view, slabMm: thick, centre: pivot, radius, lookAlong });
             } else slice = gpu.project({ ...view, mode });
           } catch (err) {
             console.warn("GPU rendering failed, using the CPU path:", err);
@@ -914,7 +986,7 @@ export class Mpr {
           return { slice, meta: this.metaFor("coronal", ax, slab, [sz.p, sz.p], suffix) };
         }
         const r = await getObliqueSlice(
-          uid, v0, ax.u, ax.v, sz.w, sz.h, sz.p, mode, FULL_MM, sz.p,
+          uid, pivot, ax.u, ax.v, sz.w, sz.h, sz.p, mode, FULL_MM, sz.p,
         );
         return {
           slice: r.slice,
