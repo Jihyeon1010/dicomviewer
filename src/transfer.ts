@@ -29,11 +29,16 @@ export const VR_PRESETS: { id: VrPresetId; label: string }[] = [
   { id: "angio-dark", label: "X-ray: Dark vessels" },
 ];
 
+export function looksLikeHounsfield(valueMin: number): boolean {
+  return valueMin <= -500;
+}
+
 /** The preset that suits the modality of a series. */
-export function presetForModality(modality: string): VrPresetId {
+/** fundamentally Claude write the valueMin -1000, which is bloody hell, why bloody hell not -1024 */
+export function presetForModality(modality: string, valueMin = CT_LO): VrPresetId {
   switch (modality) {
     case "CT":
-      return "bone";
+      return looksLikeHounsfield(valueMin) ? "bone" : "angio";
     case "MR":
       return "mr";
     case "XA":
@@ -46,7 +51,6 @@ export function presetForModality(modality: string): VrPresetId {
       return "generic";
   }
 }
-
 /** What the preset may need to know about the data. */
 export interface ValueRange {
   valueMin: number;

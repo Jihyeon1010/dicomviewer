@@ -13,7 +13,7 @@ import { matrix, type Pt } from "./transform2d";
 import type { Plane, SeriesInfo, SlabMode, SliceData, SliceMeta, VolumeInfo } from "./types";
 import { add, cross, dot, rotateAbout, scale, sub, unit, type V3 } from "./vec3";
 import type { RefLine, RefPolygon, Viewport } from "./viewport";
-import { presetForModality, transferFor, type ValueRange, type VrPresetId } from "./transfer";
+import { looksLikeHounsfield, presetForModality, transferFor, type ValueRange, type VrPresetId } from "./transfer";
 import { VolumeGL, type ProjectionMode } from "./volume-gl";
 
 export const PLANES: Plane[] = ["axial", "coronal", "sagittal"];
@@ -339,11 +339,13 @@ export class Mpr {
     this.p0 = p0;
     this.c = [...this.v0];
     this.pivot3d = [...this.v0];
-    this.vrPreset = presetForModality(opts.baseMeta?.modality ?? "");
+    const modality = opts.baseMeta?.modality ?? "";
+    const { value_min, value_low: lo, value_high: hi } = opts.volume;
+    this.vrPreset = presetForModality(modality, value_min);
     this.lookAlong = this.viewSide();
-    const { value_low: lo, value_high: hi } = opts.volume;
+    const hounsfield = modality === "CT" && looksLikeHounsfield(value_min);
     this.surf = {
-      threshold: opts.baseMeta?.modality === "CT" ? 300 : Math.round((lo + hi) / 2),
+      threshold: hounsfield ? 300 : Math.round(lo + 0.5 * (hi - lo)),
       maxThreshold: null,
       smooth: 10,
       part: "largest",
