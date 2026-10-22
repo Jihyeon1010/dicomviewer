@@ -514,7 +514,8 @@ body.dragging #viewports::after { border-color: var(--accent); }
 
 /* ---------- Dialogs (settings, DICOM tags) ---------- */
 #settings-backdrop,
-#tags-backdrop {
+#tags-backdrop,
+#plugins-backdrop {
   position: fixed;
   inset: 0;
   z-index: 10;
@@ -526,10 +527,12 @@ body.dragging #viewports::after { border-color: var(--accent); }
   -webkit-backdrop-filter: blur(3px);
 }
 #settings-backdrop[hidden],
-#tags-backdrop[hidden] { display: none; }
+#tags-backdrop[hidden],
+#plugins-backdrop[hidden] { display: none; }
 
 #settings,
-#tags {
+#tags,
+#plugins {
   display: flex;
   flex-direction: column;
   background: var(--panel);
@@ -762,3 +765,108 @@ body.dragging #viewports::after { border-color: var(--accent); }
 #viewports[data-tool="calibrate"] .vp { cursor: crosshair; }
 #viewports[data-tool="rotate"] .vp { cursor: move; }
 #viewports[data-tool="maskshift"] .vp { cursor: move; }
+
+/* ---------- Plugins ---------- */
+#plugins {
+  width: min(900px, calc(100vw - 48px));
+  height: min(640px, calc(100vh - 48px));
+}
+.head-actions { display: flex; gap: 6px; }
+#plugins-note {
+  min-height: 0;
+  padding: 0 16px;
+  font-size: 12px;
+  color: var(--muted);
+}
+#plugins-note:not(:empty) { padding: 8px 16px; border-bottom: 1px solid var(--border); }
+#plugins-note.error { color: var(--danger); }
+#plugins-body { flex: 1; display: flex; min-height: 0; }
+
+#plugins-list {
+  flex: none;
+  width: 260px;
+  margin: 0;
+  padding: 8px;
+  list-style: none;
+  overflow-y: auto;
+  border-right: 1px solid var(--border);
+}
+.plugin-item {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 2px 8px;
+  width: 100%;
+  height: auto;
+  margin-bottom: 4px;
+  padding: 8px 10px;
+  text-align: left;
+  background: transparent;
+  border-color: transparent;
+  border-radius: 8px;
+}
+.plugin-item:hover:not(.active) { background: var(--panel-2); border-color: transparent; }
+.plugin-item.active { background: var(--accent-soft); border-color: var(--accent-line); }
+.plugin-item.off .plugin-name { color: var(--muted); text-decoration: line-through; }
+.plugin-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.plugin-meta { font-size: 11px; color: var(--muted); }
+.plugin-desc {
+  grid-column: 1 / -1;
+  font-size: 11px;
+  color: var(--muted);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.plugins-empty { padding: 16px; font-size: 12px; color: var(--muted); }
+
+#plugins-detail { flex: 1; min-width: 0; padding: 14px 18px; overflow-y: auto; }
+.plugin-head { display: flex; align-items: baseline; gap: 8px; }
+.plugin-head h3, .plugin-confirm h3 { margin: 0 0 4px; font-size: 15px; }
+.plugin-text { margin: 4px 0 8px; }
+.plugin-form { display: grid; gap: 8px; margin: 12px 0; }
+.param-row { display: grid; grid-template-columns: 170px 1fr; align-items: center; gap: 8px; }
+.param-label { color: var(--muted); }
+.param-row input[type="number"],
+.param-row input[type="text"],
+.param-row select {
+  height: 28px;
+  padding: 0 8px;
+  color: var(--text);
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font: inherit;
+}
+.param-row input[type="checkbox"] { justify-self: start; }
+.plugin-actions { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
+.plugin-actions .spacer { flex: 1; }
+button.primary { color: #fff; background: var(--accent-soft); border-color: var(--accent-line); }
+button.danger { color: var(--danger); }
+.plugin-warning {
+  margin: 10px 0;
+  padding: 8px 10px;
+  color: var(--overlay);
+  background: rgba(255, 213, 74, 0.08);
+  border: 1px solid rgba(255, 213, 74, 0.3);
+  border-radius: 8px;
+}
+.plugin-log {
+  min-height: 120px;
+  max-height: 260px;
+  margin: 0;
+  padding: 8px 10px;
+  overflow: auto;
+  font: 11px/1.5 var(--font-mono);
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  user-select: text;
+  -webkit-user-select: text;
+  white-space: pre-wrap;
+}
+@media (prefers-reduced-transparency: reduce) {
+  #plugins-backdrop { backdrop-filter: none; -webkit-backdrop-filter: none; background: rgba(0, 0, 0, 0.85); }
+}

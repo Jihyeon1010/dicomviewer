@@ -28,6 +28,7 @@ import {
 } from "./settings";
 import { seriesSource, sliceCache } from "./slice-cache";
 import { createTagsDialog } from "./tags-dialog";
+import { createPluginsDialog, type PluginBackend } from "./plugins-dialog";
 import { VR_PRESETS } from "./transfer";
 import type { SeriesInfo, SlabMode, VolumeInfo } from "./types";
 import { syncedIndex, Viewport, type ToolId, type ViewportHost } from "./viewport";
@@ -54,6 +55,7 @@ const markersBtn = byId("markers", HTMLButtonElement);
 const anonBtn = byId("anonymize", HTMLButtonElement);
 const tagsBtn = byId("tags-btn", HTMLButtonElement);
 const settingsBtn = byId("settings-open", HTMLButtonElement);
+const pluginsBtn = byId("plugins-open", HTMLButtonElement);
 const tileBtn = byId("tile", HTMLButtonElement);
 const syncScrollBtn = byId("sync-scroll", HTMLButtonElement);
 const syncWindowBtn = byId("sync-window", HTMLButtonElement);
@@ -248,6 +250,7 @@ function refreshTooltips(): void {
   setTip(sliderPosBtn, "Move the image slider to the bottom or the right side", "ui.slider");
   setTip(anonBtn, "Hide patient identifiers on screen", "ui.anonymize");
   setTip(tagsBtn, "DICOM tags of the shown image", "ui.tags");
+  pluginsBtn.title = "Plugins: import and run Python plugins";
   setTip(settingsBtn, "Settings and keyboard shortcuts", "ui.settings");
 }
 
@@ -1312,11 +1315,48 @@ const tagsDialog = createTagsDialog({
   anonymize: () => anonymize,
 });
 
-const modalOpen = (): boolean => dialog.isOpen() || tagsDialog.isOpen() || calOpen();
+// There is no plugin backend yet: the dialog opens empty and says so when something is tried.
+// Replace this with calls to the Rust side.
+const pluginsUnavailable = (): Promise<never> =>
+  Promise.reject(new Error("Plugins are not available yet"));
+const emptyPluginBackend: PluginBackend = {
+  list: async () => [],
+  inspect: pluginsUnavailable,
+  install: pluginsUnavailable,
+  remove: pluginsUnavailable,
+  setEnabled: pluginsUnavailable,
+  run: pluginsUnavailable,
+};
+
+const pluginsDialog = createPluginsDialog({
+  backend: emptyPluginBackend,
+  pickFile: async () => {
+    const p = await open({
+      multiple: false,
+      directory: false,
+      filters: [{ name: "Plugin", extensions: ["py", "zip"] }],
+    });
+    return typeof p === "string" ? p : null;
+  },
+  pickFolder: async () => {
+    const p = await open({ directory: true });
+    return typeof p === "string" ? p : null;
+  },
+});
+
+const modalOpen = (): boolean =>
+  dialog.isOpen() || tagsDialog.isOpen() || pluginsDialog.isOpen() || calOpen();
 
 function openSettings(): void {
   if (tagsDialog.isOpen()) tagsDialog.close();
+  if (pluginsDialog.isOpen()) pluginsDialog.close();
   dialog.open();
+}
+
+function openPlugins(): void {
+  if (dialog.isOpen()) dialog.close();
+  if (tagsDialog.isOpen()) tagsDialog.close();
+  void pluginsDialog.open();
 }
 
 function openTags(): void {
@@ -1325,11 +1365,13 @@ function openTags(): void {
     return;
   }
   if (dialog.isOpen()) dialog.close();
+  if (pluginsDialog.isOpen()) pluginsDialog.close();
   void tagsDialog.open();
 }
 
 settingsBtn.addEventListener("click", openSettings);
 tagsBtn.addEventListener("click", openTags);
+pluginsBtn.addEventListener("click", openPlugins);
 
 // ---------- Keyboard ----------
 // One handler per action id; the keys that trigger them live in keymap.ts and the settings.
@@ -1454,6 +1496,7 @@ window.addEventListener("keydown", (e: KeyboardEvent) => {
   // While a dialog is open it owns the keyboard (including key capture)
   if (dialog.handleKey(e)) return;
   if (tagsDialog.handleKey(e)) return;
+  if (pluginsDialog.handleKey(e)) return;
 
   if (e.key === "Enter" && active.finishAneurysmIfPending()) {
     e.preventDefault();

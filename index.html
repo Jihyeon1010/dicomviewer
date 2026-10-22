@@ -82,6 +82,7 @@
       <button id="slider-pos" class="ib" aria-label="Image slider position"><span class="ic" data-icon="panel-bottom"></span></button>
       <button id="anonymize" class="ib" aria-label="Anonymize"><span class="ic" data-icon="eye-off"></span></button>
       <button id="tags-btn" class="ib" aria-label="DICOM tags"><span class="ic" data-icon="list"></span></button>
+      <button id="plugins-open" class="ib" aria-label="Plugins"><span class="ic" data-icon="plug"></span></button>
       <button id="settings-open" class="ib" aria-label="Settings"><span class="ic" data-icon="cog"></span></button>
     </div>
 
@@ -237,6 +238,25 @@
       <div id="tags-list"></div>
     </div>
   </div>
+
+    <div id="plugins-backdrop" hidden>
+      <div id="plugins" role="dialog" aria-modal="true" aria-labelledby="plugins-title">
+        <div class="dialog-head">
+          <h2 id="plugins-title">Plugins</h2>
+          <div class="head-actions">
+            <button id="plugins-import-file" type="button">Import file…</button>
+            <button id="plugins-import-folder" type="button">Import folder…</button>
+            <button id="plugins-close" type="button">Close</button>
+          </div>
+        </div>
+        <div id="plugins-note" role="status"></div>
+        <div id="plugins-body">
+          <ul id="plugins-list"></ul>
+          <section id="plugins-detail"></section>
+        </div>
+      </div>
+    </div>
+
     <div id="cal-backdrop" hidden>
     <div id="cal" role="dialog" aria-modal="true" aria-labelledby="cal-title">
       <div class="dialog-head"><h2 id="cal-title">Calibrate length</h2></div>
