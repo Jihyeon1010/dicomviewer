@@ -14,6 +14,7 @@ A local DICOM viewer for desktop, built with [Tauri 2](https://tauri.app) (Rust 
 - Layouts up to 4 × 3 with linked scrolling and window / level
 - **Tile view**: consecutive images of one series, one per view, scrolling together
 - **Enlarge a view**: double click (several views) or `Alt+Z`, again to restore
+- **Right click menu** on an image: window presets, orientation, tools, cine, save and copy (dragging with the right button still pans)
 - Cine playback with loop range, ping-pong and bookmarks
 - Save the image as PNG or copy it to the clipboard
 

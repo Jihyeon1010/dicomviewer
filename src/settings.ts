@@ -15,6 +15,20 @@ export const WHEEL_PX: Record<Sensitivity, number> = { slow: 80, normal: 40, fas
 /** Pixels of mouse movement per image with the scroll tool */
 export const SCROLL_PX: Record<Sensitivity, number> = { slow: 16, normal: 8, fast: 4 };
 
+/** The cross that shows which voxel a time course belongs to */
+export type MarkerSize = "small" | "medium" | "large" | "full";
+export const MARKER_SIZES: MarkerSize[] = ["small", "medium", "large", "full"];
+export type MarkerColor = "yellow" | "red" | "green" | "cyan" | "magenta" | "white";
+export const MARKER_COLORS: Record<MarkerColor, string> = {
+  yellow: "#ffd60a",
+  red: "#ff453a",
+  green: "#30d158",
+  cyan: "#64d2ff",
+  magenta: "#ff5ad8",
+  white: "#ffffff",
+};
+export const MARKER_COLOR_IDS = Object.keys(MARKER_COLORS) as MarkerColor[];
+
 /** What the graph of a voxel through the volumes of a 4D file shows */
 export type TimeCourseMode = "raw" | "percent";
 export const TIME_COURSE_MODES: TimeCourseMode[] = ["raw", "percent"];
@@ -34,6 +48,9 @@ export interface Settings {
   wheelSensitivity: Sensitivity;
   scrollSensitivity: Sensitivity;
   timeCourseMode: TimeCourseMode;
+  timeMarker: boolean; // mark the voxel of the time course on the image
+  timeMarkerSize: MarkerSize;
+  timeMarkerColor: MarkerColor;
   pythonPath: string; // "" lets the app look for a Python
   exportDir: string; // the folder where the save windows open; "" leaves it to the system
   keymap: Bindings; // overrides only: actions whose keys differ from the defaults
@@ -57,6 +74,9 @@ export function defaultSettings(): Settings {
     wheelSensitivity: "normal",
     scrollSensitivity: "normal",
     timeCourseMode: "raw",
+    timeMarker: true,
+    timeMarkerSize: "medium",
+    timeMarkerColor: "yellow",
     pythonPath: "",
     exportDir: "",
     keymap: {},
@@ -100,6 +120,11 @@ function sanitize(p: unknown, base: Settings): Settings {
   if (scroll) out.scrollSensitivity = scroll;
   const course = TIME_COURSE_MODES.find((v) => v === p["timeCourseMode"]);
   if (course) out.timeCourseMode = course;
+  if (typeof p["timeMarker"] === "boolean") out.timeMarker = p["timeMarker"];
+  const msize = MARKER_SIZES.find((v) => v === p["timeMarkerSize"]);
+  if (msize) out.timeMarkerSize = msize;
+  const mcolor = MARKER_COLOR_IDS.find((v) => v === p["timeMarkerColor"]);
+  if (mcolor) out.timeMarkerColor = mcolor;
   if (typeof p["exportDir"] === "string") out.exportDir = p["exportDir"].trim().slice(0, 1024);
   if (typeof p["pythonPath"] === "string") out.pythonPath = p["pythonPath"].trim().slice(0, 1024);
 

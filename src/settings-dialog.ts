@@ -13,7 +13,7 @@ import {
 } from "./keymap";
 
 import {
-  defaultSettings, OVERLAY_MODES, SENSITIVITIES, SLIDER_POSITIONS, TIME_COURSE_MODES,
+  defaultSettings, MARKER_COLOR_IDS, MARKER_SIZES, OVERLAY_MODES, SENSITIVITIES, SLIDER_POSITIONS, TIME_COURSE_MODES,
   type Settings,
 } from "./settings";
 import { ORIENT_MODES } from "./orient-auto";
@@ -157,6 +157,37 @@ const PAGES: Page[] = [
         set: (v) => {
           const timeCourseMode = pick(TIME_COURSE_MODES, v);
           return timeCourseMode ? { timeCourseMode } : {};
+        },
+      },
+      {
+        kind: "toggle",
+        label: "Mark the voxel on the image",
+        hint: "A cross shows where the time course was taken, on the image it was taken from.",
+        get: (s) => s.timeMarker,
+        set: (timeMarker) => ({ timeMarker }),
+      },
+      {
+        kind: "select",
+        label: "Size of the cross",
+        hint: "\"Across the image\" draws lines from edge to edge.",
+        options: [["small", "Small"], ["medium", "Medium"], ["large", "Large"], ["full", "Across the image"]],
+        get: (s) => s.timeMarkerSize,
+        set: (v) => {
+          const timeMarkerSize = pick(MARKER_SIZES, v);
+          return timeMarkerSize ? { timeMarkerSize } : {};
+        },
+      },
+      {
+        kind: "select",
+        label: "Colour of the cross",
+        options: [
+          ["yellow", "Yellow"], ["red", "Red"], ["green", "Green"],
+          ["cyan", "Cyan"], ["magenta", "Magenta"], ["white", "White"],
+        ],
+        get: (s) => s.timeMarkerColor,
+        set: (v) => {
+          const timeMarkerColor = pick(MARKER_COLOR_IDS, v);
+          return timeMarkerColor ? { timeMarkerColor } : {};
         },
       },
     ],

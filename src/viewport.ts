@@ -38,6 +38,23 @@ import type { Plane } from "./types";
 
 import { Angio, positionerText, PROJECTION_MODES, type ProjectionMode, type SubtractMode } from "./angio";
 
+/** The voxel of a time course: a column and row of one image of a series */
+export interface VoxelMarker {
+  uid: string;
+  index: number;
+  col: number;
+  row: number;
+}
+
+/** How the voxel is drawn; `length` is in screen pixels, 0 for lines across the image */
+export interface MarkerStyle {
+  visible: boolean;
+  length: number;
+  color: string;
+}
+
+const IS_MAC = navigator.userAgent.includes("Mac");
+
 export type MeasureKind = "length" | "angle" | "ellipse" | "rect" | "aneurysm";
 export type ToolId =
   | "window" | "pan" | "zoom" | "scroll" | "cross" | "rotate" | "maskshift" | "calibrate" | "timecourse"
@@ -84,6 +101,7 @@ export interface ViewportHost {
   windowChanged(vp: Viewport): void; // the user changed window/level
   stateChanged(vp: Viewport): void;  // anything the toolbar shows
   pick(vp: Viewport, p: Pt): void;   // the crosshair tool was used at an image position
+  contextMenu(vp: Viewport, client: Pt): void; // the right button was clicked (not dragged) on the image
   timecourse(vp: Viewport, p: Pt, client: Pt): void; // the time course tool was used at an image position (and at this screen position)
   orientMode(): OrientMode;
   // A view can fill the whole area while the others are hidden; a double click toggles that
@@ -357,8 +375,11 @@ export class Viewport {
   private cineDir: 1 | -1 = 1;
   private bookmarks = new Set<number>();
   private aneurysmPts: Pt[] = []; // clicks collected so far for the aneurysm template
+  private voxelMarker: VoxelMarker | null = null;
+  private markerStyle: MarkerStyle = { visible: true, length: 14, color: "#ffd60a" };
   private refLines: RefLine[] = [];
   private refPolys: RefPolygon[] = [];
+  private rightClick: { x: number; y: number; moved: boolean } | null = null; // right button held
   private crossing = false; // mouse button held with the crosshair tool
   private crossRaf = 0;
   private crossPt: { x: number; y: number } | null = null;
@@ -501,6 +522,17 @@ export class Viewport {
   reload(): Promise<void> {
     sliceCache.cancel(this);
     return this.loadSlice();
+  }
+
+  /** The voxel of a time course is marked on its own image; null removes the mark. */
+  setVoxelMarker(m: VoxelMarker | null): void {
+    this.voxelMarker = m;
+    this.updateMeasurements();
+  }
+
+  setMarkerStyle(style: MarkerStyle): void {
+    this.markerStyle = style;
+    this.updateMeasurements();
   }
 
   /** Reference lines of other planes, drawn across the image. */
@@ -1607,6 +1639,39 @@ export class Viewport {
       });
   }
 
+  // A cross at the centre of the voxel, with a gap in the middle so that the voxel itself stays
+  // visible. A dark line under the coloured one keeps it readable on bright images.
+  private voxelNodes(): SVGElement[] {
+    const m = this.voxelMarker;
+    const s = this.current;
+    if (!m || !s || !this.markerStyle.visible || !this.series || this.series.uid !== m.uid || this.index !== m.index) {
+      return [];
+    }
+    const c = this.toScreen({ x: m.col + 0.5, y: m.row + 0.5 });
+    const next = this.toScreen({ x: m.col + 1.5, y: m.row + 0.5 });
+    const gap = Math.max(3, Math.hypot(next.x - c.x, next.y - c.y) / 2 + 2);
+    const { length, color } = this.markerStyle;
+    let [x0, x1, y0, y1] = [c.x - gap - length, c.x + gap + length, c.y - gap - length, c.y + gap + length];
+    if (length === 0) {
+      const a = this.toScreen({ x: 0, y: 0 });
+      const b = this.toScreen({ x: s.cols, y: s.rows });
+      [x0, x1, y0, y1] = [Math.min(a.x, b.x), Math.max(a.x, b.x), Math.min(a.y, b.y), Math.max(a.y, b.y)];
+    }
+    const segments: [number, number, number, number][] = [
+      [x0, c.y, c.x - gap, c.y],
+      [c.x + gap, c.y, x1, c.y],
+      [c.x, y0, c.x, c.y - gap],
+      [c.x, c.y + gap, c.x, y1],
+    ];
+    const out: SVGElement[] = [];
+    for (const [stroke, width, opacity] of [["#000", 3.5, 0.55], [color, 1.5, 1]] as const) {
+      for (const [ax, ay, bx, by] of segments) {
+        out.push(svgEl("line", { x1: ax, y1: ay, x2: bx, y2: by, stroke, "stroke-width": width, "stroke-opacity": opacity, "stroke-linecap": "round" }));
+      }
+    }
+    return out;
+  }
+
   private lineNodes(): SVGElement[] {
     const s = this.current;
     if (!s) return [];
@@ -1628,7 +1693,7 @@ export class Viewport {
       svg.replaceChildren();
       return;
     }
-    const nodes: SVGElement[] = [...this.refNodes()];
+    const nodes: SVGElement[] = [...this.refNodes(), ...this.voxelNodes()];
     for (const m of this.measurements.get(this.sliceKey()) ?? []) {
       nodes.push(...this.shapeNodes(m.kind, m.pts, m.lines));
     }
@@ -1691,7 +1756,11 @@ export class Viewport {
     el.addEventListener("mousedown", (e: MouseEvent) => {
       this.host.activate(this);
       if (!this.current) return;
-      const panOverride = e.button === 1 || e.button === 2 || (e.button === 0 && e.shiftKey);
+      // A right click opens the menu; dragging with the right button still pans. On a Mac the
+      // right click is also made with Ctrl and the left button.
+      const rightButton = e.button === 2 || (e.button === 0 && e.ctrlKey && IS_MAC);
+      const panOverride = e.button === 1 || rightButton || (e.button === 0 && e.shiftKey);
+      this.rightClick = rightButton ? { x: e.clientX, y: e.clientY, moved: false } : null;
       const r = el.getBoundingClientRect();
       const tool = this.host.tool();
 
@@ -1758,6 +1827,9 @@ export class Viewport {
     });
 
     window.addEventListener("mouseup", () => {
+      const click = this.rightClick;
+      this.rightClick = null;
+      if (click && !click.moved && this.drag) this.host.contextMenu(this, { x: click.x, y: click.y });
       this.drag = null;
       this.crossing = false;
       if (this.rotating) {
@@ -1772,6 +1844,8 @@ export class Viewport {
     });
 
     window.addEventListener("mousemove", (e: MouseEvent) => {
+      const rc = this.rightClick;
+      if (rc && !rc.moved && Math.hypot(e.clientX - rc.x, e.clientY - rc.y) > 4) rc.moved = true;
       if (this.crossing) this.pickAt(e.clientX, e.clientY);
 
       if (this.rotating) {

@@ -52,6 +52,8 @@ export class TimeCoursePanel {
   private values: number[] = [];
   /** The series the graph belongs to; null while the panel is hidden. */
   uid: string | null = null;
+  /** Called when the panel is closed or hidden, for example to remove the mark from the image. */
+  onHide: (() => void) | null = null;
   private current = 0;
   private unit = "";
 
@@ -135,6 +137,7 @@ export class TimeCoursePanel {
 
   hide(): void {
     if (this.uid === null && this.root.hidden) return;
+    if (this.uid !== null) this.onHide?.();
     this.uid = null;
     this.values = [];
     cancelAnimationFrame(this.raf);

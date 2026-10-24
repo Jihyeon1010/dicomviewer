@@ -4,6 +4,7 @@ import {
   buildVolume, checkPython, getDiffusion, getThumbnail, getTimeSeries, openFiles, openFolder, savePng, setNiftiVolume,
   type DiffusionInfo,
 } from "./api";
+import { showContextMenu, type MenuEntry, type MenuItem } from "./context-menu";
 import { setPopover } from "./popover";
 import { TimeCoursePanel } from "./timecourse";
 import { byId } from "./dom";
@@ -26,6 +27,7 @@ import { createSettingsDialog } from "./settings-dialog";
 import {
   loadSettings,
   OVERLAY_MODES,
+  MARKER_COLORS,
   SCROLL_PX,
   saveSettings,
   WHEEL_PX,
@@ -38,7 +40,7 @@ import { createTagsDialog } from "./tags-dialog";
 import { createPluginsDialog, type PluginBackend } from "./plugins-dialog";
 import { VR_PRESETS } from "./transfer";
 import type { SeriesInfo, SlabMode, VolumeInfo } from "./types";
-import { syncedIndex, Viewport, type ToolId, type ViewportHost } from "./viewport";
+import { syncedIndex, Viewport, type MarkerStyle, type VoxelMarker, type ToolId, type ViewportHost } from "./viewport";
 import { ORIENT_MODES, type OrientMode } from "./orient-auto";
 import type { ProjectionMode } from "./angio";
 
@@ -163,6 +165,11 @@ const diffusionAsked = new Set<string>();
 const timeCourse = new TimeCoursePanel(byId("tc-panel", HTMLDivElement), viewportsEl, (t) => {
   if (timeCourse.uid) void chooseVolume(timeCourse.uid, t);
 });
+let voxelMarker: VoxelMarker | null = null; // the voxel that the time course shows
+timeCourse.onHide = () => {
+  voxelMarker = null;
+  for (const v of viewports) v.setVoxelMarker(null);
+};
 let timeRaw: number[] = []; // the values of the voxel that the graph shows, as the file has them
 let timeRun = 0; // bumped for each time course asked for, so that a late answer is dropped
 let hasLoaded = false;
@@ -323,6 +330,7 @@ const host: ViewportHost = {
     if (vp === active) syncControls();
   },
   pick: (vp, p) => mpr?.pick(vp, p),
+  contextMenu: (vp, client) => openContextMenu(vp, client),
   timecourse: (vp, p, client) => void showTimeCourse(vp, p, client),
   canMaximize: () => maximized !== null || cellCount() > 1,
   toggleMaximize: (vp) => toggleMaximize(vp),
@@ -346,6 +354,8 @@ let active: Viewport = first;
 function ensureViewports(n: number): void {
   while (viewports.length < n) {
     const vp = new Viewport(host);
+    vp.setMarkerStyle(markerStyle());
+    vp.setVoxelMarker(voxelMarker);
     viewports.push(vp);
     viewportsEl.append(vp.el);
   }
@@ -761,7 +771,7 @@ function syncControls(): void {
   view3dSel.hidden = !mip3d;
   const vs = active.series && active.series.volumes > 1 ? active.series : null;
   volWrap.hidden = !vs;
-  if (!vs) timeCourse.hide();
+  if (!vs || mpr) timeCourse.hide(); // a time course belongs to the images of the file
   if (!vs && tool === "timecourse") setTool("window");
   if (vs) {
     ensureDiffusion(vs.uid);
@@ -856,6 +866,7 @@ function changeSetting(patch: Partial<Settings>): void {
   if (patch.sliderPos && patch.sliderPos !== before.sliderPos) applySliderPos(patch.sliderPos, false);
   if (patch.smooth !== undefined) viewportsEl.dataset["smooth"] = patch.smooth ? "on" : "off";
   if (patch.timeCourseMode && patch.timeCourseMode !== before.timeCourseMode) showTimeCourseValues();
+  if (patch.timeMarker !== undefined || patch.timeMarkerSize || patch.timeMarkerColor) applyMarkerStyle();
   syncControls();
 }
 
@@ -1382,6 +1393,21 @@ function ensureDiffusion(uid: string): void {
     .finally(() => syncControls());
 }
 
+// How the voxel of the time course is drawn, as the settings say
+const MARKER_LENGTH = { small: 6, medium: 14, large: 30, full: 0 } as const;
+function markerStyle(): MarkerStyle {
+  return {
+    visible: settings.timeMarker,
+    length: MARKER_LENGTH[settings.timeMarkerSize],
+    color: MARKER_COLORS[settings.timeMarkerColor],
+  };
+}
+
+function applyMarkerStyle(): void {
+  const style = markerStyle();
+  for (const v of viewports) v.setMarkerStyle(style);
+}
+
 // The values as the settings want them: of the image, or as percent change from their mean
 function shownValues(raw: number[]): number[] {
   if (settings.timeCourseMode !== "percent" || raw.length === 0) return raw;
@@ -1414,6 +1440,8 @@ async function showTimeCourse(vp: Viewport, p: { x: number; y: number }, client:
     if (run !== timeRun) return;
     const t = volumeChange?.uid === s.uid ? volumeChange.wanted : (shownVolume.get(s.uid) ?? 0);
     timeRaw = values;
+    voxelMarker = { uid: s.uid, index: vp.index, col, row };
+    for (const v of viewports) v.setVoxelMarker(voxelMarker);
     timeCourse.show(s.uid, `Voxel (${col}, ${row}, ${vp.index + 1}) of ${s.description}`, shownValues(values), t, client, timeUnit());
   } catch (err) {
     if (run === timeRun) showError(err);
@@ -1608,6 +1636,99 @@ function toggleDsa(): void {
   void active.setDsa(!active.dsaOn);
 }
 
+// ---------- Context menu ----------
+// The menu of the right mouse button. Its items run the same handlers as the keys, and show
+// the key that is assigned to them.
+function openContextMenu(vp: Viewport, client: { x: number; y: number }): void {
+  if (modalOpen()) return;
+  activate(vp);
+  const hint = (id: string): string | undefined => {
+    const first = (bindings[id] ?? [])[0];
+    return first ? formatCombo(first) : undefined;
+  };
+  const labelOf = (id: string): string => ACTION_BY_ID.get(id)?.label ?? id;
+  const item = (id: string, label = labelOf(id), more: Partial<MenuItem> = {}): MenuItem => {
+    const run = handlers[id] as (() => void) | undefined;
+    return { label, hint: hint(id), ...(run ? { run } : { disabled: true }), ...more };
+  };
+  const toolItem = (id: ToolId, label: string): MenuItem => ({
+    label,
+    hint: hint(`tool.${id}`),
+    checked: tool === id,
+    run: () => handlers[`tool.${id}`]?.(),
+  });
+
+  const in4d = (vp.series?.volumes ?? 1) > 1 && !mpr;
+  const tools: MenuEntry[] = [
+    toolItem("window", "Window / Level"),
+    toolItem("pan", "Pan"),
+    toolItem("zoom", "Zoom"),
+    toolItem("scroll", "Scroll"),
+    "separator",
+    toolItem("length", "Length"),
+    toolItem("angle", "Angle"),
+    toolItem("ellipse", "Elliptical ROI"),
+    toolItem("rect", "Rectangular ROI"),
+    toolItem("aneurysm", "Aneurysm"),
+    toolItem("calibrate", "Calibrate length"),
+  ];
+  if (mpr) tools.push("separator", toolItem("cross", "Crosshair"), toolItem("rotate", "Rotate MPR planes"));
+  if (in4d) {
+    tools.push("separator", {
+      label: "Time course of a voxel",
+      checked: tool === "timecourse",
+      run: () => setTool("timecourse"),
+    });
+  }
+
+  const entries: MenuEntry[] = [
+    {
+      label: "Window presets",
+      children: PRESETS.map((p, i) => ({ label: p.name, hint: hint(`preset.${i + 1}`), run: () => applyPreset(i) })),
+    },
+    item("view.invert", "Invert", { checked: vp.invert }),
+    item("view.resetWindow", "Reset window"),
+    "separator",
+    {
+      label: "Zoom",
+      children: [item("view.fit", "Fit to window"), item("view.zoomIn", "Zoom in"), item("view.zoomOut", "Zoom out")],
+    },
+    {
+      label: "Orientation",
+      children: [
+        item("view.rotateCW"),
+        item("view.rotateCCW"),
+        item("view.flipH"),
+        item("view.flipV"),
+        item("view.resetOrientation"),
+        "separator",
+        item("view.orientMode", `Orientation: ${orientMode === "standard" ? "standard" : "as stored"} (switch)`),
+      ],
+    },
+    { label: "Tools", children: tools },
+    "separator",
+    item("measure.undo", "Delete last measurement"),
+    item("measure.clear", "Clear measurements on this image"),
+  ];
+
+  const extra: MenuEntry[] = [];
+  if (vp.count > 1 && !vp.isReformat) extra.push(item("cine.toggle", vp.playing ? "Pause cine" : "Play cine"));
+  if (in4d) {
+    extra.push(item("volume.prev", "Previous volume"), item("volume.next", "Next volume"));
+  }
+  if (extra.length > 0) entries.push("separator", ...extra);
+
+  entries.push(
+    "separator",
+    item("export.copy", "Copy image"),
+    item("export.save", "Save image…"),
+  );
+  if (host.canMaximize()) entries.push(item("layout.maximize", "Enlarge / restore this view"));
+  entries.push(item("ui.tags", "DICOM tags…"), item("ui.settings", "Settings…"));
+
+  showContextMenu(client.x, client.y, entries);
+}
+
 const handlers: Record<string, () => void> = {
   "slice.prev": () => active.goto(active.index - 1),
   "slice.next": () => active.goto(active.index + 1),
@@ -1799,6 +1920,7 @@ installMenu({
 mountIcons(); // must run before the first syncControls call swaps icons
 first.setActive(true);
 setTool("window");
+applyMarkerStyle();
 viewportsEl.dataset["smooth"] = settings.smooth ? "on" : "off";
 applySliderPos(sliderPos, false);
 applyLayout(layout, false);
