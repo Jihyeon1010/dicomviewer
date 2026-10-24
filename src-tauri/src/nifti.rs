@@ -6,16 +6,20 @@
 //! Patient coordinates here are LPS like those of DICOM (+x left, +y posterior, +z superior).
 //! NIfTI stores RAS, which differs in the sign of x and y.
 //!
-//! Only the first volume of a 4D file is read. Everything that follows from the header is
-//! plain arithmetic, so it can be tested without files.
+//! One volume is read at a time. Dimensions 4 to 7 of the file (time, and for example the six
+//! components of a tensor) follow each other in the file, so they are counted as one list of
+//! volumes. Everything that follows from the header is plain arithmetic, so it can be tested
+//! without files.
 
 use flate2::read::GzDecoder;
 use std::fs::File;
 use std::io::{BufReader, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Largest side of a volume that is accepted, against corrupt headers
 const MAX_SIDE: usize = 16_384;
+/// Most volumes of a 4D file that are accepted, against corrupt headers
+const MAX_VOLUMES: usize = 1_000_000;
 /// Voxels are held as 32-bit floats; same limit as for DICOM volumes
 const MAX_BYTES: usize = 4 * 1024 * 1024 * 1024;
 
@@ -26,9 +30,15 @@ pub type Mat34 = [[f64; 4]; 3];
 pub struct Header {
     pub version: u8, // 1 or 2
     pub big_endian: bool,
-    /// Voxels along x, y and z, and the number of volumes (1 when there is no 4th dimension)
+    /// Voxels along x, y and z, and the number of volumes (1 when there is no 4th dimension).
+    /// Dimensions 4 to 7 of the file are multiplied: the volumes follow each other in the file.
     pub dims: [usize; 3],
     pub volumes: usize,
+    /// The sizes of dimensions 4 and up, as the file has them (empty for a 3D file)
+    pub extra_dims: Vec<usize>,
+    /// What the data mean (NIfTI `intent_code`; 0 for nothing in particular) and the name
+    pub intent_code: i32,
+    pub intent_name: String,
     pub datatype: i16,
     pub pixdim: [f64; 8],
     pub vox_offset: u64,
@@ -101,11 +111,11 @@ pub fn parse_header(bytes: &[u8]) -> Result<Header, String> {
     let v2 = size == 540;
 
     // Field positions of the two versions
-    let (dim_at, datatype_at, pixdim_at, offset_at, slope_at, inter_at, descrip_at, qform_at, sform_at, quat_at, srow_at, units_at) =
+    let (dim_at, datatype_at, pixdim_at, offset_at, slope_at, inter_at, descrip_at, qform_at, sform_at, quat_at, srow_at, units_at, intent_at, intent_name_at) =
         if v2 {
-            (16, 12, 104, 168, 176, 184, 240, 344, 348, 352, 400, 500)
+            (16, 12, 104, 168, 176, 184, 240, 344, 348, 352, 400, 500, 504, 508)
         } else {
-            (40, 70, 76, 108, 112, 116, 148, 252, 254, 256, 280, 123)
+            (40, 70, 76, 108, 112, 116, 148, 252, 254, 256, 280, 123, 68, 328)
         };
 
     let magic = if v2 { r.text(4, 4) } else { r.text(344, 4) };
@@ -130,7 +140,20 @@ pub fn parse_header(bytes: &[u8]) -> Result<Header, String> {
             .ok_or_else(|| format!("Unreasonable image size: {n}"))
     };
     let dims = [size_of(dim(1)?)?, size_of(dim(2)?)?, size_of(dim(3)?)?];
-    let volumes = if ndim >= 4 { size_of(dim(4)?.max(1))? } else { 1 };
+    let mut extra_dims = Vec::new();
+    for n in 4..=ndim as usize {
+        extra_dims.push(size_of(dim(n)?.max(1))?);
+    }
+    let volumes = extra_dims
+        .iter()
+        .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+        .filter(|&v| v <= MAX_VOLUMES)
+        .ok_or("The image has too many volumes")?;
+    let (intent_code, intent_name) = if v2 {
+        (r.i32(intent_at)?, r.text(intent_name_at, 16))
+    } else {
+        (i32::from(r.i16(intent_at)?), r.text(intent_name_at, 16))
+    };
 
     let datatype = r.i16(datatype_at)?;
     let mut pixdim = [0.0; 8];
@@ -201,6 +224,9 @@ pub fn parse_header(bytes: &[u8]) -> Result<Header, String> {
         big_endian: big,
         dims,
         volumes,
+        extra_dims,
+        intent_code,
+        intent_name,
         datatype,
         pixdim,
         vox_offset,
@@ -521,6 +547,170 @@ pub fn read_voxels(path: &Path, h: &Header, volume: usize) -> Result<Vec<f32>, S
     r.read_exact(&mut bytes)
         .map_err(|e| format!("The file is shorter than its header says: {e}"))?;
     Ok(decode(&bytes, h))
+}
+
+// ---------- One voxel through all volumes ----------
+
+/// Index of the voxel in a volume of the file (x fastest) that shows at column `col`, row `row`
+/// of image `image` of the layout `p`
+pub fn file_voxel(dims: [usize; 3], p: &Placement, col: usize, row: usize, image: usize) -> Option<usize> {
+    let shown = [col, row, image];
+    if (0..3).any(|w| shown[w] >= p.dims[w]) {
+        return None;
+    }
+    let mut at = [0usize; 3];
+    for w in 0..3 {
+        let (axis, reversed) = p.axes[w];
+        at[axis] = if reversed { dims[axis] - 1 - shown[w] } else { shown[w] };
+    }
+    Some(at[0] + dims[0] * (at[1] + dims[1] * at[2]))
+}
+
+/// The value of one voxel in every volume, from the bytes that `read_raw` returned
+pub fn series_from_raw(h: &Header, raw: &[u8], voxel: usize) -> Result<Vec<f32>, String> {
+    let per = bytes_per_voxel(h.datatype)?;
+    let n = h.dims[0] * h.dims[1] * h.dims[2];
+    if voxel >= n {
+        return Err("The voxel is outside the volume".into());
+    }
+    let mut out = Vec::with_capacity(h.volumes);
+    for t in 0..h.volumes {
+        let at = (t * n + voxel) * per;
+        let bytes = raw.get(at..at + per).ok_or("The file is shorter than its header says")?;
+        out.extend(decode(bytes, h));
+    }
+    Ok(out)
+}
+
+/// The value of one voxel in every volume, read through the file once. Nothing is kept in
+/// memory but the values, so it also works for files that are too big for `read_raw`.
+pub fn read_series(path: &Path, h: &Header, voxel: usize) -> Result<Vec<f32>, String> {
+    let per = bytes_per_voxel(h.datatype)?;
+    let n = h.dims[0] * h.dims[1] * h.dims[2];
+    if voxel >= n {
+        return Err("The voxel is outside the volume".into());
+    }
+    let mut r = open(path)?;
+    // Skip the header, then for each volume the voxels before it and (afterwards) the rest
+    let mut skip = h.vox_offset + (voxel * per) as u64;
+    let mut out = Vec::with_capacity(h.volumes);
+    let mut buf = vec![0u8; per];
+    for _ in 0..h.volumes {
+        std::io::copy(&mut (&mut r).take(skip), &mut std::io::sink()).map_err(|e| e.to_string())?;
+        r.read_exact(&mut buf)
+            .map_err(|e| format!("The file is shorter than its header says: {e}"))?;
+        out.extend(decode(&buf, h));
+        skip = ((n - voxel - 1) * per + voxel * per) as u64;
+    }
+    Ok(out)
+}
+
+// ---------- Diffusion: b-values and gradient directions ----------
+
+/// What the `.bval` and `.bvec` files next to a diffusion image say, one entry per volume
+#[derive(Clone, Debug, PartialEq)]
+pub struct Diffusion {
+    pub bvals: Vec<f64>,
+    /// Gradient directions as unit vectors in patient coordinates (LPS); zero for volumes
+    /// without a gradient
+    pub dirs: Vec<[f64; 3]>,
+}
+
+/// The name of a file next to the image with another ending: `sub-01_dwi.nii.gz` has
+/// `sub-01_dwi.bval`
+pub fn sidecar(path: &Path, ext: &str) -> PathBuf {
+    let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    let lower = name.to_lowercase();
+    let cut = if lower.ends_with(".nii.gz") {
+        name.len() - 7
+    } else if lower.ends_with(".nii") {
+        name.len() - 4
+    } else {
+        name.len()
+    };
+    path.with_file_name(format!("{}.{ext}", &name[..cut]))
+}
+
+fn numbers(text: &str) -> Result<Vec<Vec<f64>>, String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(|l| {
+            l.split(|c: char| c.is_whitespace() || c == ',')
+                .filter(|w| !w.is_empty())
+                .map(|w| w.parse::<f64>().ok().filter(|v| v.is_finite()).ok_or_else(|| format!("{w:?} is not a number")))
+                .collect()
+        })
+        .collect()
+}
+
+/// A `.bval` file: the b-values on one line (or one per line)
+pub fn parse_bvals(text: &str) -> Result<Vec<f64>, String> {
+    Ok(numbers(text)?.into_iter().flatten().collect())
+}
+
+/// A `.bvec` file: three lines (x, y and z) with one number per volume, as FSL writes them.
+/// A file with one line of three numbers per volume is accepted too.
+pub fn parse_bvecs(text: &str) -> Result<Vec<[f64; 3]>, String> {
+    let rows = numbers(text)?;
+    if rows.len() == 3 && rows[0].len() == rows[1].len() && rows[0].len() == rows[2].len() {
+        return Ok((0..rows[0].len()).map(|i| [rows[0][i], rows[1][i], rows[2][i]]).collect());
+    }
+    rows.into_iter()
+        .map(|r| <[f64; 3]>::try_from(r).map_err(|_| "A .bvec file has three lines of numbers".to_string()))
+        .collect()
+}
+
+/// Turns the directions of a `.bvec` file into patient coordinates (LPS). FSL gives them along
+/// the voxel axes of the file, with the first one reversed when the file is stored the way
+/// that a left-handed (positive determinant) matrix says.
+pub fn bvecs_to_patient(bvecs: &[[f64; 3]], ras: &Mat34) -> Vec<[f64; 3]> {
+    let col = |a: usize| [ras[0][a], ras[1][a], ras[2][a]];
+    let (c0, c1, c2) = (col(0), col(1), col(2));
+    let det = c0[0] * (c1[1] * c2[2] - c1[2] * c2[1]) - c1[0] * (c0[1] * c2[2] - c0[2] * c2[1])
+        + c2[0] * (c0[1] * c1[2] - c0[2] * c1[1]);
+    let flip = if det > 0.0 { -1.0 } else { 1.0 };
+    let unit = |v: [f64; 3]| {
+        let n = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+        if n > 1e-9 { [v[0] / n, v[1] / n, v[2] / n] } else { [0.0; 3] }
+    };
+    let axes = [unit(c0), unit(c1), unit(c2)];
+    bvecs
+        .iter()
+        .map(|b| {
+            let b = [b[0] * flip, b[1], b[2]];
+            let mut ras_dir = [0.0; 3];
+            for (k, axis) in axes.iter().enumerate() {
+                for (o, a) in ras_dir.iter_mut().zip(axis) {
+                    *o += b[k] * a;
+                }
+            }
+            // RAS to LPS
+            unit([-ras_dir[0], -ras_dir[1], ras_dir[2]])
+        })
+        .collect()
+}
+
+/// The diffusion data of an image: None when there are no `.bval` and `.bvec` files next to it.
+/// An Err says why files that exist cannot be used (for example another number of volumes).
+pub fn read_diffusion(path: &Path, h: &Header) -> Option<Result<Diffusion, String>> {
+    let (bval_path, bvec_path) = (sidecar(path, "bval"), sidecar(path, "bvec"));
+    if !bval_path.is_file() || !bvec_path.is_file() {
+        return None;
+    }
+    Some((|| {
+        let bvals = parse_bvals(&std::fs::read_to_string(&bval_path).map_err(|e| e.to_string())?)?;
+        let bvecs = parse_bvecs(&std::fs::read_to_string(&bvec_path).map_err(|e| e.to_string())?)?;
+        if bvals.len() != h.volumes || bvecs.len() != h.volumes {
+            return Err(format!(
+                "The image has {} volumes, the .bval file {} values and the .bvec file {} directions",
+                h.volumes,
+                bvals.len(),
+                bvecs.len()
+            ));
+        }
+        Ok(Diffusion { bvals, dirs: bvecs_to_patient(&bvecs, &h.ras) })
+    })())
 }
 
 // ---------- A volume ready for the viewer ----------
@@ -943,6 +1133,127 @@ mod tests {
         let h = read_header(&path).unwrap();
         assert!(read_voxels(&path, &h, 0).is_ok());
         assert!(read_voxels(&path, &h, 3).unwrap_err().contains("shorter"));
+    }
+
+    #[test]
+    fn dimensions_beyond_the_fourth_count_as_volumes() {
+        // A tensor-like file: 2 x 2 x 1 voxels, 4 x 3 volumes, and an intent
+        let mut b = header_bytes(&spec([2, 2, 1, 4]));
+        b[40..42].copy_from_slice(&5i16.to_le_bytes());
+        b[50..52].copy_from_slice(&3i16.to_le_bytes());
+        b[68..70].copy_from_slice(&1005i16.to_le_bytes());
+        b[328..334].copy_from_slice(b"tensor");
+        let h = parse_header(&b).unwrap();
+        assert_eq!((h.volumes, h.extra_dims.clone()), (12, vec![4, 3]));
+        assert_eq!((h.intent_code, h.intent_name.as_str()), (1005, "tensor"));
+        // The plain cases keep their meaning
+        let h = parse_header(&header_bytes(&spec([2, 2, 1, 1]))).unwrap();
+        assert_eq!((h.volumes, h.extra_dims.len(), h.intent_code), (1, 0, 0));
+        // 5D with a single time point: the 6 components are the volumes
+        let mut b = header_bytes(&spec([2, 2, 1, 1]));
+        b[40..42].copy_from_slice(&5i16.to_le_bytes());
+        b[50..52].copy_from_slice(&6i16.to_le_bytes());
+        assert_eq!(parse_header(&b).unwrap().volumes, 6);
+        // NIfTI-2 keeps the intent at its own place
+        let mut s = spec([2, 2, 1, 1]);
+        s.v2 = true;
+        let mut b = header_bytes(&s);
+        b[504..508].copy_from_slice(&2003i32.to_le_bytes());
+        assert_eq!(parse_header(&b).unwrap().intent_code, 2003);
+    }
+
+    #[test]
+    fn one_voxel_through_all_volumes() {
+        // 3 x 2 x 2 voxels, 4 volumes: volume t holds 100 t + voxel number
+        let mut s = spec([3, 2, 2, 4]);
+        s.datatype = 4;
+        let voxels: Vec<i64> = (0..4).flat_map(|t| (0..12).map(move |v| 100 * t + v)).collect();
+        for (name, gz) in [("s.nii", false), ("s.nii.gz", true)] {
+            let path = write_file(name, &file_bytes(&s, &voxels), gz);
+            let h = read_header(&path).unwrap();
+            let raw = read_raw(&path, &h, 1 << 20).unwrap().unwrap();
+            for voxel in [0, 5, 11] {
+                let want: Vec<f32> = (0..4).map(|t| (100 * t + voxel) as f32).collect();
+                assert_eq!(read_series(&path, &h, voxel).unwrap(), want, "{name} voxel {voxel}");
+                assert_eq!(series_from_raw(&h, &raw, voxel).unwrap(), want);
+            }
+            assert!(read_series(&path, &h, 12).is_err());
+            assert!(series_from_raw(&h, &raw, 12).is_err());
+        }
+    }
+
+    #[test]
+    fn a_position_on_screen_is_found_in_the_file() {
+        // A file stored as LPS has its first and second axis reversed on the way to the screen
+        for code in ["RAS", "LPS", "ASR", "RPI"] {
+            let dims = [4usize, 3, 5];
+            let m = matrix_of(code, [1.0, 1.0, 1.0], [0.0, 0.0, 0.0]);
+            let p = place(dims, &m).unwrap();
+            let data: Vec<f32> = (0..60).map(|v| v as f32).collect();
+            let slices = reorient(&data, dims, &p);
+            for image in 0..p.dims[2] {
+                for row in 0..p.dims[1] {
+                    for col in 0..p.dims[0] {
+                        let v = file_voxel(dims, &p, col, row, image).unwrap();
+                        assert_eq!(data[v], slices[image][row * p.dims[0] + col], "{code} {col},{row},{image}");
+                    }
+                }
+            }
+            assert!(file_voxel(dims, &p, p.dims[0], 0, 0).is_none());
+        }
+    }
+
+    #[test]
+    fn b_values_and_directions_are_read() {
+        assert_eq!(parse_bvals("0 1000 1000\n").unwrap(), vec![0.0, 1000.0, 1000.0]);
+        assert_eq!(parse_bvals("0\n1000\n").unwrap(), vec![0.0, 1000.0]);
+        assert!(parse_bvals("0 x").is_err());
+        // FSL: three lines with a column per volume
+        let v = parse_bvecs("0 1 0\n0 0 1\n0 0 0\n").unwrap();
+        assert_eq!(v, vec![[0.0; 3], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]);
+        // One line per volume
+        let v = parse_bvecs("1 0 0\n0 1 0\n0 0 1\n0 0 0\n").unwrap();
+        assert_eq!(v.len(), 4);
+        assert!(parse_bvecs("1 0\n0 1\n").is_err());
+        assert_eq!(sidecar(Path::new("/a/sub-01_dwi.nii.gz"), "bval"), PathBuf::from("/a/sub-01_dwi.bval"));
+        assert_eq!(sidecar(Path::new("/a/dwi.NII"), "bvec"), PathBuf::from("/a/dwi.bvec"));
+    }
+
+    #[test]
+    fn directions_are_given_in_patient_coordinates_whatever_the_storage() {
+        // FSL's first axis points to the patient's left for a file stored RAS or LAS alike
+        let b = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0, 0.0]];
+        for code in ["RAS", "LAS"] {
+            let m = matrix_of(code, [2.0, 2.0, 2.0], [0.0; 3]);
+            let d = bvecs_to_patient(&b, &m);
+            assert_eq!(d[0], [1.0, 0.0, 0.0], "{code}: left is +x in LPS");
+            assert_eq!(d[3], [0.0; 3]);
+        }
+        // For LAS (nothing flipped) the second voxel axis is anterior: -y in LPS
+        let las = matrix_of("LAS", [2.0, 2.0, 2.0], [0.0; 3]);
+        assert_eq!(bvecs_to_patient(&b, &las)[1], [0.0, -1.0, 0.0]);
+        assert_eq!(bvecs_to_patient(&b, &las)[2], [0.0, 0.0, 1.0]);
+        // Directions come out as unit vectors
+        let d = bvecs_to_patient(&[[3.0, 4.0, 0.0]], &las)[0];
+        assert!((d.iter().map(|v| v * v).sum::<f64>() - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn diffusion_files_next_to_the_image_are_used_when_they_fit() {
+        let mut s = spec([2, 2, 1, 3]);
+        s.datatype = 4;
+        let path = write_file("dwi.nii.gz", &file_bytes(&s, &[0; 12]), true);
+        let h = read_header(&path).unwrap();
+        let dir = path.parent().unwrap();
+        assert!(read_diffusion(&path, &h).is_none());
+        std::fs::write(dir.join("dwi.bval"), "0 1000 1000\n").unwrap();
+        std::fs::write(dir.join("dwi.bvec"), "0 1 0\n0 0 1\n0 0 0\n").unwrap();
+        let d = read_diffusion(&path, &h).unwrap().unwrap();
+        assert_eq!(d.bvals, vec![0.0, 1000.0, 1000.0]);
+        assert_eq!(d.dirs.len(), 3);
+        // Another number of volumes is reported, not guessed at
+        std::fs::write(dir.join("dwi.bval"), "0 1000\n").unwrap();
+        assert!(read_diffusion(&path, &h).unwrap().unwrap_err().contains("3 volumes"));
     }
 
     #[test]

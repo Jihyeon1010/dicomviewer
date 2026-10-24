@@ -19,6 +19,8 @@ const ICONS = {
     '<circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3M11 8v6M8 11h6"/>',
   scroll: '<path d="M12 4v16M8 8l4-4 4 4M8 16l4 4 4-4"/>',
 
+  activity: '<path d="M22 12h-4l-3 9L9 3l-3 9H2"/>',
+
   // Measurement tools
   ruler:
     '<g transform="rotate(-45 12 12)"><rect x="1" y="8.5" width="22" height="7" rx="1.5"/>' +

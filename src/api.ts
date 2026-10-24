@@ -317,6 +317,22 @@ export function setNiftiVolume(uid: string, volume: number): Promise<void> {
   return invoke<void>("set_nifti_volume", { uid, volume });
 }
 
+/** The values of one voxel through all volumes of a 4D file. `col` and `row` are the pixel of image `index`. */
+export function getTimeSeries(uid: string, index: number, col: number, row: number): Promise<number[]> {
+  return invoke<number[]>("get_time_series", { uid, index, col, row });
+}
+
+/** What the .bval and .bvec files next to a diffusion image say, one entry per volume. */
+export interface DiffusionInfo {
+  bvals: number[];
+  dirs: [number, number, number][]; // unit vectors in patient coordinates (LPS)
+}
+
+/** Null when there are no .bval and .bvec files; rejects when they cannot be used. */
+export function getDiffusion(uid: string): Promise<DiffusionInfo | null> {
+  return invoke<DiffusionInfo | null>("get_diffusion", { uid });
+}
+
 // ---------- Python for plugins ----------
 
 export interface PythonReport {

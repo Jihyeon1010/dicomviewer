@@ -757,7 +757,7 @@ fn nifti_thumbnail(path: &PathBuf, frame: usize, max_px: usize) -> Result<tauri:
     Ok(thumb_response(ow, oh, 1, bytes))
 }
 
-fn nifti_tags(vol: &nifti::Loaded) -> Vec<TagEntry> {
+fn nifti_tags(vol: &nifti::Loaded, path: &PathBuf) -> Vec<TagEntry> {
     let h = &vol.header;
     let p = &vol.placement;
     let row = |name: &str, value: String| TagEntry {
@@ -769,7 +769,13 @@ fn nifti_tags(vol: &nifti::Loaded) -> Vec<TagEntry> {
     };
     let mut out = vec![
         row("Format", format!("NIfTI-{} ({})", h.version, if h.big_endian { "big-endian" } else { "little-endian" })),
-        row("Dimensions", format!("{} x {} x {} x {}", h.dims[0], h.dims[1], h.dims[2], h.volumes)),
+        row("Dimensions", {
+            let mut d = format!("{} x {} x {}", h.dims[0], h.dims[1], h.dims[2]);
+            for e in &h.extra_dims {
+                d += &format!(" x {e}");
+            }
+            d
+        }),
         row(
             "Shown",
             if h.volumes > 1 { format!("volume {} of {}", vol.volume + 1, h.volumes) } else { "the volume".into() },
@@ -789,10 +795,47 @@ fn nifti_tags(vol: &nifti::Loaded) -> Vec<TagEntry> {
         row("First voxel (LPS, mm)", format!("{:.2}, {:.2}, {:.2}", p.origin[0], p.origin[1], p.origin[2])),
         row("Values", format!("{} to {} (bulk {} to {})", vol.min, vol.max, vol.low, vol.high)),
     ];
+    if h.extra_dims.len() > 1 {
+        out.push(row(
+            "Volumes",
+            format!(
+                "dimensions 4 to {} of the file are shown one after the other: {} volumes",
+                h.extra_dims.len() + 3,
+                h.volumes
+            ),
+        ));
+    }
+    if h.intent_code != 0 || !h.intent_name.is_empty() {
+        out.push(row("Intent", format!("{} ({})", h.intent_code, h.intent_name)));
+    }
     if !h.description.is_empty() {
         out.push(row("Description", h.description.clone()));
     }
+    if let Some(d) = diffusion_rows(vol, path) {
+        out.extend(d);
+    }
     out
+}
+
+// The b-values and directions of a diffusion image, or why the files next to it are not used
+fn diffusion_rows(vol: &nifti::Loaded, path: &PathBuf) -> Option<Vec<TagEntry>> {
+    let row = |name: &str, value: String| TagEntry {
+        depth: 0,
+        tag: "nifti".into(),
+        name: name.into(),
+        vr: String::new(),
+        value,
+    };
+    Some(match nifti::read_diffusion(path, &vol.header)? {
+        Ok(d) => {
+            let mut shells: Vec<i64> = d.bvals.iter().map(|b| b.round() as i64).collect();
+            shells.sort_unstable();
+            shells.dedup();
+            let list = shells.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(", ");
+            vec![row("Diffusion", format!("{} volumes, b-values {list}", d.bvals.len()))]
+        }
+        Err(e) => vec![row("Diffusion", format!("not used: {e}"))],
+    })
 }
 
 fn slice_ref(state: &AppState, uid: &str, index: usize) -> Result<(PathBuf, u32), String> {
@@ -892,6 +935,47 @@ fn set_nifti_volume(uid: String, volume: u32, state: tauri::State<AppState>) -> 
     }
     state.volume_gen.fetch_add(1, Ordering::SeqCst);
     Ok(())
+}
+
+/// The values of one voxel through all volumes of a 4D NIfTI file. The position is that of the
+/// image on screen: the column and row of image `index` of the series.
+#[tauri::command(async)]
+fn get_time_series(uid: String, index: usize, col: usize, row: usize, state: tauri::State<AppState>) -> Result<Vec<f32>, String> {
+    let (path, _) = slice_ref(&state, &uid, index)?;
+    if !nifti::is_nifti(&path) {
+        return Err("This series is not a NIfTI file".into());
+    }
+    let header = nifti::read_header(&path)?;
+    let placement = nifti::place(header.dims, &header.ras)?;
+    let voxel = nifti::file_voxel(header.dims, &placement, col, row, index).ok_or("The position is outside the image")?;
+    // The unzipped bytes are used when a volume change has kept them
+    if let Some(raw) = nifti_raw(&state, &path) {
+        return nifti::series_from_raw(&raw.0, &raw.1, voxel);
+    }
+    nifti::read_series(&path, &header, voxel)
+}
+
+#[derive(Serialize)]
+struct DiffusionInfo {
+    bvals: Vec<f64>,
+    dirs: Vec<[f64; 3]>, // unit vectors in patient coordinates (LPS)
+}
+
+/// The b-values and gradient directions of a diffusion image, one per volume. None when no
+/// `.bval` and `.bvec` files lie next to it; an error says why they cannot be used.
+#[tauri::command(async)]
+fn get_diffusion(uid: String, state: tauri::State<AppState>) -> Result<Option<DiffusionInfo>, String> {
+    let slices = series_slices(&state, &uid);
+    let first = slices.first().ok_or("Series not found")?;
+    if !nifti::is_nifti(&first.path) {
+        return Ok(None);
+    }
+    let header = nifti::read_header(&first.path)?;
+    match nifti::read_diffusion(&first.path, &header) {
+        None => Ok(None),
+        Some(Ok(d)) => Ok(Some(DiffusionInfo { bvals: d.bvals, dirs: d.dirs })),
+        Some(Err(e)) => Err(e),
+    }
 }
 
 #[tauri::command(async)]
@@ -1748,7 +1832,7 @@ fn get_tags(
     let (path, _frame) = slice_ref(&state, &uid, index)?;
     if nifti::is_nifti(&path) {
         let vol = nifti_loaded(&state, &path)?;
-        return Ok(nifti_tags(&vol));
+        return Ok(nifti_tags(&vol, &path));
     }
     let obj = open_cached(&state, &path)?;
 
@@ -1807,7 +1891,9 @@ pub fn run() {
             get_surface_mesh,
             export_mesh,
             check_python,
-            set_nifti_volume
+            set_nifti_volume,
+            get_time_series,
+            get_diffusion
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -1917,7 +2003,7 @@ mod real_data {
         assert!(nifti_slice(&state, &path, 4).is_ok());
         assert!(nifti_slice(&state, &path, 5).is_err());
         let vol = nifti_loaded(&state, &path).unwrap();
-        assert!(nifti_tags(&vol).iter().any(|t| t.name == "Dimensions" && t.value.starts_with("4 x 3 x 5")));
+        assert!(nifti_tags(&vol, &path).iter().any(|t| t.name == "Dimensions" && t.value.starts_with("4 x 3 x 5")));
     }
 
     #[test]
@@ -1943,7 +2029,7 @@ mod real_data {
         assert_eq!(third.value_max, 1.0 + 3.0 + 20.0 + 400.0 + 2000.0);
         let meta = nifti_meta(&state, &path, 0).unwrap();
         assert!(meta.series_description.ends_with("volume 3/3"), "{}", meta.series_description);
-        assert!(nifti_tags(&nifti_loaded(&state, &path).unwrap()).iter().any(|t| t.name == "Shown" && t.value == "volume 3 of 3"));
+        assert!(nifti_tags(&nifti_loaded(&state, &path).unwrap(), &path).iter().any(|t| t.name == "Shown" && t.value == "volume 3 of 3"));
 
         // Wrong requests are refused and change nothing
         assert!(set_nifti_volume(uid.clone(), 3, state.clone()).is_err());

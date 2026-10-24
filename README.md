@@ -8,7 +8,7 @@ A local DICOM viewer for desktop, built with [Tauri 2](https://tauri.app) (Rust 
 
 ### Viewing
 - Open files or whole folders (also by drag and drop); a series list with thumbnails
-- **DICOM and NIfTI**: `.nii` and `.nii.gz` files (for example the BIDS folders of OpenNeuro) open like a series, a 4D file with a slider for its volumes, in the usual orientation of axial images, with the position from the header, so MPR, 3D, surfaces and exports work the same
+- **DICOM and NIfTI**: `.nii` and `.nii.gz` files (for example the BIDS folders of OpenNeuro) open like a series, a 4D file with a slider for its volumes (dimensions 5 to 7, such as tensor components, count as more volumes; `.bval` / `.bvec` files next to the image add the b-value and direction to the slider, and the time course tool plots one voxel through all volumes), in the usual orientation of axial images, with the position from the header, so MPR, 3D, surfaces and exports work the same
 - Window / level with presets, invert, pan, zoom, scroll, rotate and flip, orientation in the radiological convention or as stored
 - Overlays with patient and study data, orientation markers, scale bars, an anonymize switch, and a DICOM tag browser
 - Layouts up to 4 × 3 with linked scrolling and window / level

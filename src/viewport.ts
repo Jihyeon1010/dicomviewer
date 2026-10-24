@@ -40,7 +40,7 @@ import { Angio, positionerText, PROJECTION_MODES, type ProjectionMode, type Subt
 
 export type MeasureKind = "length" | "angle" | "ellipse" | "rect" | "aneurysm";
 export type ToolId =
-  | "window" | "pan" | "zoom" | "scroll" | "cross" | "rotate" | "maskshift" | "calibrate"
+  | "window" | "pan" | "zoom" | "scroll" | "cross" | "rotate" | "maskshift" | "calibrate" | "timecourse"
   | MeasureKind;
 type DragMode = "window" | "pan" | "zoom" | "scroll";
 
@@ -77,6 +77,7 @@ export interface ViewportHost {
   windowChanged(vp: Viewport): void; // the user changed window/level
   stateChanged(vp: Viewport): void;  // anything the toolbar shows
   pick(vp: Viewport, p: Pt): void;   // the crosshair tool was used at an image position
+  timecourse(vp: Viewport, p: Pt): void; // the time course tool was used at an image position
   orientMode(): OrientMode;
   // A view can fill the whole area while the others are hidden; a double click toggles that
   canMaximize(): boolean;
@@ -1704,6 +1705,12 @@ export class Viewport {
         return;
       }
 
+      if (tool === "timecourse" && e.button === 0 && !panOverride) {
+        this.host.timecourse(this, this.toImage(e.clientX - r.left, e.clientY - r.top));
+        e.preventDefault();
+        return;
+      }
+
       if (tool === "rotate" && e.button === 0 && !panOverride) {
         this.rotating = true;
         this.host.rotate(this, "down", e.clientX - r.left, e.clientY - r.top);
@@ -1727,7 +1734,8 @@ export class Viewport {
         tool === "cross" ||
         tool === "calibrate" ||
         tool === "rotate" ||
-        tool === "maskshift"
+        tool === "maskshift" ||
+        tool === "timecourse"
           ? "pan"
           : tool;
       this.drag = {
@@ -1824,7 +1832,8 @@ export class Viewport {
         tool !== "cross" &&
         tool !== "calibrate" &&
         tool !== "rotate" &&
-        tool !== "maskshift"
+        tool !== "maskshift" &&
+        tool !== "timecourse"
       ) {
         // With several views a double click enlarges this one (and restores the layout);
         // with a single view it fits the image

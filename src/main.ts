@@ -1,6 +1,10 @@
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { buildVolume, getThumbnail, openFiles, openFolder, savePng, setNiftiVolume } from "./api";
+import {
+  buildVolume, getDiffusion, getThumbnail, getTimeSeries, openFiles, openFolder, savePng, setNiftiVolume,
+  type DiffusionInfo,
+} from "./api";
+import { TimeCoursePanel } from "./timecourse";
 import { byId } from "./dom";
 import { compact, num } from "./format";
 import { mountIcons, setIcon, setLabel } from "./icons";
@@ -149,6 +153,13 @@ let seriesData: SeriesInfo[] = [];
 // while a change is under way.
 const shownVolume = new Map<string, number>();
 let volumeChange: { uid: string; wanted: number } | null = null;
+// b-values and gradient directions of diffusion images, by series; null when there are none
+const diffusion = new Map<string, DiffusionInfo | null>();
+const diffusionAsked = new Set<string>();
+const timeCourse = new TimeCoursePanel(byId("tc-panel", HTMLDivElement), (t) => {
+  if (timeCourse.uid) void chooseVolume(timeCourse.uid, t);
+});
+let timeRun = 0; // bumped for each time course asked for, so that a late answer is dropped
 let hasLoaded = false;
 let volume: { uid: string; info: VolumeInfo } | null = null;
 let volumeBusy: string | null = null; // uid of the series being built
@@ -304,6 +315,7 @@ const host: ViewportHost = {
     if (vp === active) syncControls();
   },
   pick: (vp, p) => mpr?.pick(vp, p),
+  timecourse: (vp, p) => void showTimeCourse(vp, p),
   canMaximize: () => maximized !== null || cellCount() > 1,
   toggleMaximize: (vp) => toggleMaximize(vp),
   orientMode: () => orientMode,
@@ -716,12 +728,19 @@ function syncControls(): void {
   view3dSel.hidden = !mip3d;
   const vs = active.series && active.series.volumes > 1 ? active.series : null;
   volWrap.hidden = !vs;
+  if (!vs) timeCourse.hide();
+  if (!vs && tool === "timecourse") setTool("window");
   if (vs) {
+    ensureDiffusion(vs.uid);
     const t = volumeChange?.uid === vs.uid ? volumeChange.wanted : (shownVolume.get(vs.uid) ?? 0);
     volSlider.max = String(vs.volumes);
     // Not while it is being dragged: the value must follow the hand, not the loading
     if (document.activeElement !== volSlider) volSlider.value = String(t + 1);
-    volLabel.textContent = `Volume ${t + 1} / ${vs.volumes}`;
+    const diff = diffusionText(vs.uid, t);
+    volLabel.textContent = `Volume ${t + 1} / ${vs.volumes}${diff}`;
+    volLabel.title = volLabel.textContent;
+    timeCourse.setCurrent(t);
+    if (timeCourse.uid !== null && timeCourse.uid !== vs.uid) timeCourse.hide();
     const locked = mpr !== null; // the MPR holds the volume that it was built from
     volSlider.disabled = locked;
     volPrevBtn.disabled = locked || t <= 0;
@@ -1289,6 +1308,52 @@ async function chooseVolume(uid: string, wanted: number): Promise<void> {
   } finally {
     volumeChange = null;
     syncControls();
+  }
+}
+
+// ---------- Diffusion and time course of a 4D file ----------
+
+// The b-value and direction of a volume, as text for the label; empty for other files
+function diffusionText(uid: string, volume: number): string {
+  const d = diffusion.get(uid);
+  const b = d?.bvals[volume];
+  const dir = d?.dirs[volume];
+  if (b === undefined || !dir) return "";
+  if (b < 50) return " · b0";
+  return ` · b=${Math.round(b)} · dir (${dir.map((v) => v.toFixed(2)).join(", ")})`;
+}
+
+// Looks for the .bval and .bvec files of a series once
+function ensureDiffusion(uid: string): void {
+  if (diffusionAsked.has(uid)) return;
+  diffusionAsked.add(uid);
+  getDiffusion(uid)
+    .then((d) => diffusion.set(uid, d))
+    .catch((err) => {
+      diffusion.set(uid, null);
+      flashStatus(`Diffusion files not used: ${err instanceof Error ? err.message : String(err)}`);
+    })
+    .finally(() => syncControls());
+}
+
+// Plots the voxel under the cursor through all volumes of the 4D file
+async function showTimeCourse(vp: Viewport, p: { x: number; y: number }): Promise<void> {
+  const s = vp.series;
+  if (!s || s.volumes < 2) return;
+  if (mpr) {
+    flashStatus("Close the MPR to plot a time course");
+    return;
+  }
+  const col = Math.floor(p.x);
+  const row = Math.floor(p.y);
+  const run = ++timeRun;
+  try {
+    const values = await getTimeSeries(s.uid, vp.index, col, row);
+    if (run !== timeRun) return;
+    const t = volumeChange?.uid === s.uid ? volumeChange.wanted : (shownVolume.get(s.uid) ?? 0);
+    timeCourse.show(s.uid, `Voxel (${col}, ${row}, ${vp.index + 1}) of ${s.description}`, values, t);
+  } catch (err) {
+    if (run === timeRun) showError(err);
   }
 }
 

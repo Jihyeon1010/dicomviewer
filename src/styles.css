@@ -886,3 +886,29 @@ button.danger { color: var(--danger); }
 @media (prefers-reduced-transparency: reduce) {
   #plugins-backdrop { backdrop-filter: none; -webkit-backdrop-filter: none; background: rgba(0, 0, 0, 0.85); }
 }
+/* ---------- Time course of a voxel ---------- */
+#viewports[data-tool="timecourse"] .vp { cursor: crosshair; }
+#tc-panel {
+  position: absolute;
+  right: 12px;
+  bottom: 44px;
+  z-index: 5;
+  width: 340px;
+  padding: 8px 10px 10px;
+  background: var(--panel);
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  box-shadow: 0 10px 34px rgba(0, 0, 0, 0.55);
+  font-size: 12px;
+  color: var(--text);
+}
+#tc-panel[hidden] { display: none; }
+#tc-panel .tc-head { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+#tc-panel .tc-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#tc-panel .tc-close { flex: none; background: transparent; border: 0; color: var(--muted); cursor: pointer; font-size: 16px; line-height: 1; }
+#tc-panel .tc-close:hover { color: var(--text); }
+#tc-panel svg { display: block; width: 100%; height: 150px; cursor: pointer; }
+#tc-panel .tc-line { fill: none; stroke: var(--accent); stroke-width: 1.5; }
+#tc-panel .tc-now { stroke: var(--text); stroke-width: 1; stroke-dasharray: 3 3; }
+#tc-panel .tc-axis { fill: var(--muted); font-size: 10px; font-variant-numeric: tabular-nums; }
+#tc-panel .tc-note { color: var(--muted); margin-top: 4px; font-variant-numeric: tabular-nums; }

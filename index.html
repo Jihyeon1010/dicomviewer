@@ -74,6 +74,7 @@
       <input id="vol-slider" type="range" min="1" max="1" value="1" aria-label="Volume" />
       <button id="vol-next" class="ib" aria-label="Next volume"><span class="ic" data-icon="chevron-right"></span></button>
       <span id="vol-label">Volume 1 / 1</span>
+      <button id="timecourse" class="tool ib" data-tool="timecourse" aria-label="Time course of a voxel" title="Time course: click a voxel to plot its value through all volumes"><span class="ic" data-icon="activity"></span></button>
     </div>
 
     <div class="group" id="cine-wrap" hidden>
@@ -208,6 +209,7 @@
     <main id="stage">
       <div id="viewports" data-tool="window"></div>
       <div id="status"></div>
+      <div id="tc-panel" hidden></div>
       <div id="slider-bar">
         <input type="range" id="slider" min="0" max="0" value="0" aria-label="Image" />
       </div>
