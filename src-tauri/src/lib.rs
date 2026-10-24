@@ -17,6 +17,8 @@ use std::{
 use walkdir::WalkDir;
 
 mod mpr;
+mod nifti;
+mod python_env;
 mod surface;
 
 type Vec3 = [f64; 3];
@@ -132,6 +134,8 @@ struct AppState {
     // Recently opened files with their size on disk, most recently used first
     files: Mutex<Vec<(PathBuf, Arc<DefaultDicomObject>, u64)>>,
     volume: Mutex<Option<Arc<Volume>>>,
+    // NIfTI volumes that were read, most recently used first. They are large, so few are kept.
+    nifti: Mutex<Vec<(PathBuf, Arc<nifti::Loaded>)>>,
     // Bumped whenever a volume build starts or the loaded files change, so a
     // build that finished too late can recognise that it is stale.
     volume_gen: AtomicU64,
@@ -558,6 +562,199 @@ fn open_cached(state: &AppState, path: &PathBuf) -> Result<Arc<DefaultDicomObjec
     Ok(obj)
 }
 
+// ---------- NIfTI ----------
+// A NIfTI file is one volume. It is shown as a series of axial images (see nifti.rs), each
+// with the position and orientation that a DICOM image would have, so that sorting, linked
+// scrolling, MPR, 3D and export treat it like any other series.
+
+const NIFTI_CACHE_MAX: usize = 3;
+
+fn nifti_loaded(state: &AppState, path: &PathBuf) -> Result<Arc<nifti::Loaded>, String> {
+    // Held while loading, like open_cached, so that concurrent commands read the file once
+    let mut cache = state.nifti.lock().unwrap();
+    if let Some(pos) = cache.iter().position(|(p, _)| p == path) {
+        let entry = cache.remove(pos);
+        let vol = Arc::clone(&entry.1);
+        cache.insert(0, entry);
+        return Ok(vol);
+    }
+    let vol = Arc::new(nifti::load(path)?);
+    cache.insert(0, (path.clone(), Arc::clone(&vol)));
+    cache.truncate(NIFTI_CACHE_MAX);
+    Ok(vol)
+}
+
+// The images of a NIfTI file for the series list; only the header is read
+fn read_nifti_header(path: PathBuf) -> Vec<(SliceInfo, String)> {
+    let Ok(h) = nifti::read_header(&path) else {
+        return Vec::new();
+    };
+    if !nifti::supported(h.datatype) {
+        return Vec::new();
+    }
+    let Ok(p) = nifti::place(h.dims, &h.ras) else {
+        return Vec::new();
+    };
+    let uid = format!("nifti:{}", path.display());
+    let mut description = nifti::stem(&path);
+    if h.volumes > 1 {
+        description.push_str(&format!(" ({} volumes, showing the first)", h.volumes));
+    }
+    (0..p.dims[2])
+        .map(|k| {
+            (
+                SliceInfo {
+                    path: path.clone(),
+                    series_uid: uid.clone(),
+                    instance_number: k as i32 + 1,
+                    frame: k as u32,
+                    ipp: Some(p.ipp(k)),
+                    iop: Some(p.iop()),
+                    frame_of_reference: uid.clone(),
+                },
+                description.clone(),
+            )
+        })
+        .collect()
+}
+
+// The window that a NIfTI image opens with: the bulk of the values
+fn nifti_window(vol: &nifti::Loaded) -> (f32, f32) {
+    let width = vol.high - vol.low;
+    if width > 0.0 {
+        ((vol.low + vol.high) / 2.0, width)
+    } else {
+        (f32::NAN, f32::NAN)
+    }
+}
+
+fn nifti_slice(state: &AppState, path: &PathBuf, frame: usize) -> Result<tauri::ipc::Response, String> {
+    let vol = nifti_loaded(state, path)?;
+    let slice = vol.slices.get(frame).ok_or("index out of range")?;
+    // Sent like the reformatted images: 16-bit values with a slope and an intercept
+    let enc = mpr::encoding_for(f64::from(vol.min), f64::from(vol.max));
+    let samples = mpr::encode(slice, &enc);
+    let (wc, ww) = nifti_window(&vol);
+    let header = SliceHeader {
+        rows: vol.placement.dims[1] as u32,
+        cols: vol.placement.dims[0] as u32,
+        bits: 16,
+        signed: false,
+        slope: enc.slope as f32,
+        intercept: enc.intercept as f32,
+        wc,
+        ww,
+        mono1: false,
+        samples: 1,
+    };
+    let mut out = Vec::with_capacity(40 + samples.len());
+    header.write(&mut out);
+    out.extend_from_slice(&samples);
+    Ok(tauri::ipc::Response::new(out))
+}
+
+fn nifti_meta(state: &AppState, path: &PathBuf, frame: usize) -> Result<SliceMeta, String> {
+    let vol = nifti_loaded(state, path)?;
+    let p = &vol.placement;
+    if frame >= p.dims[2] {
+        return Err("index out of range".into());
+    }
+    Ok(SliceMeta {
+        patient_name: String::new(),
+        patient_id: String::new(),
+        patient_sex: String::new(),
+        patient_age: String::new(),
+        patient_birth_date: String::new(),
+        institution: String::new(),
+        study_description: String::new(),
+        study_date: String::new(),
+        study_time: String::new(),
+        series_description: nifti::stem(path),
+        series_number: String::new(),
+        modality: nifti::modality(path),
+        manufacturer_model: String::new(),
+        slice_location: Some(p.ipp(frame)[2]),
+        slice_thickness: Some(p.spacing[2]),
+        kvp: None,
+        tube_current: None,
+        pixel_spacing: Some([p.spacing[1], p.spacing[0]]),
+        spacing_is_imager: false,
+        cine_fps: None,
+        frame_time_ms: None,
+        positioner_primary: None,
+        positioner_secondary: None,
+        intensity_relation: String::new(),
+        image_orientation: Some(p.iop()),
+        patient_orientation: String::new(),
+        frame: frame as u32,
+        frame_count: 1,
+    })
+}
+
+// A small grayscale picture of one image, windowed with the bulk of the values. The volume
+// is read directly and not kept: the cache belongs to the images that are on screen.
+fn nifti_thumbnail(path: &PathBuf, frame: usize, max_px: usize) -> Result<tauri::ipc::Response, String> {
+    let vol = nifti::load(path)?;
+    let slice = vol.slices.get(frame).ok_or("index out of range")?;
+    let (cols, rows) = (vol.placement.dims[0], vol.placement.dims[1]);
+    let (ow, oh) = fit_size(cols, rows, max_px);
+    let (lo, hi) = if vol.high > vol.low { (vol.low, vol.high) } else { (vol.min, vol.max) };
+    let width = f64::from(hi - lo).max(1e-6);
+    let mut bytes = Vec::with_capacity(ow * oh);
+    for oy in 0..oh {
+        let y0 = oy * rows / oh;
+        let y1 = ((oy + 1) * rows / oh).max(y0 + 1).min(rows);
+        for ox in 0..ow {
+            let x0 = ox * cols / ow;
+            let x1 = ((ox + 1) * cols / ow).max(x0 + 1).min(cols);
+            let mut sum = 0.0f64;
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    sum += f64::from(slice[y * cols + x]);
+                }
+            }
+            let mean = sum / ((y1 - y0) * (x1 - x0)) as f64;
+            bytes.push((((mean - f64::from(lo)) / width) * 255.0).clamp(0.0, 255.0) as u8);
+        }
+    }
+    Ok(thumb_response(ow, oh, 1, bytes))
+}
+
+fn nifti_tags(vol: &nifti::Loaded) -> Vec<TagEntry> {
+    let h = &vol.header;
+    let p = &vol.placement;
+    let row = |name: &str, value: String| TagEntry {
+        depth: 0,
+        tag: "nifti".into(),
+        name: name.into(),
+        vr: String::new(),
+        value,
+    };
+    let mut out = vec![
+        row("Format", format!("NIfTI-{} ({})", h.version, if h.big_endian { "big-endian" } else { "little-endian" })),
+        row("Dimensions", format!("{} x {} x {} x {}", h.dims[0], h.dims[1], h.dims[2], h.volumes)),
+        row("Shown", if h.volumes > 1 { "the first volume".into() } else { "the volume".into() }),
+        row("Data type", nifti::datatype_name(h.datatype).into()),
+        row("Voxel size (header, mm)", format!("{} x {} x {}", h.pixdim[1], h.pixdim[2], h.pixdim[3])),
+        row("Scaling", format!("value = {} * stored + {}", h.slope, h.inter)),
+        row("qform_code", h.qform_code.to_string()),
+        row("sform_code", h.sform_code.to_string()),
+        row("Axes of the file", nifti::orientation_code(&h.ras)),
+        row("Position known", if h.placed { "yes".into() } else { "no (the axes are a guess)".into() }),
+        row(
+            "Shown as",
+            format!("{} x {} x {} voxels, columns to the left, rows to posterior, images to superior", p.dims[0], p.dims[1], p.dims[2]),
+        ),
+        row("Voxel size shown (mm)", format!("{:.4} x {:.4} x {:.4}", p.spacing[0], p.spacing[1], p.spacing[2])),
+        row("First voxel (LPS, mm)", format!("{:.2}, {:.2}, {:.2}", p.origin[0], p.origin[1], p.origin[2])),
+        row("Values", format!("{} to {} (bulk {} to {})", vol.min, vol.max, vol.low, vol.high)),
+    ];
+    if !h.description.is_empty() {
+        out.push(row("Description", h.description.clone()));
+    }
+    out
+}
+
 fn slice_ref(state: &AppState, uid: &str, index: usize) -> Result<(PathBuf, u32), String> {
     let slices = series_slices(state, uid);
     let s = slices.get(index).ok_or("index out of range")?;
@@ -565,8 +762,16 @@ fn slice_ref(state: &AppState, uid: &str, index: usize) -> Result<(PathBuf, u32)
 }
 
 fn load_paths(paths: Vec<PathBuf>, state: &AppState) -> Vec<SeriesInfo> {
-    let parsed: Vec<(SliceInfo, String)> =
-        paths.into_par_iter().flat_map_iter(read_header).collect();
+    let parsed: Vec<(SliceInfo, String)> = paths
+        .into_par_iter()
+        .flat_map_iter(|p| {
+            if nifti::is_nifti(&p) {
+                read_nifti_header(p)
+            } else {
+                read_header(p)
+            }
+        })
+        .collect();
 
     let mut series: BTreeMap<String, (String, usize)> = BTreeMap::new();
     for (s, d) in &parsed {
@@ -584,6 +789,7 @@ fn load_paths(paths: Vec<PathBuf>, state: &AppState) -> Vec<SeriesInfo> {
         sorted.clear();
     }
     state.files.lock().unwrap().clear();
+    state.nifti.lock().unwrap().clear();
     // The old volume belongs to files that are no longer loaded
     *state.volume.lock().unwrap() = None;
     state.volume_gen.fetch_add(1, Ordering::SeqCst);
@@ -655,6 +861,9 @@ fn get_slice(
     state: tauri::State<AppState>,
 ) -> Result<tauri::ipc::Response, String> {
     let (path, frame) = slice_ref(&state, &uid, index)?;
+    if nifti::is_nifti(&path) {
+        return nifti_slice(&state, &path, frame as usize);
+    }
     let obj = open_cached(&state, &path)?;
     let px = obj
         .decode_pixel_data_frame(frame)
@@ -718,6 +927,9 @@ fn get_slice_meta(
     state: tauri::State<AppState>,
 ) -> Result<SliceMeta, String> {
     let (path, frame) = slice_ref(&state, &uid, index)?;
+    if nifti::is_nifti(&path) {
+        return nifti_meta(&state, &path, frame as usize);
+    }
     let obj = open_cached(&state, &path)?;
 
     // PixelSpacing is calibrated to the patient; ImagerPixelSpacing is measured at the
@@ -800,6 +1012,9 @@ fn get_thumbnail(
     let max_px = max_px.clamp(16, 512) as usize;
     let slices = series_slices(&state, &uid);
     let s = slices.get(slices.len() / 2).ok_or("Series not found")?;
+    if nifti::is_nifti(&s.path) {
+        return nifti_thumbnail(&s.path, s.frame as usize, max_px);
+    }
 
     // Opened directly instead of through open_cached: the shared cache holds the
     // files shown in the viewports and must not be evicted by background thumbnails.
@@ -952,23 +1167,36 @@ fn build_volume(uid: String, state: tauri::State<AppState>) -> Result<VolumeInfo
     }
     let gen = state.volume_gen.fetch_add(1, Ordering::SeqCst) + 1;
 
+    // A NIfTI series has its voxels in memory already
+    let nifti_vol = if nifti::is_nifti(&slices[0].path) {
+        Some(nifti_loaded(&state, &slices[0].path)?)
+    } else {
+        None
+    };
+
     // Image size and pixel spacing come from the first image's header
-    let head = OpenFileOptions::new()
-        .read_until(tags::PIXEL_DATA)
-        .open_file(&slices[0].path)
-        .map_err(|e| e.to_string())?;
-    let rows = head
-        .element(tags::ROWS)
-        .ok()
-        .and_then(|e| e.to_int::<u32>().ok())
-        .ok_or("Missing Rows")? as usize;
-    let cols = head
-        .element(tags::COLUMNS)
-        .ok()
-        .and_then(|e| e.to_int::<u32>().ok())
-        .ok_or("Missing Columns")? as usize;
-    let pixel_spacing = array_of::<2>(&head, tags::PIXEL_SPACING)
-        .or_else(|| array_of::<2>(&head, tags::IMAGER_PIXEL_SPACING));
+    let (rows, cols, pixel_spacing, head) = if let Some(n) = &nifti_vol {
+        let p = &n.placement;
+        (p.dims[1], p.dims[0], Some([p.spacing[1], p.spacing[0]]), None)
+    } else {
+        let head = OpenFileOptions::new()
+            .read_until(tags::PIXEL_DATA)
+            .open_file(&slices[0].path)
+            .map_err(|e| e.to_string())?;
+        let rows = head
+            .element(tags::ROWS)
+            .ok()
+            .and_then(|e| e.to_int::<u32>().ok())
+            .ok_or("Missing Rows")? as usize;
+        let cols = head
+            .element(tags::COLUMNS)
+            .ok()
+            .and_then(|e| e.to_int::<u32>().ok())
+            .ok_or("Missing Columns")? as usize;
+        let pixel_spacing = array_of::<2>(&head, tags::PIXEL_SPACING)
+            .or_else(|| array_of::<2>(&head, tags::IMAGER_PIXEL_SPACING));
+        (rows, cols, pixel_spacing, Some(head))
+    };
 
     let bytes = rows * cols * slices.len() * 4;
     if bytes > MAX_VOLUME_BYTES {
@@ -979,24 +1207,32 @@ fn build_volume(uid: String, state: tauri::State<AppState>) -> Result<VolumeInfo
         ));
     }
 
-    // Group frames by file so each file is opened once
-    let mut by_file: BTreeMap<PathBuf, Vec<(usize, u32)>> = BTreeMap::new();
-    for (i, s) in slices.iter().enumerate() {
-        by_file.entry(s.path.clone()).or_default().push((i, s.frame));
-    }
-    let groups: Vec<(PathBuf, Vec<(usize, u32)>)> = by_file.into_iter().collect();
-
-    let decoded = groups
-        .par_iter()
-        .map(|(path, items)| decode_group(path, items, rows, cols))
-        .collect::<Result<Vec<Vec<(usize, Vec<f32>)>>, String>>()?;
-
-    let mut data: Vec<Vec<f32>> = vec![Vec::new(); slices.len()];
-    for group in decoded {
-        for (i, buf) in group {
-            data[i] = buf;
+    let data: Vec<Vec<f32>> = if let Some(n) = &nifti_vol {
+        slices
+            .iter()
+            .map(|s| n.slices.get(s.frame as usize).cloned().ok_or("index out of range"))
+            .collect::<Result<_, _>>()?
+    } else {
+        // Group frames by file so each file is opened once
+        let mut by_file: BTreeMap<PathBuf, Vec<(usize, u32)>> = BTreeMap::new();
+        for (i, s) in slices.iter().enumerate() {
+            by_file.entry(s.path.clone()).or_default().push((i, s.frame));
         }
-    }
+        let groups: Vec<(PathBuf, Vec<(usize, u32)>)> = by_file.into_iter().collect();
+
+        let decoded = groups
+            .par_iter()
+            .map(|(path, items)| decode_group(path, items, rows, cols))
+            .collect::<Result<Vec<Vec<(usize, Vec<f32>)>>, String>>()?;
+
+        let mut data: Vec<Vec<f32>> = vec![Vec::new(); slices.len()];
+        for group in decoded {
+            for (i, buf) in group {
+                data[i] = buf;
+            }
+        }
+        data
+    };
 
     let (vmin, vmax) = data
         .par_iter()
@@ -1020,14 +1256,23 @@ fn build_volume(uid: String, state: tauri::State<AppState>) -> Result<VolumeInfo
     let ipps: Vec<Option<Vec3>> = slices.iter().map(|s| s.ipp).collect();
     let (z, z_real) = mpr::stack_positions(&ipps, normal, fallback_step);
 
-    let window = match (
-        first_f64(&head, tags::WINDOW_CENTER),
-        first_f64(&head, tags::WINDOW_WIDTH),
-    ) {
-        (Some(c), Some(w)) if w > 0.0 => Some((c as f32, w as f32)),
-        _ => None,
+    let (window, mono1) = match (&nifti_vol, &head) {
+        (Some(n), _) => {
+            let (wc, ww) = nifti_window(n);
+            (ww.is_finite().then_some((wc, ww)), false)
+        }
+        (None, Some(head)) => (
+            match (
+                first_f64(head, tags::WINDOW_CENTER),
+                first_f64(head, tags::WINDOW_WIDTH),
+            ) {
+                (Some(c), Some(w)) if w > 0.0 => Some((c as f32, w as f32)),
+                _ => None,
+            },
+            text_of(head, tags::PHOTOMETRIC_INTERPRETATION) == "MONOCHROME1",
+        ),
+        (None, None) => (None, false),
     };
-    let mono1 = text_of(&head, tags::PHOTOMETRIC_INTERPRETATION) == "MONOCHROME1";
 
     let (value_low, value_high) = mpr::percentiles(&data, vmin, vmax, 0.02, 0.98);
 
@@ -1351,6 +1596,15 @@ fn export_mesh(
     Ok(mesh.triangle_count() as u32)
 }
 
+// ---------- Python for plugins ----------
+
+// Looks for a usable Python and the packages a plugin needs. It starts programs and waits
+// for them for a few seconds, hence `async`.
+#[tauri::command(async)]
+fn check_python(configured: Option<String>, requires: Vec<String>) -> python_env::PythonReport {
+    python_env::check_python(configured.as_deref(), &requires)
+}
+
 // ---------- DICOM tag dump ----------
 
 const MAX_TAG_ENTRIES: usize = 5000;
@@ -1426,6 +1680,10 @@ fn get_tags(
     state: tauri::State<AppState>,
 ) -> Result<Vec<TagEntry>, String> {
     let (path, _frame) = slice_ref(&state, &uid, index)?;
+    if nifti::is_nifti(&path) {
+        let vol = nifti_loaded(&state, &path)?;
+        return Ok(nifti_tags(&vol));
+    }
     let obj = open_cached(&state, &path)?;
 
     let mut out = vec![TagEntry {
@@ -1481,7 +1739,8 @@ pub fn run() {
             get_oblique_slice,
             get_volume_texture,
             get_surface_mesh,
-            export_mesh
+            export_mesh,
+            check_python
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -1493,6 +1752,112 @@ pub fn run() {
 mod real_data {
     use super::*;
     use tauri::Manager;
+
+    // A small NIfTI-1 file (int16, 4 x 3 x 5 voxels of 2 x 2 x 3 mm) whose first axis points to
+    // the patient's right (RAS in x, as for most files). The value of a voxel is
+    // 1 + i + 10 j + 100 k.
+    fn small_nifti() -> PathBuf {
+        let mut b = vec![0u8; 352];
+        b[0..4].copy_from_slice(&348i32.to_le_bytes());
+        b[40..42].copy_from_slice(&3i16.to_le_bytes());
+        for (n, d) in [4i16, 3, 5].iter().enumerate() {
+            b[42 + 2 * n..44 + 2 * n].copy_from_slice(&d.to_le_bytes());
+        }
+        b[70..72].copy_from_slice(&4i16.to_le_bytes()); // int16
+        for (n, p) in [1.0f32, 2.0, 2.0, 3.0].iter().enumerate() {
+            b[76 + 4 * n..80 + 4 * n].copy_from_slice(&p.to_le_bytes());
+        }
+        b[108..112].copy_from_slice(&352.0f32.to_le_bytes());
+        b[112..116].copy_from_slice(&1.0f32.to_le_bytes());
+        b[123] = 2; // millimetres
+        b[254..256].copy_from_slice(&1i16.to_le_bytes()); // sform_code
+        let srow = [[2.0f32, 0.0, 0.0, -10.0], [0.0, 2.0, 0.0, -20.0], [0.0, 0.0, 3.0, -30.0]];
+        for (r, row) in srow.iter().enumerate() {
+            for (c, v) in row.iter().enumerate() {
+                b[280 + (r * 4 + c) * 4..284 + (r * 4 + c) * 4].copy_from_slice(&v.to_le_bytes());
+            }
+        }
+        b[344..348].copy_from_slice(b"n+1\0");
+        for k in 0..5i16 {
+            for j in 0..3i16 {
+                for i in 0..4i16 {
+                    b.extend_from_slice(&(1 + i + 10 * j + 100 * k).to_le_bytes());
+                }
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("nifti_app_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sub-01_T1w.nii");
+        std::fs::write(&path, b).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_nifti_file_becomes_a_series_with_positions() {
+        let path = small_nifti();
+        let app = tauri::test::mock_app();
+        app.manage(AppState::default());
+        let state = app.state::<AppState>();
+
+        let series = load_paths(collect_paths(vec![path.to_string_lossy().into_owned()]), &state);
+        assert_eq!(series.len(), 1);
+        assert_eq!((series[0].slice_count, series[0].description.as_str()), (5, "sub-01_T1w"));
+        assert!(series[0].uid.starts_with("nifti:"));
+
+        // The images are sorted from superior to inferior, like those of a DICOM series
+        let slices = series_slices(&state, &series[0].uid);
+        assert_eq!(slices.len(), 5);
+        let z: Vec<f64> = slices.iter().map(|s| s.ipp.unwrap()[2]).collect();
+        assert!(z.windows(2).all(|w| w[0] > w[1]), "{z:?}");
+        // z of the file is -30 + 3 k, so the first image shown is the top one (k = 4)
+        assert!((z[0] - (-30.0 + 12.0)).abs() < 1e-9 && (z[4] + 30.0).abs() < 1e-9);
+        // The file grows to the right (x) and to anterior (y); the images grow to the left and
+        // to posterior, so both axes are reversed. The first voxel shown is the file's voxel
+        // (i = 3, j = 2, k = 4): RAS (-4, -16, -18), which is LPS (4, 16, -18).
+        let ipp = slices[0].ipp.unwrap();
+        for (got, want) in ipp.iter().zip([4.0, 16.0, -18.0]) {
+            assert!((got - want).abs() < 1e-9, "{ipp:?}");
+        }
+
+        let info = build_volume(series[0].uid.clone(), state.clone()).unwrap();
+        assert_eq!((info.cols, info.rows, info.depth), (4, 3, 5));
+        assert_eq!(info.pixel_spacing, Some([2.0, 2.0]));
+        assert_eq!(info.z_positions.len(), 5);
+        assert!((info.slice_spacing.unwrap() - 3.0).abs() < 1e-9);
+        assert_eq!(info.origin, slices[0].ipp);
+
+        // Every voxel keeps its value. The image at the top of the stack is k = 4. Its first
+        // row is the file's last row (j = 2) and its first column the file's last column (i = 3).
+        let vol = volume_for(&state, &series[0].uid).unwrap();
+        let top = &vol.slices[0];
+        assert_eq!(top[0], 1.0 + 3.0 + 20.0 + 400.0); // i = 3, j = 2
+        assert_eq!(top[3], 1.0 + 0.0 + 20.0 + 400.0); // i = 0, j = 2
+        assert_eq!(top[11], 1.0 + 0.0 + 0.0 + 400.0); // i = 0, j = 0
+
+        // Metadata, thumbnail and tags work without a DICOM file
+        let meta = nifti_meta(&state, &path, 0).unwrap();
+        assert_eq!((meta.series_description.as_str(), meta.modality.as_str()), ("sub-01_T1w", "MR"));
+        assert_eq!(meta.pixel_spacing, Some([2.0, 2.0]));
+        assert!(meta.image_orientation.is_some());
+        assert!(nifti_thumbnail(&path, 0, 64).is_ok());
+        assert!(nifti_slice(&state, &path, 4).is_ok());
+        assert!(nifti_slice(&state, &path, 5).is_err());
+        let vol = nifti_loaded(&state, &path).unwrap();
+        assert!(nifti_tags(&vol).iter().any(|t| t.name == "Dimensions" && t.value.starts_with("4 x 3 x 5")));
+    }
+
+    #[test]
+    fn broken_and_unsupported_nifti_files_are_left_out() {
+        let dir = std::env::temp_dir().join(format!("nifti_app_bad_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("empty.nii"), b"").unwrap();
+        std::fs::write(dir.join("junk.nii.gz"), vec![7u8; 1000]).unwrap();
+        let app = tauri::test::mock_app();
+        app.manage(AppState::default());
+        let state = app.state::<AppState>();
+        let series = load_paths(collect_paths(vec![dir.to_string_lossy().into_owned()]), &state);
+        assert!(series.is_empty());
+    }
 
     #[test]
     #[ignore]

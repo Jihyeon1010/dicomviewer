@@ -510,7 +510,7 @@ function afterAssignment(): void {
 function refreshEmptyMessages(): void {
   for (const vp of viewports) {
     if (!hasLoaded) {
-      vp.setEmptyMessage("Drop DICOM files or a folder here", "or use Open folder / Open files above");
+      vp.setEmptyMessage("Drop DICOM or NIfTI files, or a folder, here", "or use Open folder / Open files above");
     } else if (seriesData.length === 0) {
       vp.setEmptyMessage("No DICOM files found", "Check that the selection contains DICOM data");
     } else {

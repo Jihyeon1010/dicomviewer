@@ -1079,6 +1079,7 @@ version = "0.1.0"
 dependencies = [
  "dicom",
  "dicom-pixeldata",
+ "flate2",
  "rayon",
  "serde",
  "serde_json",

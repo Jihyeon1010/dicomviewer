@@ -311,3 +311,21 @@ export async function savePng(path: string, png: Uint8Array): Promise<void> {
   payload.set(png, 4 + p.length);
   await invoke("save_png", payload);
 }
+
+// ---------- Python for plugins ----------
+
+export interface PythonReport {
+  status: "ok" | "not_found" | "too_old" | "missing_packages" | "package_check_failed";
+  python: {
+    version: [number, number, number];
+    executable: string;
+    command: { program: string; args: string[] };
+  } | null;
+  missing: string[]; // packages the plugin needs and Python does not have
+  tried: { command: string; outcome: string }[];
+  hint: string; // what to tell the user to do next
+}
+
+export function checkPython(configured: string | null, requires: string[]): Promise<PythonReport> {
+  return invoke<PythonReport>("check_python", { configured, requires });
+}
