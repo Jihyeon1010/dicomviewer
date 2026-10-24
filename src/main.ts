@@ -1,9 +1,10 @@
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import {
-  buildVolume, getDiffusion, getThumbnail, getTimeSeries, openFiles, openFolder, savePng, setNiftiVolume,
+  buildVolume, checkPython, getDiffusion, getThumbnail, getTimeSeries, openFiles, openFolder, savePng, setNiftiVolume,
   type DiffusionInfo,
 } from "./api";
+import { setPopover } from "./popover";
 import { TimeCoursePanel } from "./timecourse";
 import { byId } from "./dom";
 import { compact, num } from "./format";
@@ -25,7 +26,9 @@ import { createSettingsDialog } from "./settings-dialog";
 import {
   loadSettings,
   OVERLAY_MODES,
+  SCROLL_PX,
   saveSettings,
+  WHEEL_PX,
   type OverlayMode,
   type Settings,
   type SliderPosition,
@@ -55,7 +58,6 @@ const flipHBtn = byId("flip-h", HTMLButtonElement);
 const flipVBtn = byId("flip-v", HTMLButtonElement);
 const cineBtn = byId("cine", HTMLButtonElement);
 const infoBtn = byId("info", HTMLButtonElement);
-const markersBtn = byId("markers", HTMLButtonElement);
 const anonBtn = byId("anonymize", HTMLButtonElement);
 const tagsBtn = byId("tags-btn", HTMLButtonElement);
 const settingsBtn = byId("settings-open", HTMLButtonElement);
@@ -104,12 +106,14 @@ const surfDetailSel = byId("surf-detail", HTMLSelectElement);
 const surfUpdateBtn = byId("surf-update", HTMLButtonElement);
 const surfStlBtn = byId("surf-stl", HTMLButtonElement);
 const surfCoordsSel = byId("surf-coords", HTMLSelectElement);
+const surfWrap = byId("surf-wrap", HTMLDivElement);
+const surfSettingsBtn = byId("surf-settings", HTMLButtonElement);
+const surfPop = byId("surf-pop", HTMLDivElement);
 const slabModeSel = byId("slab-mode", HTMLSelectElement);
 const slabThickSel = byId("slab-thick", HTMLSelectElement);
 const slider = byId("slider", HTMLInputElement);
 const stageEl = byId("stage", HTMLElement);
 const sliderBar = byId("slider-bar", HTMLDivElement);
-const sliderPosBtn = byId("slider-pos", HTMLButtonElement);
 const layoutWrap = byId("layout-wrap", HTMLDivElement);
 const layoutBtn = byId("layout-btn", HTMLButtonElement);
 const layoutPop = byId("layout-pop", HTMLDivElement);
@@ -156,9 +160,10 @@ let volumeChange: { uid: string; wanted: number } | null = null;
 // b-values and gradient directions of diffusion images, by series; null when there are none
 const diffusion = new Map<string, DiffusionInfo | null>();
 const diffusionAsked = new Set<string>();
-const timeCourse = new TimeCoursePanel(byId("tc-panel", HTMLDivElement), (t) => {
+const timeCourse = new TimeCoursePanel(byId("tc-panel", HTMLDivElement), viewportsEl, (t) => {
   if (timeCourse.uid) void chooseVolume(timeCourse.uid, t);
 });
+let timeRaw: number[] = []; // the values of the voxel that the graph shows, as the file has them
 let timeRun = 0; // bumped for each time course asked for, so that a late answer is dropped
 let hasLoaded = false;
 let volume: { uid: string; info: VolumeInfo } | null = null;
@@ -268,8 +273,6 @@ function refreshTooltips(): void {
   setTip(flipVBtn, "Flip vertically", "view.flipV");
   setTip(cineBtn, "Play / pause cine", "cine.toggle");
   setTip(infoBtn, "Overlay detail: full / minimal / off", "ui.overlay");
-  setTip(markersBtn, "Orientation markers and scale bars", "ui.markers");
-  setTip(sliderPosBtn, "Move the image slider to the bottom or the right side", "ui.slider");
   setTip(anonBtn, "Hide patient identifiers on screen", "ui.anonymize");
   setTip(tagsBtn, "DICOM tags of the shown image", "ui.tags");
   pluginsBtn.title = "Plugins: import and run Python plugins";
@@ -307,6 +310,11 @@ function flashStatus(text: string): void {
 // ---------- Viewports ----------
 const host: ViewportHost = {
   tool: () => tool,
+  input: () => ({
+    wheelPx: WHEEL_PX[settings.wheelSensitivity],
+    wheelSign: settings.wheelReverse ? -1 : 1,
+    scrollPx: SCROLL_PX[settings.scrollSensitivity],
+  }),
   overlay: () => ({ mode: overlayMode, anonymize, markers: markersOn }),
   activate: (vp) => activate(vp),
   sliceChanged: (vp) => syncSlices(vp),
@@ -315,7 +323,7 @@ const host: ViewportHost = {
     if (vp === active) syncControls();
   },
   pick: (vp, p) => mpr?.pick(vp, p),
-  timecourse: (vp, p) => void showTimeCourse(vp, p),
+  timecourse: (vp, p, client) => void showTimeCourse(vp, p, client),
   canMaximize: () => maximized !== null || cellCount() > 1,
   toggleMaximize: (vp) => toggleMaximize(vp),
   orientMode: () => orientMode,
@@ -597,6 +605,31 @@ document.addEventListener("mousedown", (e: MouseEvent) => {
   closeLayoutPicker();
 });
 
+// ---------- Surface settings ----------
+function closeSurfacePop(): void {
+  setPopover(surfPop, false);
+  surfSettingsBtn.setAttribute("aria-expanded", "false");
+  setPressed(surfSettingsBtn, false);
+}
+
+surfSettingsBtn.addEventListener("click", () => {
+  const open = !surfPop.classList.contains("open");
+  if (!open) {
+    closeSurfacePop();
+    return;
+  }
+  setPopover(surfPop, true);
+  surfSettingsBtn.setAttribute("aria-expanded", "true");
+  setPressed(surfSettingsBtn, true);
+});
+
+// A click anywhere outside the settings closes them
+document.addEventListener("mousedown", (e: MouseEvent) => {
+  if (!surfPop.classList.contains("open")) return;
+  if (e.target instanceof Node && surfWrap.contains(e.target)) return;
+  closeSurfacePop();
+});
+
 // ---------- Calibration ----------
 let calTarget: { vp: Viewport; pixels: number } | null = null;
 
@@ -756,12 +789,8 @@ function syncControls(): void {
   vrPresetSel.hidden = !mip3d || view !== "vr";
   vrThickSel.hidden = !mip3d || (view !== "vr" && view !== "surface");
   const surface = mip3d && view === "surface";
-  for (const el of [
-    surfThrInput, surfMaxInput, surfPartSel, surfSmoothSel, surfDetailSel, surfUpdateBtn,
-    surfCoordsSel, surfStlBtn,
-  ]) {
-    el.hidden = !surface;
-  }
+  for (const el of [surfWrap, surfUpdateBtn, surfStlBtn]) el.hidden = !surface;
+  if (!surface) closeSurfacePop();
   if (mpr) {
     view3dSel.value = mpr.view;
     vrPresetSel.value = mpr.preset;
@@ -781,7 +810,6 @@ function syncControls(): void {
   setPressed(cineBtn, vp.playing);
   setPressed(flipHBtn, vp.orientation.flipH);
   setPressed(flipVBtn, vp.orientation.flipV);
-  setPressed(markersBtn, markersOn);
   setPressed(anonBtn, anonymize);
   setPressed(tileBtn, tile !== null);
   tileBtn.disabled = mpr !== null || (tile === null && cellCount() < 2);
@@ -790,7 +818,6 @@ function syncControls(): void {
   setLabel(layoutBtn, `${layout.cols} × ${layout.rows}`);
   setLabel(infoBtn, OVERLAY_LABEL[overlayMode]);
   setLabel(orientModeBtn, ORIENT_LABEL[orientMode]);
-  setIcon(sliderPosBtn, sliderPos === "bottom" ? "panel-bottom" : "panel-right");
 
   syncMenu();
 }
@@ -810,17 +837,36 @@ function applySliderPos(pos: SliderPosition, persist = true): void {
   syncControls();
 }
 
+// A setting was changed in the settings dialog: it is stored and takes effect at once
+function changeSetting(patch: Partial<Settings>): void {
+  const before = settings;
+  update(patch);
+  if (patch.overlay && patch.overlay !== before.overlay) {
+    overlayMode = patch.overlay;
+    refreshAllOverlays();
+  }
+  if (patch.orientMode && patch.orientMode !== before.orientMode) {
+    orientMode = patch.orientMode;
+    for (const vp of viewports) vp.refreshOrientMode();
+  }
+  if (patch.markers !== undefined && patch.markers !== before.markers) {
+    markersOn = patch.markers;
+    refreshAllOverlays();
+  }
+  if (patch.sliderPos && patch.sliderPos !== before.sliderPos) applySliderPos(patch.sliderPos, false);
+  if (patch.smooth !== undefined) viewportsEl.dataset["smooth"] = patch.smooth ? "on" : "off";
+  if (patch.timeCourseMode && patch.timeCourseMode !== before.timeCourseMode) showTimeCourseValues();
+  syncControls();
+}
+
 function toggleSliderPos(): void {
-  applySliderPos(sliderPos === "bottom" ? "right" : "bottom");
+  changeSetting({ sliderPos: sliderPos === "bottom" ? "right" : "bottom" });
 }
 
 new ResizeObserver(() => fitSlider()).observe(sliderBar);
 
 function setOverlay(mode: OverlayMode): void {
-  overlayMode = mode;
-  update({ overlay: mode });
-  syncControls();
-  refreshAllOverlays();
+  changeSetting({ overlay: mode });
 }
 
 function cycleOverlay(): void {
@@ -830,17 +876,11 @@ function cycleOverlay(): void {
 
 function toggleOrientMode(): void {
   const next = ORIENT_MODES[(ORIENT_MODES.indexOf(orientMode) + 1) % ORIENT_MODES.length];
-  orientMode = next ?? "standard";
-  update({ orientMode });
-  for (const vp of viewports) vp.refreshOrientMode();
-  syncControls();
+  changeSetting({ orientMode: next ?? "standard" });
 }
 
 function toggleMarkers(): void {
-  markersOn = !markersOn;
-  update({ markers: markersOn });
-  syncControls();
-  refreshAllOverlays();
+  changeSetting({ markers: !markersOn });
 }
 
 function toggleAnonymize(): void {
@@ -1110,7 +1150,7 @@ async function exportImage(copy: boolean): Promise<void> {
     }
     const name = `image-${String(active.index + 1).padStart(3, "0")}.png`;
     const path = await save({
-      defaultPath: name,
+      defaultPath: exportPath(name),
       filters: [{ name: "PNG image", extensions: ["png"] }],
     });
     if (typeof path !== "string") return;
@@ -1119,6 +1159,14 @@ async function exportImage(copy: boolean): Promise<void> {
   } catch (err) {
     showError(err);
   }
+}
+
+// Where a save window opens: the folder from the settings, when there is one
+function exportPath(name: string): string {
+  const dir = settings.exportDir;
+  if (dir === "") return name;
+  const sep = dir.includes("\\") && !dir.includes("/") ? "\\" : "/";
+  return dir.endsWith(sep) ? dir + name : dir + sep + name;
 }
 
 // ---------- Loading ----------
@@ -1184,9 +1232,7 @@ flipVBtn.addEventListener("click", () => active.flip("v"));
 orientModeBtn.addEventListener("click", toggleOrientMode);
 cineBtn.addEventListener("click", () => active.togglePlay());
 infoBtn.addEventListener("click", cycleOverlay);
-markersBtn.addEventListener("click", toggleMarkers);
 anonBtn.addEventListener("click", toggleAnonymize);
-sliderPosBtn.addEventListener("click", toggleSliderPos);
 tileBtn.addEventListener("click", toggleTile);
 syncScrollBtn.addEventListener("click", toggleSyncScroll);
 syncWindowBtn.addEventListener("click", toggleSyncWindow);
@@ -1246,7 +1292,7 @@ async function changeSurface(s: Parameters<Mpr["setSurface"]>[0]): Promise<void>
 async function exportSurfaceMesh(): Promise<void> {
   if (!mpr || mpr.view !== "surface") return;
   let path = await save({
-    defaultPath: "surface.stl",
+    defaultPath: exportPath("surface.stl"),
     filters: [
       { name: "STL mesh", extensions: ["stl"] },
       { name: "OBJ mesh", extensions: ["obj"] },
@@ -1336,8 +1382,24 @@ function ensureDiffusion(uid: string): void {
     .finally(() => syncControls());
 }
 
+// The values as the settings want them: of the image, or as percent change from their mean
+function shownValues(raw: number[]): number[] {
+  if (settings.timeCourseMode !== "percent" || raw.length === 0) return raw;
+  const mean = raw.reduce((a, b) => a + b, 0) / raw.length;
+  return mean === 0 ? raw : raw.map((v) => ((v - mean) / Math.abs(mean)) * 100);
+}
+
+function timeUnit(): string {
+  return settings.timeCourseMode === "percent" ? "% from the mean" : "";
+}
+
+// The graph that is shown is drawn again, for example after the setting changed
+function showTimeCourseValues(): void {
+  if (timeCourse.uid !== null) timeCourse.setValues(shownValues(timeRaw), timeUnit());
+}
+
 // Plots the voxel under the cursor through all volumes of the 4D file
-async function showTimeCourse(vp: Viewport, p: { x: number; y: number }): Promise<void> {
+async function showTimeCourse(vp: Viewport, p: { x: number; y: number }, client: { x: number; y: number }): Promise<void> {
   const s = vp.series;
   if (!s || s.volumes < 2) return;
   if (mpr) {
@@ -1351,7 +1413,8 @@ async function showTimeCourse(vp: Viewport, p: { x: number; y: number }): Promis
     const values = await getTimeSeries(s.uid, vp.index, col, row);
     if (run !== timeRun) return;
     const t = volumeChange?.uid === s.uid ? volumeChange.wanted : (shownVolume.get(s.uid) ?? 0);
-    timeCourse.show(s.uid, `Voxel (${col}, ${row}, ${vp.index + 1}) of ${s.description}`, values, t);
+    timeRaw = values;
+    timeCourse.show(s.uid, `Voxel (${col}, ${row}, ${vp.index + 1}) of ${s.description}`, shownValues(values), t, client, timeUnit());
   } catch (err) {
     if (run === timeRun) showError(err);
   }
@@ -1444,6 +1507,19 @@ void getCurrentWebview().onDragDropEvent(async (event) => {
 
 // ---------- Dialogs ----------
 const dialog = createSettingsDialog({
+  pickFolder: async () => {
+    const dir = await open({ directory: true, multiple: false, defaultPath: settings.exportDir || undefined });
+    return typeof dir === "string" ? dir : null;
+  },
+  getSettings: () => settings,
+  change: (patch) => changeSetting(patch),
+  checkPython: async (path) => {
+    const r = await checkPython(path === "" ? null : path, []);
+    const p = r.python;
+    return r.status === "ok" && p
+      ? `Python ${p.version.join(".")} found at ${p.executable}`
+      : r.hint;
+  },
   getBindings: () => bindings,
   onChange: (overrides) => {
     update({ keymap: overrides });
@@ -1653,6 +1729,12 @@ window.addEventListener("keydown", (e: KeyboardEvent) => {
   }
 
   if (e.key === "Escape") {
+    if (surfPop.classList.contains("open")) {
+      e.preventDefault();
+      closeSurfacePop();
+      surfSettingsBtn.focus();
+      return;
+    }
     if (!layoutPop.hidden) {
       e.preventDefault();
       closeLayoutPicker();
@@ -1717,6 +1799,7 @@ installMenu({
 mountIcons(); // must run before the first syncControls call swaps icons
 first.setActive(true);
 setTool("window");
+viewportsEl.dataset["smooth"] = settings.smooth ? "on" : "off";
 applySliderPos(sliderPos, false);
 applyLayout(layout, false);
 refreshEmptyMessages();

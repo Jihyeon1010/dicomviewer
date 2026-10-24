@@ -243,7 +243,7 @@ export async function installMenu(deps: MenuDeps): Promise<AppMenu> {
 
   const helpMenu = await Submenu.new({
     text: "Help",
-    items: [await key("Keyboard Shortcuts…", "ui.settings")],
+    items: [await key("Settings…", "ui.settings")],
   });
 
   const menu = await Menu.new({

@@ -69,15 +69,22 @@ export interface OverlayOptions {
 }
 
 // What a viewport needs from the application around it
+export interface InputOptions {
+  wheelPx: number;    // wheel units for one image
+  wheelSign: 1 | -1;  // -1 when the wheel direction is reversed
+  scrollPx: number;   // pixels of mouse movement for one image with the scroll tool
+}
+
 export interface ViewportHost {
   tool(): ToolId;
+  input(): InputOptions;
   overlay(): OverlayOptions;
   activate(vp: Viewport): void;
   sliceChanged(vp: Viewport): void;  // the user moved to another image
   windowChanged(vp: Viewport): void; // the user changed window/level
   stateChanged(vp: Viewport): void;  // anything the toolbar shows
   pick(vp: Viewport, p: Pt): void;   // the crosshair tool was used at an image position
-  timecourse(vp: Viewport, p: Pt): void; // the time course tool was used at an image position
+  timecourse(vp: Viewport, p: Pt, client: Pt): void; // the time course tool was used at an image position (and at this screen position)
   orientMode(): OrientMode;
   // A view can fill the whole area while the others are hidden; a double click toggles that
   canMaximize(): boolean;
@@ -1664,10 +1671,11 @@ export class Viewport {
           this.zoomAt(Math.exp(-e.deltaY * 0.01), e.clientX - r.left, e.clientY - r.top);
           return;
         }
-        this.wheelAcc += e.deltaY;
-        const steps = Math.trunc(this.wheelAcc / 40);
+        const { wheelPx, wheelSign } = this.host.input();
+        this.wheelAcc += e.deltaY * wheelSign;
+        const steps = Math.trunc(this.wheelAcc / wheelPx);
         if (steps !== 0) {
-          this.wheelAcc -= steps * 40;
+          this.wheelAcc -= steps * wheelPx;
           this.goto(this.index + steps);
         }
       },
@@ -1706,7 +1714,7 @@ export class Viewport {
       }
 
       if (tool === "timecourse" && e.button === 0 && !panOverride) {
-        this.host.timecourse(this, this.toImage(e.clientX - r.left, e.clientY - r.top));
+        this.host.timecourse(this, this.toImage(e.clientX - r.left, e.clientY - r.top), { x: e.clientX, y: e.clientY });
         e.preventDefault();
         return;
       }
@@ -1815,7 +1823,7 @@ export class Viewport {
           break;
         }
         case "scroll":
-          this.goto(d.index + Math.trunc(dy / 8)); // 8 px per image
+          this.goto(d.index + Math.trunc(dy / this.host.input().scrollPx));
           break;
       }
     });

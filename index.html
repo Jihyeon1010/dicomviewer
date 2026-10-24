@@ -86,8 +86,6 @@
 
     <div class="group end">
       <button id="info"><span class="ic" data-icon="info"></span><span class="lbl">Full</span></button>
-      <button id="markers" class="ib" aria-label="Markers and scale bars"><span class="ic" data-icon="crosshair"></span></button>
-      <button id="slider-pos" class="ib" aria-label="Image slider position"><span class="ic" data-icon="panel-bottom"></span></button>
       <button id="anonymize" class="ib" aria-label="Anonymize"><span class="ic" data-icon="eye-off"></span></button>
       <button id="tags-btn" class="ib" aria-label="DICOM tags"><span class="ic" data-icon="list"></span></button>
       <button id="plugins-open" class="ib" aria-label="Plugins"><span class="ic" data-icon="plug"></span></button>
@@ -149,31 +147,48 @@
           <option value="30">30 mm</option>
           <option value="15">15 mm</option>
         </select>
-        <input id="surf-thr" type="number" step="10" placeholder="Min" aria-label="Surface threshold" hidden />
-        <input id="surf-max" type="number" step="10" placeholder="Max" aria-label="Surface maximum" hidden />
-        <select id="surf-part" aria-label="Parts of the surface" hidden>
-          <option value="all">All parts</option>
-          <option value="largest" selected>Largest part</option>
-          <option value="at">Grow from crosshair</option>
-        </select>
-        <select id="surf-smooth" aria-label="Smoothing of the surface" hidden>
-          <option value="0">No smoothing</option>
-          <option value="10" selected>Light smoothing</option>
-          <option value="25">Medium smoothing</option>
-          <option value="50">Strong smoothing</option>
-        </select>
-        <select id="surf-detail" aria-label="Surface detail" hidden>
-          <option value="0" selected>Auto detail</option>
-          <option value="1">Fine</option>
-          <option value="2">Medium</option>
-          <option value="3">Coarse</option>
-        </select>
+        <div id="surf-wrap" class="pop-wrap" hidden>
+          <button id="surf-settings" aria-haspopup="true" aria-expanded="false"><span class="ic" data-icon="sliders"></span><span class="lbl">Surface</span></button>
+          <div id="surf-pop" class="pop" role="dialog" aria-label="Surface settings" hidden>
+            <label class="pop-row"><span>Lowest value</span>
+              <input id="surf-thr" type="number" step="10" placeholder="Min" aria-label="Surface threshold" />
+            </label>
+            <label class="pop-row"><span>Highest value</span>
+              <input id="surf-max" type="number" step="10" placeholder="Max" aria-label="Surface maximum" />
+            </label>
+            <label class="pop-row"><span>Parts</span>
+              <select id="surf-part" aria-label="Parts of the surface">
+                <option value="all">All parts</option>
+                <option value="largest" selected>Largest part</option>
+                <option value="at">Grow from crosshair</option>
+              </select>
+            </label>
+            <label class="pop-row"><span>Smoothing</span>
+              <select id="surf-smooth" aria-label="Smoothing of the surface">
+                <option value="0">No smoothing</option>
+                <option value="10" selected>Light smoothing</option>
+                <option value="25">Medium smoothing</option>
+                <option value="50">Strong smoothing</option>
+              </select>
+            </label>
+            <label class="pop-row"><span>Detail</span>
+              <select id="surf-detail" aria-label="Surface detail">
+                <option value="0" selected>Auto detail</option>
+                <option value="1">Fine</option>
+                <option value="2">Medium</option>
+                <option value="3">Coarse</option>
+              </select>
+            </label>
+            <label class="pop-row"><span>Export axes</span>
+              <select id="surf-coords" aria-label="Coordinates of the exported file">
+                <option value="lps" selected>LPS (DICOM)</option>
+                <option value="ras">RAS (Slicer)</option>
+                <option value="volume">Volume axes</option>
+              </select>
+            </label>
+          </div>
+        </div>
         <button id="surf-update" aria-label="Build the surface again" hidden><span class="lbl">Update</span></button>
-        <select id="surf-coords" aria-label="Coordinates of the exported file" hidden>
-          <option value="lps" selected>LPS (DICOM)</option>
-          <option value="ras">RAS (Slicer)</option>
-          <option value="volume">Volume axes</option>
-        </select>
         <button id="surf-stl" aria-label="Save the surface as a file" hidden><span class="lbl">Export</span></button>
       </div>
       <div class="group" id="angio-wrap" hidden>
@@ -222,13 +237,19 @@
         <h2 id="settings-title">Settings</h2>
         <button id="settings-close" type="button">Close</button>
       </div>
-      <div id="settings-body">
-        <div class="section-head">
-          <h3>Keyboard shortcuts</h3>
-          <button id="keys-reset-all" type="button">Reset all</button>
+      <div id="settings-layout">
+        <nav id="settings-nav" aria-label="Settings sections"></nav>
+        <div id="settings-body">
+          <div id="settings-page" class="settings-page"></div>
+          <div id="keys-page" class="settings-page" hidden>
+            <div class="section-head">
+              <h3>Keyboard shortcuts</h3>
+              <button id="keys-reset-all" type="button">Reset all</button>
+            </div>
+            <div id="keys-notice" role="status"></div>
+            <div id="keys-list"></div>
+          </div>
         </div>
-        <div id="keys-notice" role="status"></div>
-        <div id="keys-list"></div>
       </div>
     </div>
   </div>

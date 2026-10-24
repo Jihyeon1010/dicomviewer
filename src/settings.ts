@@ -7,6 +7,18 @@ export type SliderPosition = "bottom" | "right";
 export const SLIDER_POSITIONS: SliderPosition[] = ["bottom", "right"];
 export const OVERLAY_MODES: OverlayMode[] = ["full", "minimal", "off"];
 
+/** How far the wheel or the scroll tool has to move for one image: slow needs the most. */
+export type Sensitivity = "slow" | "normal" | "fast";
+export const SENSITIVITIES: Sensitivity[] = ["slow", "normal", "fast"];
+/** Wheel units (pixels of delta) per image */
+export const WHEEL_PX: Record<Sensitivity, number> = { slow: 80, normal: 40, fast: 20 };
+/** Pixels of mouse movement per image with the scroll tool */
+export const SCROLL_PX: Record<Sensitivity, number> = { slow: 16, normal: 8, fast: 4 };
+
+/** What the graph of a voxel through the volumes of a 4D file shows */
+export type TimeCourseMode = "raw" | "percent";
+export const TIME_COURSE_MODES: TimeCourseMode[] = ["raw", "percent"];
+
 export interface Settings {
   version: 1;
   overlay: OverlayMode;
@@ -17,12 +29,19 @@ export interface Settings {
   orientMode: OrientMode;
   syncScroll: boolean;
   syncWindow: boolean;
+  smooth: boolean; // images are drawn smoothed when enlarged, not as sharp pixels
+  wheelReverse: boolean;
+  wheelSensitivity: Sensitivity;
+  scrollSensitivity: Sensitivity;
+  timeCourseMode: TimeCourseMode;
+  pythonPath: string; // "" lets the app look for a Python
+  exportDir: string; // the folder where the save windows open; "" leaves it to the system
   keymap: Bindings; // overrides only: actions whose keys differ from the defaults
 }
 
 const STORAGE_KEY = "settings";
 
-function defaults(): Settings {
+export function defaultSettings(): Settings {
   return {
     version: 1,
     overlay: "full",
@@ -33,6 +52,13 @@ function defaults(): Settings {
     orientMode: "standard",
     syncScroll: true,
     syncWindow: false,
+    smooth: false,
+    wheelReverse: false,
+    wheelSensitivity: "normal",
+    scrollSensitivity: "normal",
+    timeCourseMode: "raw",
+    pythonPath: "",
+    exportDir: "",
     keymap: {},
   };
 }
@@ -66,6 +92,16 @@ function sanitize(p: unknown, base: Settings): Settings {
   if (typeof p["markers"] === "boolean") out.markers = p["markers"];
   if (typeof p["syncScroll"] === "boolean") out.syncScroll = p["syncScroll"];
   if (typeof p["syncWindow"] === "boolean") out.syncWindow = p["syncWindow"];
+  if (typeof p["smooth"] === "boolean") out.smooth = p["smooth"];
+  if (typeof p["wheelReverse"] === "boolean") out.wheelReverse = p["wheelReverse"];
+  const wheel = SENSITIVITIES.find((v) => v === p["wheelSensitivity"]);
+  if (wheel) out.wheelSensitivity = wheel;
+  const scroll = SENSITIVITIES.find((v) => v === p["scrollSensitivity"]);
+  if (scroll) out.scrollSensitivity = scroll;
+  const course = TIME_COURSE_MODES.find((v) => v === p["timeCourseMode"]);
+  if (course) out.timeCourseMode = course;
+  if (typeof p["exportDir"] === "string") out.exportDir = p["exportDir"].trim().slice(0, 1024);
+  if (typeof p["pythonPath"] === "string") out.pythonPath = p["pythonPath"].trim().slice(0, 1024);
 
   const km = p["keymap"];
   if (isRecord(km)) {
@@ -96,7 +132,7 @@ function migrateLegacy(base: Settings): Settings {
 }
 
 export function loadSettings(): Settings {
-  const base = defaults();
+  const base = defaultSettings();
   const raw = readItem(STORAGE_KEY);
   if (raw === null) return migrateLegacy(base);
   try {
