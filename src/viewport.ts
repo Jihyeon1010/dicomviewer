@@ -489,6 +489,12 @@ export class Viewport {
     void this.loadSlice();
   }
 
+  /** Loads the shown image again, for example after the volume of a 4D file was changed. */
+  reload(): Promise<void> {
+    sliceCache.cancel(this);
+    return this.loadSlice();
+  }
+
   /** Reference lines of other planes, drawn across the image. */
   setRefLines(lines: RefLine[]): void {
     this.refLines = lines;

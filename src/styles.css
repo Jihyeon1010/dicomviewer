@@ -434,7 +434,8 @@ body.dragging #viewports::after { border-color: var(--accent); }
   background: var(--panel);
   border-top: 1px solid var(--border);
 }
-#slider {
+#slider,
+#vol-slider {
   flex: 1;
   height: 16px;
   margin: 0;
@@ -443,12 +444,14 @@ body.dragging #viewports::after { border-color: var(--accent); }
   appearance: none;
   cursor: pointer;
 }
-#slider::-webkit-slider-runnable-track {
+#slider::-webkit-slider-runnable-track,
+#vol-slider::-webkit-slider-runnable-track {
   height: 3px;
   background: var(--border-strong);
   border-radius: 2px;
 }
-#slider::-webkit-slider-thumb {
+#slider::-webkit-slider-thumb,
+#vol-slider::-webkit-slider-thumb {
   -webkit-appearance: none;
   appearance: none;
   width: 14px;
@@ -460,9 +463,22 @@ body.dragging #viewports::after { border-color: var(--accent); }
   box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.35), 0 1px 4px rgba(0, 0, 0, 0.5);
   transition: transform 0.1s ease-out, background-color 0.12s;
 }
-#slider:hover::-webkit-slider-thumb { background: var(--accent); }
-#slider:active::-webkit-slider-thumb { transform: scale(1.15); background: var(--accent); }
-#slider:disabled { opacity: 0.4; cursor: default; }
+#slider:hover::-webkit-slider-thumb,
+#vol-slider:hover::-webkit-slider-thumb { background: var(--accent); }
+#slider:active::-webkit-slider-thumb,
+#vol-slider:active::-webkit-slider-thumb { transform: scale(1.15); background: var(--accent); }
+#slider:disabled,
+#vol-slider:disabled { opacity: 0.4; cursor: default; }
+
+/* The volume of a 4D file */
+#vol-slider { flex: none; width: 180px; margin: 0 4px; }
+#vol-label {
+  min-width: 108px;
+  padding: 0 8px 0 4px;
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+  white-space: nowrap;
+}
 
 #stage[data-slider="right"] { flex-direction: row; }
 #stage[data-slider="right"] #viewports { min-width: 0; }

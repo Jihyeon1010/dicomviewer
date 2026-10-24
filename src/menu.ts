@@ -228,6 +228,8 @@ export async function installMenu(deps: MenuDeps): Promise<AppMenu> {
       await key("Reset MPR Rotation", "mpr.resetRotation"),
       await key("3D View (MPR)", "mpr.mipView"),
       await key("Next 3D View Mode", "mpr.view3dCycle"),
+      await key("Previous Volume (4D File)", "volume.prev"),
+      await key("Next Volume (4D File)", "volume.next"),
       await key("DICOM Tags…", "ui.tags"),
       await std("Separator"),
       await std("Fullscreen"),

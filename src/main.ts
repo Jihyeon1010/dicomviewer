@@ -1,6 +1,6 @@
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { buildVolume, getThumbnail, openFiles, openFolder, savePng } from "./api";
+import { buildVolume, getThumbnail, openFiles, openFolder, savePng, setNiftiVolume } from "./api";
 import { byId } from "./dom";
 import { compact, num } from "./format";
 import { mountIcons, setIcon, setLabel } from "./icons";
@@ -85,6 +85,11 @@ const mipViewBtn = byId("mip-view", HTMLButtonElement);
 const resetRotBtn = byId("reset-rot", HTMLButtonElement);
 const view3dSel = byId("view3d", HTMLSelectElement);
 const planes3dBtn = byId("planes3d", HTMLButtonElement);
+const volWrap = byId("volume-wrap", HTMLDivElement);
+const volPrevBtn = byId("vol-prev", HTMLButtonElement);
+const volNextBtn = byId("vol-next", HTMLButtonElement);
+const volSlider = byId("vol-slider", HTMLInputElement);
+const volLabel = byId("vol-label", HTMLSpanElement);
 const vrPresetSel = byId("vr-preset", HTMLSelectElement);
 const vrThickSel = byId("vr-thick", HTMLSelectElement);
 const surfThrInput = byId("surf-thr", HTMLInputElement);
@@ -138,6 +143,12 @@ let syncWindow = settings.syncWindow;
 let tool: ToolId = "window";
 
 let seriesData: SeriesInfo[] = [];
+
+// ---------- Volumes of a 4D file ----------
+// Which volume of each 4D NIfTI file is shown (0 for the first), and the one asked for last
+// while a change is under way.
+const shownVolume = new Map<string, number>();
+let volumeChange: { uid: string; wanted: number } | null = null;
 let hasLoaded = false;
 let volume: { uid: string; info: VolumeInfo } | null = null;
 let volumeBusy: string | null = null; // uid of the series being built
@@ -703,6 +714,23 @@ function syncControls(): void {
   setPressed(mipViewBtn, mpr?.mipOn ?? false);
   const mip3d = mpr?.mipOn ?? false;
   view3dSel.hidden = !mip3d;
+  const vs = active.series && active.series.volumes > 1 ? active.series : null;
+  volWrap.hidden = !vs;
+  if (vs) {
+    const t = volumeChange?.uid === vs.uid ? volumeChange.wanted : (shownVolume.get(vs.uid) ?? 0);
+    volSlider.max = String(vs.volumes);
+    // Not while it is being dragged: the value must follow the hand, not the loading
+    if (document.activeElement !== volSlider) volSlider.value = String(t + 1);
+    volLabel.textContent = `Volume ${t + 1} / ${vs.volumes}`;
+    const locked = mpr !== null; // the MPR holds the volume that it was built from
+    volSlider.disabled = locked;
+    volPrevBtn.disabled = locked || t <= 0;
+    volNextBtn.disabled = locked || t >= vs.volumes - 1;
+    const why = locked ? "Close the MPR to change the volume" : "";
+    volSlider.title = why || "Volume of the 4D file";
+    volPrevBtn.title = why || "Previous volume (Shift+<)";
+    volNextBtn.title = why || "Next volume (Shift+>)";
+  }
   planes3dBtn.hidden = !mip3d;
   setPressed(planes3dBtn, mpr?.showPlanes ?? false);
   const view = mpr?.view;
@@ -1082,6 +1110,8 @@ async function showSeries(list: SeriesInfo[]): Promise<void> {
   thumbs.clear();
   sliceCache.clear(); // indices of the old files must not be served for the new ones
   seriesData = list;
+  shownVolume.clear();
+  volumeChange = null;
   hasLoaded = true;
   volume = null;
   for (const vp of viewports) void vp.setSeries(null);
@@ -1225,6 +1255,58 @@ vrPresetSel.addEventListener("change", () => {
   if (id) mpr?.setVrPreset(id.id);
   vrPresetSel.blur();
 });
+// Shows another volume of a 4D file. While one is being loaded the latest request waits and
+// replaces the ones before it, so that dragging the slider never queues up old volumes.
+async function chooseVolume(uid: string, wanted: number): Promise<void> {
+  const s = seriesData.find((x) => x.uid === uid);
+  if (!s || s.volumes < 2) return;
+  if (mpr) {
+    flashStatus("Close the MPR to change the volume");
+    return;
+  }
+  const target = Math.min(s.volumes - 1, Math.max(0, Math.round(wanted)));
+  if (volumeChange) {
+    volumeChange.wanted = target;
+    syncControls();
+    return;
+  }
+  volumeChange = { uid, wanted: target };
+  syncControls();
+  try {
+    for (;;) {
+      const t = volumeChange.wanted;
+      if (t === (shownVolume.get(uid) ?? 0)) break;
+      await setNiftiVolume(uid, t);
+      shownVolume.set(uid, t);
+      if (volume?.uid === uid) volume = null; // built from the previous volume
+      sliceCache.clear();
+      await Promise.all(viewports.filter((vp) => vp.series?.uid === uid).map((vp) => vp.reload()));
+      syncControls();
+      if (volumeChange.wanted === t) break;
+    }
+  } catch (err) {
+    showError(err);
+  } finally {
+    volumeChange = null;
+    syncControls();
+  }
+}
+
+function stepVolume(delta: number): void {
+  const s = active.series;
+  if (!s || s.volumes < 2) return;
+  const t = volumeChange?.uid === s.uid ? volumeChange.wanted : (shownVolume.get(s.uid) ?? 0);
+  void chooseVolume(s.uid, t + delta);
+}
+
+volSlider.addEventListener("input", () => {
+  const s = active.series;
+  if (s) void chooseVolume(s.uid, Number(volSlider.value) - 1);
+});
+volSlider.addEventListener("change", () => volSlider.blur());
+volPrevBtn.addEventListener("click", () => stepVolume(-1));
+volNextBtn.addEventListener("click", () => stepVolume(1));
+
 planes3dBtn.addEventListener("click", () => {
   if (!mpr) return;
   mpr.setShowPlanes(!mpr.showPlanes);
@@ -1439,6 +1521,8 @@ const handlers: Record<string, () => void> = {
   "volume.build": () => void runBuildVolume(),
   "mpr.toggle": () => void toggleMpr(),
   "mpr.resetRotation": () => mpr?.resetRotation(),
+  "volume.prev": () => stepVolume(-1),
+  "volume.next": () => stepVolume(1),
   "mpr.view3dCycle": () => {
     if (!mpr?.mipOn) {
       flashStatus("Turn on the 3D view first (Shift+V)");

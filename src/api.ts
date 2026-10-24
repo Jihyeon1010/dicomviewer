@@ -312,6 +312,11 @@ export async function savePng(path: string, png: Uint8Array): Promise<void> {
   await invoke("save_png", payload);
 }
 
+/** Chooses which volume of a 4D NIfTI file is shown; what was built from the old one is dropped. */
+export function setNiftiVolume(uid: string, volume: number): Promise<void> {
+  return invoke<void>("set_nifti_volume", { uid, volume });
+}
+
 // ---------- Python for plugins ----------
 
 export interface PythonReport {

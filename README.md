@@ -8,7 +8,7 @@ A local DICOM viewer for desktop, built with [Tauri 2](https://tauri.app) (Rust 
 
 ### Viewing
 - Open files or whole folders (also by drag and drop); a series list with thumbnails
-- **DICOM and NIfTI**: `.nii` and `.nii.gz` files (for example the BIDS folders of OpenNeuro) open like a series, in the usual orientation of axial images, with the position from the header, so MPR, 3D, surfaces and exports work the same
+- **DICOM and NIfTI**: `.nii` and `.nii.gz` files (for example the BIDS folders of OpenNeuro) open like a series, a 4D file with a slider for its volumes, in the usual orientation of axial images, with the position from the header, so MPR, 3D, surfaces and exports work the same
 - Window / level with presets, invert, pan, zoom, scroll, rotate and flip, orientation in the radiological convention or as stored
 - Overlays with patient and study data, orientation markers, scale bars, an anonymize switch, and a DICOM tag browser
 - Layouts up to 4 × 3 with linked scrolling and window / level
@@ -119,6 +119,7 @@ All shortcuts can be changed in **Settings** (`,` or `?`). Shortcuts refer to ph
 | Ping-pong | `Alt+P` |
 | Bookmark / next / previous bookmark | `Alt+K` / `Alt+.` / `Alt+,` |
 | Build volume | `V` |
+| Previous / next volume of a 4D NIfTI file | `Shift+,` / `Shift+.` |
 | MPR on or off | `Shift+M` |
 | Crosshair / rotate tool (MPR) | `K` / `Q` |
 | Reset MPR rotation / 3D view | `Shift+Q` / `Shift+V` |
@@ -133,7 +134,7 @@ All shortcuts can be changed in **Settings** (`,` or `?`). Shortcuts refer to ph
 ## Limitations
 
 - **Volumes** are limited to 4 GB of 32-bit values and need images of one size. Colour series cannot be built into a volume.
-- **NIfTI**: only the first volume of a 4D file is shown. Colour, complex and two-part (`.hdr` + `.img`) files are not supported. The axes are turned and reversed to the axial layout, but the voxels are not resampled. There is no patient information; the overlay shows the file name and the sizes. Files without a position matrix (the oldest style) have only a guessed orientation.
+- **NIfTI**: a 4D file shows one volume at a time (slider in the toolbar, `Shift+,` and `Shift+.`); the MPR has to be closed to change it, and there is no average or maximum over time yet. Colour, complex and two-part (`.hdr` + `.img`) files are not supported. The axes are turned and reversed to the axial layout, but the voxels are not resampled. There is no patient information; the overlay shows the file name and the sizes. Files without a position matrix (the oldest style) have only a guessed orientation.
 - **GPU rendering** needs WebGL2. The 3D projections fall back to the CPU when it is missing; volume rendering and surfaces need the GPU. Volumes larger than about 384 MB as half floats, or than the 3D texture limit of the GPU, are scaled down for the 3D view.
 - **Surfaces** are limited to 6 million triangles on screen and 30 million in a file; use a coarser detail or a higher threshold when the limit is reached.
 - The **CT presets** assume CT numbers in Hounsfield units. MR and X-ray presets are placed relative to the bulk of the values and may need another threshold for the surface.

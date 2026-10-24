@@ -69,6 +69,13 @@
       <button id="cine" class="ib" aria-label="Play or pause cine"><span class="ic" data-icon="play"></span></button>
     </div>
 
+    <div class="group" id="volume-wrap" hidden>
+      <button id="vol-prev" class="ib" aria-label="Previous volume"><span class="ic" data-icon="chevron-left"></span></button>
+      <input id="vol-slider" type="range" min="1" max="1" value="1" aria-label="Volume" />
+      <button id="vol-next" class="ib" aria-label="Next volume"><span class="ic" data-icon="chevron-right"></span></button>
+      <span id="vol-label">Volume 1 / 1</span>
+    </div>
+
     <div class="group" id="cine-wrap" hidden>
       <button id="loop-in" class="ib" aria-label="Loop start"><span class="ic" data-icon="mark-in"></span></button>
       <button id="loop-out" class="ib" aria-label="Loop end"><span class="ic" data-icon="mark-out"></span></button>

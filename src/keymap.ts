@@ -98,6 +98,8 @@ export const ACTIONS: ActionDef[] = [
   { id: "mpr.toggle", label: "Multiplanar view (MPR)", group: "Volume", defaults: ["Shift+KeyM"] },
   { id: "mpr.resetRotation", label: "Reset MPR rotation", group: "Volume", defaults: ["Shift+KeyQ"] },
   { id: "mpr.mipView", label: "3D view (MPR)", group: "Volume", defaults: ["Shift+KeyV"] },
+  { id: "volume.prev", label: "Previous volume (4D file)", group: "Volume", defaults: ["Shift+Comma"], repeat: true },
+  { id: "volume.next", label: "Next volume (4D file)", group: "Volume", defaults: ["Shift+Period"], repeat: true },
   { id: "mpr.view3dCycle", label: "3D view: MIP / MinIP / Average / Volume", group: "Volume", defaults: ["Alt+KeyV"] },
 
   ...LAYOUT_PRESETS.map((l, i): ActionDef => ({

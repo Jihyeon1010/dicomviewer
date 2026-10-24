@@ -43,6 +43,7 @@ struct SliceInfo {
     ipp: Option<[f64; 3]>,     // ImagePositionPatient
     iop: Option<[f64; 6]>,     // ImageOrientationPatient
     frame_of_reference: String,
+    volumes: u32,              // volumes of a 4D NIfTI file; 1 for everything else
 }
 
 #[derive(Serialize)]
@@ -50,6 +51,7 @@ struct SeriesInfo {
     uid: String,
     description: String,
     slice_count: usize,
+    volumes: u32, // more than 1 for a 4D NIfTI file: one of them is shown at a time
 }
 
 // Where the images of a series sit in patient space; used to link viewports
@@ -135,7 +137,12 @@ struct AppState {
     files: Mutex<Vec<(PathBuf, Arc<DefaultDicomObject>, u64)>>,
     volume: Mutex<Option<Arc<Volume>>>,
     // NIfTI volumes that were read, most recently used first. They are large, so few are kept.
-    nifti: Mutex<Vec<(PathBuf, Arc<nifti::Loaded>)>>,
+    nifti: Mutex<Vec<(PathBuf, usize, Arc<nifti::Loaded>)>>,
+    // Which volume of a 4D NIfTI file is shown (0 when it is not in the map)
+    nifti_volume: Mutex<HashMap<PathBuf, usize>>,
+    // The unzipped voxels of the 4D file that is being looked through: its volumes can then be
+    // switched quickly. One file at a time, and only when it is not huge.
+    nifti_raw: Mutex<Option<(PathBuf, Arc<(nifti::Header, Vec<u8>)>)>>,
     // Bumped whenever a volume build starts or the loaded files change, so a
     // build that finished too late can recognise that it is stale.
     volume_gen: AtomicU64,
@@ -530,6 +537,7 @@ fn read_header(path: PathBuf) -> Vec<(SliceInfo, String)> {
                     ipp,
                     iop,
                     frame_of_reference: frame_of_reference.clone(),
+                    volumes: 1,
                 },
                 desc.clone(),
             )
@@ -568,18 +576,45 @@ fn open_cached(state: &AppState, path: &PathBuf) -> Result<Arc<DefaultDicomObjec
 // scrolling, MPR, 3D and export treat it like any other series.
 
 const NIFTI_CACHE_MAX: usize = 3;
+const NIFTI_RAW_MAX_BYTES: usize = 768 * 1024 * 1024;
 
+// The unzipped bytes of a 4D file, kept for the next switch of volume
+fn nifti_raw(state: &AppState, path: &PathBuf) -> Option<Arc<(nifti::Header, Vec<u8>)>> {
+    let mut slot = state.nifti_raw.lock().unwrap();
+    if let Some((p, raw)) = slot.as_ref() {
+        if p == path {
+            return Some(Arc::clone(raw));
+        }
+    }
+    let header = nifti::read_header(path).ok()?;
+    if header.volumes < 2 {
+        return None;
+    }
+    let bytes = nifti::read_raw(path, &header, NIFTI_RAW_MAX_BYTES).ok()??;
+    let raw = Arc::new((header, bytes));
+    *slot = Some((path.clone(), Arc::clone(&raw)));
+    Some(raw)
+}
+
+// The volume of a NIfTI file that is shown (the first one unless another was chosen)
 fn nifti_loaded(state: &AppState, path: &PathBuf) -> Result<Arc<nifti::Loaded>, String> {
+    let volume = state.nifti_volume.lock().unwrap().get(path).copied().unwrap_or(0);
     // Held while loading, like open_cached, so that concurrent commands read the file once
     let mut cache = state.nifti.lock().unwrap();
-    if let Some(pos) = cache.iter().position(|(p, _)| p == path) {
+    if let Some(pos) = cache.iter().position(|(p, v, _)| p == path && *v == volume) {
         let entry = cache.remove(pos);
-        let vol = Arc::clone(&entry.1);
+        let vol = Arc::clone(&entry.2);
         cache.insert(0, entry);
         return Ok(vol);
     }
-    let vol = Arc::new(nifti::load(path)?);
-    cache.insert(0, (path.clone(), Arc::clone(&vol)));
+    // The first volume is read directly; looking at a later one means a 4D file is being
+    // looked through, which is quicker from bytes that were unzipped once
+    let loaded = match (volume > 0).then(|| nifti_raw(state, path)).flatten() {
+        Some(raw) => nifti::load_from_raw(&raw.0, &raw.1, volume)?,
+        None => nifti::load(path, volume)?,
+    };
+    let vol = Arc::new(loaded);
+    cache.insert(0, (path.clone(), volume, Arc::clone(&vol)));
     cache.truncate(NIFTI_CACHE_MAX);
     Ok(vol)
 }
@@ -596,10 +631,7 @@ fn read_nifti_header(path: PathBuf) -> Vec<(SliceInfo, String)> {
         return Vec::new();
     };
     let uid = format!("nifti:{}", path.display());
-    let mut description = nifti::stem(&path);
-    if h.volumes > 1 {
-        description.push_str(&format!(" ({} volumes, showing the first)", h.volumes));
-    }
+    let description = nifti::stem(&path);
     (0..p.dims[2])
         .map(|k| {
             (
@@ -611,6 +643,7 @@ fn read_nifti_header(path: PathBuf) -> Vec<(SliceInfo, String)> {
                     ipp: Some(p.ipp(k)),
                     iop: Some(p.iop()),
                     frame_of_reference: uid.clone(),
+                    volumes: h.volumes as u32,
                 },
                 description.clone(),
             )
@@ -669,7 +702,11 @@ fn nifti_meta(state: &AppState, path: &PathBuf, frame: usize) -> Result<SliceMet
         study_description: String::new(),
         study_date: String::new(),
         study_time: String::new(),
-        series_description: nifti::stem(path),
+        series_description: if vol.header.volumes > 1 {
+            format!("{} · volume {}/{}", nifti::stem(path), vol.volume + 1, vol.header.volumes)
+        } else {
+            nifti::stem(path)
+        },
         series_number: String::new(),
         modality: nifti::modality(path),
         manufacturer_model: String::new(),
@@ -694,7 +731,7 @@ fn nifti_meta(state: &AppState, path: &PathBuf, frame: usize) -> Result<SliceMet
 // A small grayscale picture of one image, windowed with the bulk of the values. The volume
 // is read directly and not kept: the cache belongs to the images that are on screen.
 fn nifti_thumbnail(path: &PathBuf, frame: usize, max_px: usize) -> Result<tauri::ipc::Response, String> {
-    let vol = nifti::load(path)?;
+    let vol = nifti::load(path, 0)?;
     let slice = vol.slices.get(frame).ok_or("index out of range")?;
     let (cols, rows) = (vol.placement.dims[0], vol.placement.dims[1]);
     let (ow, oh) = fit_size(cols, rows, max_px);
@@ -733,7 +770,10 @@ fn nifti_tags(vol: &nifti::Loaded) -> Vec<TagEntry> {
     let mut out = vec![
         row("Format", format!("NIfTI-{} ({})", h.version, if h.big_endian { "big-endian" } else { "little-endian" })),
         row("Dimensions", format!("{} x {} x {} x {}", h.dims[0], h.dims[1], h.dims[2], h.volumes)),
-        row("Shown", if h.volumes > 1 { "the first volume".into() } else { "the volume".into() }),
+        row(
+            "Shown",
+            if h.volumes > 1 { format!("volume {} of {}", vol.volume + 1, h.volumes) } else { "the volume".into() },
+        ),
         row("Data type", nifti::datatype_name(h.datatype).into()),
         row("Voxel size (header, mm)", format!("{} x {} x {}", h.pixdim[1], h.pixdim[2], h.pixdim[3])),
         row("Scaling", format!("value = {} * stored + {}", h.slope, h.inter)),
@@ -773,11 +813,11 @@ fn load_paths(paths: Vec<PathBuf>, state: &AppState) -> Vec<SeriesInfo> {
         })
         .collect();
 
-    let mut series: BTreeMap<String, (String, usize)> = BTreeMap::new();
+    let mut series: BTreeMap<String, (String, usize, u32)> = BTreeMap::new();
     for (s, d) in &parsed {
         let e = series
             .entry(s.series_uid.clone())
-            .or_insert((d.clone(), 0));
+            .or_insert((d.clone(), 0, s.volumes));
         e.1 += 1;
     }
 
@@ -790,16 +830,19 @@ fn load_paths(paths: Vec<PathBuf>, state: &AppState) -> Vec<SeriesInfo> {
     }
     state.files.lock().unwrap().clear();
     state.nifti.lock().unwrap().clear();
+    state.nifti_volume.lock().unwrap().clear();
+    *state.nifti_raw.lock().unwrap() = None;
     // The old volume belongs to files that are no longer loaded
     *state.volume.lock().unwrap() = None;
     state.volume_gen.fetch_add(1, Ordering::SeqCst);
 
     series
         .into_iter()
-        .map(|(uid, (description, slice_count))| SeriesInfo {
+        .map(|(uid, (description, slice_count, volumes))| SeriesInfo {
             uid,
             description,
             slice_count,
+            volumes,
         })
         .collect()
 }
@@ -826,6 +869,29 @@ fn open_folder(dir: String, state: tauri::State<AppState>) -> Vec<SeriesInfo> {
 #[tauri::command(async)]
 fn open_files(files: Vec<String>, state: tauri::State<AppState>) -> Vec<SeriesInfo> {
     load_paths(collect_paths(files), &state)
+}
+
+// Chooses which volume of a 4D NIfTI file is shown. The volume that was built from the
+// previous choice is dropped; the caller reloads what it shows.
+#[tauri::command(async)]
+fn set_nifti_volume(uid: String, volume: u32, state: tauri::State<AppState>) -> Result<(), String> {
+    let slices = series_slices(&state, &uid);
+    let first = slices.first().ok_or("Series not found")?;
+    if !nifti::is_nifti(&first.path) {
+        return Err("This series is not a NIfTI file".into());
+    }
+    if volume >= first.volumes {
+        return Err(format!("The file has {} volume(s)", first.volumes));
+    }
+    state.nifti_volume.lock().unwrap().insert(first.path.clone(), volume as usize);
+    {
+        let mut built = state.volume.lock().unwrap();
+        if built.as_ref().is_some_and(|v| v.uid == uid) {
+            *built = None;
+        }
+    }
+    state.volume_gen.fetch_add(1, Ordering::SeqCst);
+    Ok(())
 }
 
 #[tauri::command(async)]
@@ -1740,7 +1806,8 @@ pub fn run() {
             get_volume_texture,
             get_surface_mesh,
             export_mesh,
-            check_python
+            check_python,
+            set_nifti_volume
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -1757,10 +1824,15 @@ mod real_data {
     // the patient's right (RAS in x, as for most files). The value of a voxel is
     // 1 + i + 10 j + 100 k.
     fn small_nifti() -> PathBuf {
+        small_nifti_with(1, "sub-01_T1w.nii")
+    }
+
+    // With `volumes` volumes; the value of a voxel in volume t is 1000 t more than in the first
+    fn small_nifti_with(volumes: i16, name: &str) -> PathBuf {
         let mut b = vec![0u8; 352];
         b[0..4].copy_from_slice(&348i32.to_le_bytes());
-        b[40..42].copy_from_slice(&3i16.to_le_bytes());
-        for (n, d) in [4i16, 3, 5].iter().enumerate() {
+        b[40..42].copy_from_slice(&(if volumes > 1 { 4i16 } else { 3 }).to_le_bytes());
+        for (n, d) in [4i16, 3, 5, volumes].iter().enumerate() {
             b[42 + 2 * n..44 + 2 * n].copy_from_slice(&d.to_le_bytes());
         }
         b[70..72].copy_from_slice(&4i16.to_le_bytes()); // int16
@@ -1778,16 +1850,18 @@ mod real_data {
             }
         }
         b[344..348].copy_from_slice(b"n+1\0");
-        for k in 0..5i16 {
-            for j in 0..3i16 {
-                for i in 0..4i16 {
-                    b.extend_from_slice(&(1 + i + 10 * j + 100 * k).to_le_bytes());
+        for t in 0..volumes {
+            for k in 0..5i16 {
+                for j in 0..3i16 {
+                    for i in 0..4i16 {
+                        b.extend_from_slice(&(1 + i + 10 * j + 100 * k + 1000 * t).to_le_bytes());
+                    }
                 }
             }
         }
         let dir = std::env::temp_dir().join(format!("nifti_app_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("sub-01_T1w.nii");
+        let path = dir.join(name);
         std::fs::write(&path, b).unwrap();
         path
     }
@@ -1844,6 +1918,40 @@ mod real_data {
         assert!(nifti_slice(&state, &path, 5).is_err());
         let vol = nifti_loaded(&state, &path).unwrap();
         assert!(nifti_tags(&vol).iter().any(|t| t.name == "Dimensions" && t.value.starts_with("4 x 3 x 5")));
+    }
+
+    #[test]
+    fn the_shown_volume_of_a_4d_nifti_file_can_be_chosen() {
+        let path = small_nifti_with(3, "sub-01_task-x_bold.nii");
+        let app = tauri::test::mock_app();
+        app.manage(AppState::default());
+        let state = app.state::<AppState>();
+        let series = load_paths(collect_paths(vec![path.to_string_lossy().into_owned()]), &state);
+        let uid = series[0].uid.clone();
+        assert_eq!((series[0].slice_count, series[0].volumes), (5, 3));
+
+        // The first volume is shown at first
+        let first = build_volume(uid.clone(), state.clone()).unwrap();
+        assert_eq!(first.value_max, 1.0 + 3.0 + 20.0 + 400.0);
+        assert!(nifti_meta(&state, &path, 0).unwrap().series_description.ends_with("volume 1/3"));
+
+        // Another one replaces it, and the volume that was built is dropped
+        set_nifti_volume(uid.clone(), 2, state.clone()).unwrap();
+        assert!(state.volume.lock().unwrap().is_none());
+        let third = build_volume(uid.clone(), state.clone()).unwrap();
+        assert_eq!(third.value_min, 1.0 + 2000.0);
+        assert_eq!(third.value_max, 1.0 + 3.0 + 20.0 + 400.0 + 2000.0);
+        let meta = nifti_meta(&state, &path, 0).unwrap();
+        assert!(meta.series_description.ends_with("volume 3/3"), "{}", meta.series_description);
+        assert!(nifti_tags(&nifti_loaded(&state, &path).unwrap()).iter().any(|t| t.name == "Shown" && t.value == "volume 3 of 3"));
+
+        // Wrong requests are refused and change nothing
+        assert!(set_nifti_volume(uid.clone(), 3, state.clone()).is_err());
+        assert!(set_nifti_volume("nifti:/no/such/file.nii".into(), 0, state.clone()).is_err());
+        assert_eq!(nifti_loaded(&state, &path).unwrap().volume, 2);
+        // And going back works
+        set_nifti_volume(uid, 0, state.clone()).unwrap();
+        assert_eq!(nifti_loaded(&state, &path).unwrap().volume, 0);
     }
 
     #[test]

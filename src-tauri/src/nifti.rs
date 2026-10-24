@@ -474,16 +474,49 @@ pub fn read_header(path: &Path) -> Result<Header, String> {
     parse_header(&buf)
 }
 
-/// Reads the first volume of a file: x fastest, then y, then z, with the scaling applied.
-pub fn read_voxels(path: &Path, h: &Header) -> Result<Vec<f32>, String> {
+/// The voxel bytes of all volumes of a file, unzipped. Switching between the volumes of a 4D
+/// file is then quick. None when they would not fit in `max_bytes`.
+pub fn read_raw(path: &Path, h: &Header, max_bytes: usize) -> Result<Option<Vec<u8>>, String> {
+    let per = bytes_per_voxel(h.datatype)?;
+    let total = h.dims[0] * h.dims[1] * h.dims[2] * per * h.volumes;
+    if total > max_bytes {
+        return Ok(None);
+    }
+    let mut r = open(path)?;
+    std::io::copy(&mut (&mut r).take(h.vox_offset), &mut std::io::sink()).map_err(|e| e.to_string())?;
+    let mut bytes = vec![0u8; total];
+    r.read_exact(&mut bytes)
+        .map_err(|e| format!("The file is shorter than its header says: {e}"))?;
+    Ok(Some(bytes))
+}
+
+/// One volume out of the bytes that `read_raw` returned.
+pub fn load_from_raw(h: &Header, raw: &[u8], volume: usize) -> Result<Loaded, String> {
+    if volume >= h.volumes {
+        return Err(format!("The file has {} volume(s), not {}", h.volumes, volume + 1));
+    }
+    let per = bytes_per_voxel(h.datatype)?;
+    let n = h.dims[0] * h.dims[1] * h.dims[2] * per;
+    let bytes = raw.get(volume * n..(volume + 1) * n).ok_or("The file is shorter than its header says")?;
+    finish(h.clone(), volume, decode(bytes, h))
+}
+
+/// Reads one volume of a file (0 is the first): x fastest, then y, then z, with the scaling
+/// applied. The volumes of a 4D file follow each other, so the ones before it are skipped.
+/// A gzip file cannot be entered in the middle: they are read through and thrown away.
+pub fn read_voxels(path: &Path, h: &Header, volume: usize) -> Result<Vec<f32>, String> {
+    if volume >= h.volumes {
+        return Err(format!("The file has {} volume(s), not {}", h.volumes, volume + 1));
+    }
     let per = bytes_per_voxel(h.datatype)?;
     let n = h.dims[0] * h.dims[1] * h.dims[2];
     if n * 4 > MAX_BYTES {
         return Err(format!("The volume would need {} MB, the limit is {} MB", (n * 4) >> 20, MAX_BYTES >> 20));
     }
     let mut r = open(path)?;
-    // Skip the header (and any extension) up to the voxels
-    std::io::copy(&mut (&mut r).take(h.vox_offset), &mut std::io::sink()).map_err(|e| e.to_string())?;
+    // Skip the header (and any extension) and the volumes before this one
+    let skip = h.vox_offset + (volume * n * per) as u64;
+    std::io::copy(&mut (&mut r).take(skip), &mut std::io::sink()).map_err(|e| e.to_string())?;
     let mut bytes = vec![0u8; n * per];
     r.read_exact(&mut bytes)
         .map_err(|e| format!("The file is shorter than its header says: {e}"))?;
@@ -494,6 +527,8 @@ pub fn read_voxels(path: &Path, h: &Header) -> Result<Vec<f32>, String> {
 
 pub struct Loaded {
     pub header: Header,
+    /// Which volume of the file this is (0 for the first)
+    pub volume: usize,
     pub placement: Placement,
     /// Images in the new layout, image 0 first
     pub slices: Vec<Vec<f32>>,
@@ -504,10 +539,15 @@ pub struct Loaded {
     pub high: f32,
 }
 
-pub fn load(path: &Path) -> Result<Loaded, String> {
+pub fn load(path: &Path, volume: usize) -> Result<Loaded, String> {
     let header = read_header(path)?;
+    let data = read_voxels(path, &header, volume)?;
+    finish(header, volume, data)
+}
+
+// From the voxels of a volume to what the viewer needs
+fn finish(header: Header, volume: usize, data: Vec<f32>) -> Result<Loaded, String> {
     let placement = place(header.dims, &header.ras)?;
-    let data = read_voxels(path, &header)?;
     let slices = reorient(&data, header.dims, &placement);
     drop(data);
     let (min, max) = slices
@@ -515,7 +555,7 @@ pub fn load(path: &Path) -> Result<Loaded, String> {
         .flatten()
         .fold((f32::MAX, f32::MIN), |(lo, hi), &v| (lo.min(v), hi.max(v)));
     let (low, high) = crate::mpr::percentiles(&slices, min, max, 0.02, 0.98);
-    Ok(Loaded { header, placement, slices, min, max, low, high })
+    Ok(Loaded { header, volume, placement, slices, min, max, low, high })
 }
 
 /// Whether a path names a NIfTI file
@@ -875,9 +915,55 @@ mod tests {
             let path = write_file(name, &file_bytes(&s, &voxels), gz);
             let h = read_header(&path).unwrap();
             assert_eq!(h.volumes, 3);
-            let v = read_voxels(&path, &h).unwrap();
+            let v = read_voxels(&path, &h, 0).unwrap();
             assert_eq!(v.len(), 8);
             assert_eq!(v, (0..8).map(|n| n as f32 * 2.0 + 1.0).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn a_later_volume_of_a_4d_file_is_read() {
+        // 2 x 2 x 1 voxels, 4 volumes: volume t holds 10 t + voxel number
+        let mut s = spec([2, 2, 1, 4]);
+        s.datatype = 4;
+        let voxels: Vec<i64> = (0..4).flat_map(|t| (0..4).map(move |v| 10 * t + v)).collect();
+        for (name, gz) in [("t.nii", false), ("t.nii.gz", true)] {
+            let path = write_file(name, &file_bytes(&s, &voxels), gz);
+            let h = read_header(&path).unwrap();
+            assert_eq!(h.volumes, 4);
+            for t in 0..4 {
+                let v = read_voxels(&path, &h, t).unwrap();
+                assert_eq!(v, (0..4).map(|n| (10 * t + n) as f32).collect::<Vec<_>>(), "volume {t} of {name}");
+            }
+            assert!(read_voxels(&path, &h, 4).unwrap_err().contains("4 volume"));
+            assert_eq!(load(&path, 3).unwrap().volume, 3);
+        }
+        // A file that stops inside a later volume is refused, not shown half
+        let path = write_file("cut.nii", &file_bytes(&s, &voxels[..10]), false);
+        let h = read_header(&path).unwrap();
+        assert!(read_voxels(&path, &h, 0).is_ok());
+        assert!(read_voxels(&path, &h, 3).unwrap_err().contains("shorter"));
+    }
+
+    #[test]
+    fn unzipped_bytes_give_the_same_volumes() {
+        let mut s = spec([3, 2, 2, 5]);
+        s.datatype = 16;
+        let voxels: Vec<i64> = (0..60).map(|v| v * 3 - 40).collect();
+        for (name, gz) in [("raw.nii", false), ("raw.nii.gz", true)] {
+            let path = write_file(name, &file_bytes(&s, &voxels), gz);
+            let h = read_header(&path).unwrap();
+            let raw = read_raw(&path, &h, 1 << 20).unwrap().expect("fits");
+            assert_eq!(raw.len(), 60 * 4);
+            for t in 0..5 {
+                let a = load(&path, t).unwrap();
+                let b = load_from_raw(&h, &raw, t).unwrap();
+                assert_eq!(a.slices, b.slices, "volume {t} of {name}");
+                assert_eq!((a.min, a.max, a.volume), (b.min, b.max, b.volume));
+            }
+            assert!(load_from_raw(&h, &raw, 5).is_err());
+            // Too big to keep: no bytes, and no error
+            assert!(read_raw(&path, &h, 100).unwrap().is_none());
         }
     }
 
@@ -888,18 +974,18 @@ mod tests {
         s.big = true;
         let p = write_file("f.nii", &file_bytes(&s, &[-5, 0, 7, 100]), false);
         let h = read_header(&p).unwrap();
-        assert_eq!(read_voxels(&p, &h).unwrap(), vec![-5.0, 0.0, 7.0, 100.0]);
+        assert_eq!(read_voxels(&p, &h, 0).unwrap(), vec![-5.0, 0.0, 7.0, 100.0]);
         s.datatype = 2;
         s.big = false;
         let p = write_file("u.nii", &file_bytes(&s, &[0, 200, 255, 1]), false);
         let h = read_header(&p).unwrap();
-        assert_eq!(read_voxels(&p, &h).unwrap(), vec![0.0, 200.0, 255.0, 1.0]);
+        assert_eq!(read_voxels(&p, &h, 0).unwrap(), vec![0.0, 200.0, 255.0, 1.0]);
         // NIfTI-2
         s.v2 = true;
         s.datatype = 4;
         let p = write_file("v2.nii", &file_bytes(&s, &[-1, 2, -3, 4]), false);
         let h = read_header(&p).unwrap();
-        assert_eq!(read_voxels(&p, &h).unwrap(), vec![-1.0, 2.0, -3.0, 4.0]);
+        assert_eq!(read_voxels(&p, &h, 0).unwrap(), vec![-1.0, 2.0, -3.0, 4.0]);
     }
 
     #[test]
@@ -907,12 +993,12 @@ mod tests {
         let s = spec([4, 4, 4, 1]);
         let p = write_file("short.nii", &file_bytes(&s, &[1, 2, 3]), false);
         let h = read_header(&p).unwrap();
-        assert!(read_voxels(&p, &h).unwrap_err().contains("shorter"));
+        assert!(read_voxels(&p, &h, 0).unwrap_err().contains("shorter"));
         let mut rgb = spec([2, 2, 2, 1]);
         rgb.datatype = 128;
         let p = write_file("rgb.nii", &file_bytes(&rgb, &[]), false);
         let h = read_header(&p).unwrap();
-        assert!(read_voxels(&p, &h).unwrap_err().contains("RGB"));
+        assert!(read_voxels(&p, &h, 0).unwrap_err().contains("RGB"));
     }
 
     #[test]
@@ -921,7 +1007,7 @@ mod tests {
         s.sform = Some(matrix_of("LAS", [1.0, 1.0, 1.0], [0.0; 3]));
         let voxels: Vec<i64> = (0..12).collect();
         let p = write_file("whole.nii.gz", &file_bytes(&s, &voxels), true);
-        let l = load(&p).unwrap();
+        let l = load(&p, 0).unwrap();
         assert_eq!(l.slices.len(), l.placement.dims[2]);
         assert_eq!((l.min, l.max), (0.0, 11.0));
         assert!(l.low >= 0.0 && l.high <= 11.0 && l.low < l.high);
@@ -967,7 +1053,7 @@ mod tests {
         for path in files {
             let t = std::time::Instant::now();
             let h = read_header(&path).unwrap();
-            let l = load(&path).unwrap();
+            let l = load(&path, 0).unwrap();
             let col = |m: &Mat34, a: usize| (m[0][a].powi(2) + m[1][a].powi(2) + m[2][a].powi(2)).sqrt();
             println!(
                 "{}\n  NIfTI-{} {}, dims {:?} x {} volume(s), {}, qform {} sform {}, orientation {}",
@@ -989,6 +1075,27 @@ mod tests {
                 for a in 0..3 {
                     let (m, p) = (col(&h.ras, a), h.pixdim[a + 1].abs());
                     assert!((m - p).abs() / p.max(1e-9) < 0.02, "axis {a}: matrix {m} vs pixdim {p}");
+                }
+            }
+            if h.volumes > 1 {
+                // Later volumes need the ones before them to be read through (gzip)
+                let mut means = Vec::new();
+                for t in [0, h.volumes / 2, h.volumes - 1] {
+                    let t0 = std::time::Instant::now();
+                    let v = read_voxels(&path, &h, t).unwrap();
+                    means.push(v.iter().map(|x| f64::from(*x)).sum::<f64>() / v.len() as f64);
+                    println!("  volume {} of {}: mean {:.1}, read in {:?}", t + 1, h.volumes, means.last().unwrap(), t0.elapsed());
+                }
+                assert!(means[0] != means[1] || means[1] != means[2], "all volumes are the same");
+                // Kept unzipped, switching is quick
+                let t0 = std::time::Instant::now();
+                if let Some(raw) = read_raw(&path, &h, 768 << 20).unwrap() {
+                    println!("  all volumes unzipped once: {:.0} MB in {:?}", raw.len() as f64 / 1048576.0, t0.elapsed());
+                    for t in [h.volumes - 1, 0, h.volumes / 2] {
+                        let t1 = std::time::Instant::now();
+                        let l = load_from_raw(&h, &raw, t).unwrap();
+                        println!("  volume {} from the kept bytes: {:?} (max {})", t + 1, t1.elapsed(), l.max);
+                    }
                 }
             }
             assert!(l.max > l.min, "the volume is flat");

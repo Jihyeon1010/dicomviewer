@@ -2,6 +2,7 @@ export interface SeriesInfo {
   uid: string;
   description: string;
   slice_count: number; // Rust serde field names (snake_case) are kept as-is
+  volumes: number; // more than 1 for a 4D NIfTI file: one volume is shown at a time
 }
 
 export type PixelArray = Uint8Array | Int16Array | Uint16Array;
